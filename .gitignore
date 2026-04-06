@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
+
+runs/
+datasets/
+structures/

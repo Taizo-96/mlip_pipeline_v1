@@ -1,0 +1,67 @@
+project_root: .
+
+paths:
+  data_root: /home/saitto/data
+  runs_root: runs
+  structures_root: structures
+  datasets_root: datasets
+
+training:
+  input_glob: Pb*
+  output_subdir: pb_cfg
+  merge_name: train.cfg
+
+fit:
+  mlp_command: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
+  mpi_prefix: mpirun -np 32
+  template_dir: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/MTP_templates
+  mtp_level: 16
+  output_subdir: gen_00_fit
+  trained_potential_name: pb16.almtp
+  extra_args:
+    - --energy-weight=1
+    - --force-weight=0.01
+    - --stress-weight=0.001
+    - --max-iter=1000
+
+materials_project:
+  api_key: OgHbEK8Ejzp0Y2rtY79rpvEAfRNrHEvv
+  material_ids:
+    - mp-20483
+  conventional_cell: true
+  output_subdir: mp_raw
+  export_lammps_data: true
+  lammps_output_subdir: lammps_data
+  lammps_atom_style: atomic
+  ff_elements: [Pb]
+
+explore:
+  temperatures: [700, 900, 1150]
+  output_subdir: gen_00_explore
+  ensemble: npt
+  timestep: 0.00001
+  nsteps: 20000
+  dump_every: 100
+  pressure_bar: 0.0
+  seed_base: 492845
+
+  replicate: [4, 4, 4]
+  tdamp: 2.0
+  pdamp: 10.0
+  neighbor_skin: 4.0
+  thermo_every: 50
+  nvt_pre_steps: 1000
+
+  stabilization:
+    neigh_modify:
+      every: 1
+      delay: 0
+      check: "yes"
+    velocity_scale: true
+    momentum_fix:
+      every: 1
+      linear: [1, 1, 1]
+      rescale: true
+
+  lammps_command: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
+  mpi_prefix: mpirun -np 32
