@@ -1,15 +1,18 @@
 project_root: .
 
+
 paths:
   data_root: /home/saitto/data
   runs_root: runs
   structures_root: structures
   datasets_root: datasets
 
+
 training:
   input_glob: Pb*
   output_subdir: pb_cfg
   merge_name: train.cfg
+
 
 fit:
   mlp_command: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
@@ -24,6 +27,7 @@ fit:
     - --stress-weight=0.001
     - --max-iter=1000
 
+
 materials_project:
   api_key: OgHbEK8Ejzp0Y2rtY79rpvEAfRNrHEvv
   material_ids:
@@ -34,6 +38,7 @@ materials_project:
   lammps_output_subdir: lammps_data
   lammps_atom_style: atomic
   ff_elements: [Pb]
+
 
 explore:
   temperatures: [700, 900, 1150]
@@ -52,6 +57,20 @@ explore:
   thermo_every: 50
   nvt_pre_steps: 1000
 
+  dump:
+    attributes: [ id, type, x, y, z, fx, fy, fz ]
+    sort: id
+    pbc: yes
+    unwrap: no
+    time: yes
+    units: yes
+
+  active_learning:
+    enabled: true
+    threshold_save: 2.1
+    threshold_break: 10.0
+    save_extrapolative_to: preselected.cfg
+
   stabilization:
     neigh_modify:
       every: 1
@@ -65,3 +84,18 @@ explore:
 
   lammps_command: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
   mpi_prefix: mpirun -np 32
+
+
+select:
+  input_subdir: gen_00_explore
+  output_subdir: gen_00_select
+
+  strategy: mlip_select_add
+  candidate_filename: preselected.cfg
+
+  mlip_command: mlp
+  training_cfg: datasets/pb_cfg/train.cfg
+
+  merged_candidates_filename: candidates_merged.cfg
+  selected_filename: selected.cfg
+  write_manifest: true

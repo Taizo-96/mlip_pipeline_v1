@@ -27,8 +27,8 @@ def build_lammps_input(
     seed = seed_base + int(temperature)
 
     replicate = explore_cfg.get("replicate")
-    tdamp = explore_cfg["tdamp"] if "tdamp" in explore_cfg else 0.1
-    pdamp = explore_cfg["pdamp"] if "pdamp" in explore_cfg else 1.0
+    tdamp = explore_cfg.get("tdamp", 0.1)
+    pdamp = explore_cfg.get("pdamp", 1.0)
     neighbor_skin = explore_cfg.get("neighbor_skin")
     thermo_every = explore_cfg.get("thermo_every")
     nvt_pre_steps = explore_cfg.get("nvt_pre_steps")
@@ -37,6 +37,23 @@ def build_lammps_input(
     neigh_mod_cfg = stab_cfg.get("neigh_modify", {})
     velocity_scale = stab_cfg.get("velocity_scale", False)
     momentum_cfg = stab_cfg.get("momentum_fix", {})
+
+    dump_cfg = explore_cfg.get("dump", {})
+    dump_attrs = dump_cfg.get(
+        "attributes",
+        ["id", "type", "x", "y", "z", "fx", "fy", "fz"]
+    )
+    dump_sort = str(dump_cfg.get("sort", "id")).lower()
+    dump_pbc = str(dump_cfg.get("pbc", "no")).lower()
+    dump_time = str(dump_cfg.get("time", "yes")).lower()
+    dump_units = str(dump_cfg.get("units", "yes")).lower()
+    dump_unwrap = str(dump_cfg.get("unwrap", "no")).lower()
+
+    al_cfg = explore_cfg.get("active_learning", {})
+    al_enabled = bool(al_cfg.get("enabled", False))
+    threshold_save = al_cfg.get("threshold_save", 2.1)
+    threshold_break = al_cfg.get("threshold_break", 10.0)
+    save_extrapolative_to = al_cfg.get("save_extrapolative_to", "preselected.cfg")
 
     rep_line = ""
     if replicate and any(r > 1 for r in replicate):
@@ -101,10 +118,40 @@ def build_lammps_input(
     else:
         raise ValueError(f"unsupported ensemble: {ensemble}")
 
+    pair_style_line = f"pair_style mlip load_from={potential_path}"
+    if al_enabled:
+        pair_style_line += (
+            " extrapolation_control=true"
+            f" threshold_save={threshold_save}"
+            f" threshold_break={threshold_break}"
+            f" save_extrapolative_to={save_extrapolative_to}"
+        )
+
+    dump_line = (
+        f"dump 1 all custom {dump_every} traj_{temperature}.lammpstrj "
+        + " ".join(dump_attrs)
+    )
+
+    dump_modify_lines = []
+    if dump_sort in {"off", "id"} or dump_sort.lstrip("-").isdigit():
+        dump_modify_lines.append(f"dump_modify 1 sort {dump_sort}")
+    if dump_pbc in {"yes", "no"}:
+        dump_modify_lines.append(f"dump_modify 1 pbc {dump_pbc}")
+    if dump_time in {"yes", "no"}:
+        dump_modify_lines.append(f"dump_modify 1 time {dump_time}")
+    if dump_units in {"yes", "no"}:
+        dump_modify_lines.append(f"dump_modify 1 units {dump_units}")
+    if dump_unwrap in {"yes", "no"}:
+        dump_modify_lines.append(f"dump_modify 1 unwrap {dump_unwrap}")
+
+    dump_modify_block = ""
+    if dump_modify_lines:
+        dump_modify_block = "\n".join(dump_modify_lines) + "\n"
+
     return f"""units metal
 atom_style atomic
 read_data {structure_data}
-{rep_line}pair_style mlip load_from={potential_path}
+{rep_line}{pair_style_line}
 pair_coeff * *
 
 {neighbor_line}{neigh_modify_line}timestep {timestep}
@@ -112,8 +159,8 @@ velocity all create {temperature} {seed} mom yes rot no dist gaussian
 {velocity_scale_line}{thermo_line}thermo_style custom step temp pe ke etotal press vol
 {momentum_fix_line}{pre_nvt_block}{fix_line}
 
-dump 1 all custom {dump_every} traj_{temperature}.lammpstrj id type x y z
-run {nsteps}
+{dump_line}
+{dump_modify_block}run {nsteps}
 """
 
 

@@ -18,3 +18,11 @@ class FitResult:
     run_dir: Path
     model_path: Path
     log_path: Path
+
+
+@dataclass
+class SelectionResult:
+    select_root: Path
+    manifest_path: Path
+    selected_cfg_paths: list[Path]
+    selected_count: int
