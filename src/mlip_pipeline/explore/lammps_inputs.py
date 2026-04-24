@@ -4,7 +4,6 @@ from pathlib import Path
 import shutil
 
 from mlip_pipeline.explore.resolve import resolve_structure_data_path
-from mlip_pipeline.explore.templates import render_mlip_ini
 from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.models import FitResult
 
@@ -14,6 +13,7 @@ def build_lammps_input(
     resolved_paths: dict,
     temperature: int,
     potential_path: str,
+    pressure: float = 0.0,
 ) -> str:
     explore_cfg = config["explore"]
     structure_data = resolve_structure_data_path(config, resolved_paths)
@@ -22,9 +22,9 @@ def build_lammps_input(
     timestep = explore_cfg.get("timestep", 0.001)
     nsteps = explore_cfg.get("nsteps", 20000)
     dump_every = explore_cfg.get("dump_every", 100)
-    pressure_bar = explore_cfg.get("pressure_bar", 0.0)
+    pressure_bar = pressure
     seed_base = int(explore_cfg.get("seed_base", 492845))
-    seed = seed_base + int(temperature)
+    seed = seed_base + int(temperature) + int(abs(pressure))
 
     replicate = explore_cfg.get("replicate")
     tdamp = explore_cfg.get("tdamp", 0.1)
@@ -128,8 +128,8 @@ def build_lammps_input(
         )
 
     dump_line = (
-        f"dump 1 all custom {dump_every} traj_{temperature}.lammpstrj "
-        + " ".join(dump_attrs)
+            f"dump 1 all custom {dump_every} traj_{temperature}K_P{int(pressure)}bar.lammpstrj "
+            + " ".join(dump_attrs)
     )
 
     dump_modify_lines = []
@@ -169,20 +169,25 @@ def create_exploration_runs(config: dict, resolved_paths: dict, fit_result: FitR
     explore_cfg = config['explore']
     temperatures = explore_cfg['temperatures']
 
+    # Support scalar or list for pressure_bar
+    pressures_raw = explore_cfg.get('pressure_bar', 0.0)
+    pressures = pressures_raw if isinstance(pressures_raw, list) else [pressures_raw]
+
     for temp in temperatures:
-        temp_dir = ensure_dir(explore_root / f"T{temp}K")
+        for pressure in pressures:
+            # Name the dir T700K_P0bar, T700K_P-5000bar, etc.
+            run_dir = ensure_dir(explore_root / f"T{temp}K_P{int(pressure)}bar")
 
-        # 1. Copy potential from fit phase
-        potential_path = fit_result.model_path.name
-        shutil.copy(fit_result.model_path, temp_dir / potential_path)
+            potential_path = fit_result.model_path.name
+            shutil.copy(fit_result.model_path, run_dir / potential_path)
 
-        # 2. Generate LAMMPS input
-        lammps_input = build_lammps_input(
-            config=config,
-            resolved_paths=resolved_paths,
-            temperature=temp,
-            potential_path=potential_path,
-        )
-        (temp_dir / "in.mlip.pb").write_text(lammps_input)
+            lammps_input = build_lammps_input(
+                config=config,
+                resolved_paths=resolved_paths,
+                temperature=temp,
+                pressure=pressure,          # pass scalar explicitly
+                potential_path=potential_path,
+            )
+            (run_dir / "in.mlip.pb").write_text(lammps_input)
 
     return explore_root

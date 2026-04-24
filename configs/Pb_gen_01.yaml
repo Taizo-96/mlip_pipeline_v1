@@ -18,9 +18,9 @@ fit:
   mlp_command: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
   mpi_prefix: mpirun -np 32
   template_dir: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/MTP_templates
-  mtp_level: 16
-  output_subdir: gen_00_fit
-  trained_potential_name: pb16.almtp
+  mtp_level: 20
+  output_subdir: Pb_gen_00_fit
+  trained_potential_name: pb20.almtp
   extra_args:
     - --energy-weight=1
     - --force-weight=0.01
@@ -41,21 +41,21 @@ materials_project:
 
 
 explore:
-  temperatures: [700, 900, 1150]
-  output_subdir: gen_00_explore
+  temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
+  output_subdir: Pb_gen_00_explore
   ensemble: npt
   timestep: 0.00001
-  nsteps: 20000
-  dump_every: 100
-  pressure_bar: 0.0
+  nsteps: 50000
+  dump_every: 50
+  pressure_bar: [-5000, 0, 5000]
   seed_base: 492845
 
   replicate: [4, 4, 4]
-  tdamp: 2.0
+  tdamp: 2
   pdamp: 10.0
   neighbor_skin: 4.0
   thermo_every: 50
-  nvt_pre_steps: 1000
+  nvt_pre_steps: 2000
 
   dump:
     attributes: [ id, type, x, y, z, fx, fy, fz ]
@@ -67,7 +67,7 @@ explore:
 
   active_learning:
     enabled: true
-    threshold_save: 2.1
+    threshold_save: 1.5
     threshold_break: 10.0
     save_extrapolative_to: preselected.cfg
 
@@ -76,7 +76,7 @@ explore:
       every: 1
       delay: 0
       check: "yes"
-    velocity_scale: true
+    velocity_scale: false
     momentum_fix:
       every: 1
       linear: [1, 1, 1]
@@ -87,8 +87,8 @@ explore:
 
 
 select:
-  input_subdir: gen_00_explore
-  output_subdir: gen_00_select
+  input_subdir: Pb_gen_00_explore
+  output_subdir: Pb_gen_00_select
 
   strategy: mlip_select_add
   candidate_filename: preselected.cfg

@@ -7,7 +7,9 @@ Minimal Python package skeleton for:
 ## Commands
 
 ```bash
-mlip-pipeline fit --config configs/fit.yaml
-mlip-pipeline explore --config configs/explore.yaml
-mlip-pipeline run --fit-config configs/fit.yaml --explore-config configs/explore.yaml
+python -m mlip_pipeline.cli download-structures --config fit/config.yaml
+python -m mlip_pipeline.cli prepare-train --config fit/config.yaml
+python -m mlip_pipeline.cli fit --config fit/config.yaml
+python -m mlip_pipeline.cli explore --config configs/config.yaml
+python -m mlip_pipeline.cli select --config configs/config.yaml
 ```

@@ -30,7 +30,7 @@ def train_potential(config: dict, resolved_paths: dict) -> FitResult:
         fit_cfg.get('train_cfg', dataset_dir / training_cfg.get('merge_name', 'train.cfg'))
     ).expanduser().resolve()
     output_dir = ensure_dir(
-        resolved_paths['runs_root'] / fit_cfg.get('output_subdir', 'gen_00_fit')
+        resolved_paths['runs_root'] / fit_cfg.get('output_subdir', 'Pb_gen_00_fit')
     )
     trained_name = fit_cfg.get(
         'trained_potential_name', f'pb{fit_cfg.get("mtp_level", "xx")}.almtp'
