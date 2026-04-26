@@ -107,12 +107,27 @@ def cmd_sync_to_remote(label_result: LabelResult, config: dict, resolved_paths: 
 
 
 def cmd_submit_and_watch(label_result: LabelResult, config: dict, resolved_paths: dict):
-    """Command 2: Submit and block for results."""
+    """
+    Submits jobs, waits for completion, and automatically pulls results.
+    """
     label_cfg = config["label"]
     d_cfg = label_cfg["dardel"]
+    user = d_cfg["user"]
+    host = d_cfg.get("host", "dardel.pdc.kth.se")
 
     runs_root = resolved_paths["runs_root"]
     remote_dir = f"{d_cfg['remote_root']}/{runs_root.name}/{label_cfg['output_subdir']}"
+
+    # 1. Submit
+    print(f"Submitting jobs in {remote_dir}...")
+    submit_jobs_on_dardel(user, host, remote_dir)
+
+    # 2. Watch (returns when done)
+    finished_cleanly = watch_queue(user, host, poll_interval=d_cfg.get("poll_interval", 60))
+
+    # 3. Auto-sync back
+    if finished_cleanly:
+        sync_outputs_from_dardel(label_result.label_root, user, host, remote_dir)
 
 
 
@@ -130,7 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
         "label",
         "label-run",
         "sync-to-remote",
-        "submit-and-watch",
+        "submit-remote",
+        "watch-remote",
+        "sync-from-remote",
     ]
 
     for name in commands:
@@ -184,10 +201,23 @@ def main() -> None:
         cmd_sync_to_remote(result, config, resolved_paths)
         return
 
-    if args.command == "submit-and-watch":
+    if args.command == "submit-remote":
+        d_cfg = config["label"]["dardel"]
+        remote_dir = f"{d_cfg['remote_root']}/{resolved_paths['runs_root'].name}/{config['label']['output_subdir']}"
+        submit_jobs_on_dardel(d_cfg["user"], d_cfg.get("host"), remote_dir)
+        return
+
+    if args.command == "watch-remote":
+        d_cfg = config["label"]["dardel"]
+        # Now returns cleanly when queue is empty, but doesn't trigger sync
+        watch_queue(d_cfg["user"], d_cfg.get("host"), poll_interval=d_cfg.get("poll_interval", 60))
+        return
+
+    if args.command == "sync-from-remote":
         result = LabelResult.load_from_dir(label_root)
-        # Pass resolved_paths as the third argument
-        cmd_submit_and_watch(result, config, resolved_paths)
+        d_cfg = config["label"]["dardel"]
+        remote_dir = f"{d_cfg['remote_root']}/{resolved_paths['runs_root'].name}/{config['label']['output_subdir']}"
+        sync_outputs_from_dardel(result.label_root, d_cfg["user"], d_cfg.get("host"), remote_dir)
         return
 
     raise ValueError(f"unknown command: {args.command}")

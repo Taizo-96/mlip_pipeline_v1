@@ -8,6 +8,7 @@ def run_command(
     command: list[str],
     cwd: str | Path | None = None,
     log_file: str | Path | None = None,
+    env: dict | None = None, # Added for source_env support
 ) -> int:
     cwd_path = Path(cwd).resolve() if cwd is not None else None
 
@@ -25,5 +26,6 @@ def run_command(
             stdout=fh,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env  # Pass environment through
         )
-    return result.returncode
+        return result.returncode

@@ -1,115 +1,132 @@
 from __future__ import annotations
 
-import subprocess
 import time
+import subprocess
 from pathlib import Path
-
-from mlip_pipeline.models import LabelResult
+from mlip_pipeline.utils.shell import run_command  # Use your utility
 
 # Only these files are synced to Dardel — outputs stay local until sync-back
 VASP_INPUT_FILES = {"POSCAR", "INCAR", "KPOINTS", "POTCAR", "job.sh"}
 
 
-def _run(cmd: str) -> None:
-    print(f"  $ {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+def _ssh_cmd(user: str, host: str, remote_cmd: str) -> list[str]:
+    """Helper to format SSH commands for run_command."""
+    return ["ssh", f"{user}@{host}", remote_cmd]
 
+def sync_inputs_to_dardel(local_label_dir: Path, user: str, host: str, remote_label_dir: str) -> None:
+    """Rsync only VASP input files to Dardel."""
+    # Ensure remote directory exists
+    run_command(["ssh", f"{user}@{host}", f"mkdir -p {remote_label_dir}"]) #
 
-def _ssh(user: str, host: str, remote_cmd: str) -> None:
-    subprocess.run(["ssh", f"{user}@{host}", remote_cmd], check=True)
-
-
-def sync_inputs_to_dardel(
-    local_label_dir: Path,
-    user: str,
-    host: str,
-    remote_label_dir: str,
-) -> None:
-    """Rsync only VASP input files + job.sh to Dardel. Excludes outputs."""
-    # Ensure remote directory exists before rsync
-    _ssh(user, host, f"mkdir -p {remote_label_dir}")
-
-    include_flags = " ".join(
-        f"--include='task.*/{f}'" for f in sorted(VASP_INPUT_FILES)
-    )
-    _run(
-        f"rsync -avz "
-        f"--include='task.*/' "
-        f"{include_flags} "
-        f"--exclude='*' "
-        f"{local_label_dir}/ {user}@{host}:{remote_label_dir}/"
-    )
+    include_flags = [f"--include='task.*/{f}'" for f in sorted(VASP_INPUT_FILES)]
+    cmd = [
+        "rsync", "-avz",
+        "--include='task.*/'",
+        *include_flags,
+        "--exclude='*'",
+        f"{local_label_dir}/",
+        f"{user}@{host}:{remote_label_dir}/"
+    ]
+    run_command(cmd) #
 
 
 def submit_jobs_on_dardel(
-    user: str,
-    host: str,
-    remote_label_dir: str,
+        user: str,
+        host: str,
+        remote_label_dir: str,
 ) -> None:
-    _ssh(user, host,
+    """Submits VASP jobs using the remote scheduler."""
+    # Build a single robust remote command string
+    remote_cmd = (
         f"find {remote_label_dir} -name job.sh | sort | while read job; do "
         f"sbatch --chdir=$(dirname $(realpath $job)) $job; done"
     )
 
+    # Use the helper to wrap it in an SSH list and execute via your utility
+    full_cmd = _ssh_cmd(user, host, remote_cmd)
+    exit_code = run_command(full_cmd)
 
-def watch_queue(
-    user: str,
-    host: str,
-    poll_interval: int = 300,
-) -> None:
+    if exit_code != 0:
+        print(f"Error: Submission failed on {host}")
+
+
+def watch_queue(user: str, host: str, poll_interval: int = 300) -> bool:
+    """Monitors the Slurm queue using SSH multiplexing."""
     socket_path = f"/tmp/ssh_ctrl_{user}@{host}"
     poll_interval = max(60, poll_interval)
 
-    # Open one persistent SSH connection
-    subprocess.Popen([
+    # 1. Establish Master Connection
+    # We still use Popen here because this process must stay alive in the background
+    master_cmd = [
         "ssh", "-MNf",
         "-o", "ControlMaster=yes",
         "-o", f"ControlPath={socket_path}",
         "-o", "ControlPersist=yes",
         f"{user}@{host}",
-    ])
-    time.sleep(2)  # let the master establish
+    ]
+    subprocess.Popen(master_cmd)
+    time.sleep(2)
 
     print(f"Watching queue every {poll_interval}s  —  Ctrl+C to stop")
     try:
         while True:
-            result = subprocess.run(
-                ["ssh",
-                 "-o", "ControlMaster=no",
-                 "-o", f"ControlPath={socket_path}",
-                 f"{user}@{host}",
-                 f"squeue -u {user} --format='%.10i %.20j %.8T %.10M %.6D %R'"],
-                text=True, capture_output=True,
-            )
-            os.system("clear")
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}]  polling every {poll_interval}s  —  Ctrl+C to stop\n")
-            if result.returncode != 0:
-                print(f"  SSH/squeue error:\n{result.stderr.strip()}")
-            else:
-                print(result.stdout.strip() or "  No jobs in queue.")
+            # 2. Check Queue using utility
+            # Use capture_output logic or redirect to a temp log if needed
+            check_cmd = [
+                "ssh", "-o", "ControlMaster=no", "-o", f"ControlPath={socket_path}",
+                f"{user}@{host}", f"squeue -u {user} -h"
+            ]
+
+            # Since run_command doesn't currently return stdout text,
+            # we use a temporary subprocess call or enhance run_command.
+            # For "Senior" consistency, let's assume we want to see the output:
+            result = subprocess.run(check_cmd, text=True, capture_output=True)
+
+            if not result.stdout.strip():
+                print("Queue is empty.")
+                return True
+
+            print(result.stdout.strip())
             time.sleep(poll_interval)
+
     except KeyboardInterrupt:
         print("\nStopped watching.")
     finally:
-        # Close the master connection on exit
-        subprocess.run([
+        # 3. Cleanup using utility
+        exit_cmd = [
             "ssh", "-O", "exit",
             "-o", f"ControlPath={socket_path}",
             f"{user}@{host}",
-        ])
+        ]
+        run_command(exit_cmd)
         print("SSH master connection closed.")
 
 
 def sync_outputs_from_dardel(
-    local_label_dir: Path,
-    user: str,
-    host: str,
-    remote_label_dir: str,
+        local_label_dir: Path,
+        user: str,
+        host: str,
+        remote_label_dir: str,
 ) -> None:
-    _run(
-        f"rsync -avz {user}@{host}:{remote_label_dir}/ {local_label_dir}/"
-    )
+    """
+    Syncs results back.
+    Uses --update to prevent overwriting newer local files and
+    --exclude to avoid pulling back massive unnecessary system files.
+    """
+    # Using your existing shell utility instead of raw subprocess
+    cmd = [
+        "rsync", "-avzu",
+        "--include='*/'",
+        "--include='OUTCAR'", "--include='vasprun.xml'", "--include='OSZICAR'",
+        "--exclude='*'",
+        f"{user}@{host}:{remote_label_dir}/",
+        f"{local_label_dir}/"
+    ]
+    print(f"=== Syncing outputs from {host} ===")
+    # run_command returns exit code
+    exit_code = run_command(cmd)
+    if exit_code != 0:
+        print(f"Error: Sync failed with exit code {exit_code}")
 
 
 def submit_label_jobs(label_result, config: dict) -> None:
@@ -138,6 +155,7 @@ def submit_label_jobs(label_result, config: dict) -> None:
     print("\n=== Syncing outputs back ===")
     sync_outputs_from_dardel(local_label_dir, user, host, remote_label_dir)
     print("Done.")
+
 
 
 
