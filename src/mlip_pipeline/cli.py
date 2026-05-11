@@ -15,6 +15,8 @@ from mlip_pipeline.label.runner import run_labeling
 from mlip_pipeline.label.local_runner import run_vasp_local
 from mlip_pipeline.io.dardel import submit_label_jobs, sync_inputs_to_dardel, submit_jobs_on_dardel, watch_queue, \
     sync_outputs_from_dardel
+from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
+
 
 
 def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
@@ -130,6 +132,11 @@ def cmd_submit_and_watch(label_result: LabelResult, config: dict, resolved_paths
         sync_outputs_from_dardel(label_result.label_root, user, host, remote_dir)
 
 
+def cmd_convert_cfg(config: dict, resolved_paths: dict) -> None:
+    label_root = resolved_paths["runs_root"] / config["label"]["output_subdir"]
+    label_result = LabelResult.load_from_dir(label_root)
+    merged = convert_outcars_to_cfg(label_result, config, resolved_paths)
+    print(merged)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
         "submit-remote",
         "watch-remote",
         "sync-from-remote",
+        "convert-cfg",
     ]
 
     for name in commands:
@@ -218,6 +226,10 @@ def main() -> None:
         d_cfg = config["label"]["dardel"]
         remote_dir = f"{d_cfg['remote_root']}/{resolved_paths['runs_root'].name}/{config['label']['output_subdir']}"
         sync_outputs_from_dardel(result.label_root, d_cfg["user"], d_cfg.get("host"), remote_dir)
+        return
+
+    if args.command == "convert-cfg":
+        cmd_convert_cfg(config, resolved_paths)
         return
 
     raise ValueError(f"unknown command: {args.command}")

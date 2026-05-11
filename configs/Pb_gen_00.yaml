@@ -154,3 +154,10 @@ label:
     env_block: |
       export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
       module load PrgEnv-intel/8.5.0
+
+
+convert:
+  output_subdir: converted_cfg
+  run_name: run_00
+  merge_name: train.cfg
+  # origin_cfg: pb_cfg/train.cfg    # optional — derived automatically from training block
