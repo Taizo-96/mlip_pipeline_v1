@@ -48,7 +48,9 @@ def convert_outcars_to_cfg(
     base_dir = (resolved_paths["datasets_root"] / base_subdir).resolve()
     run_dir  = ensure_dir(base_dir / run_name)
 
-    # ── 1. Convert each OUTCAR → per-task .cfg ────────────────────────────────
+    # ── 1. Convert each OUTCAR → per-task .cfg (MLIP-3 syntax) ────────────────
+    # MLIP-3: mlp convert OUTCAR out.cfg --input_format=outcar
+    # MLIP-2: mlp convert-cfg OUTCAR out.cfg --input-format=vasp-outcar
     this_run_cfgs: list[Path] = []
     for task_dir in sorted(label_result.task_dirs):
         outcar = task_dir / "OUTCAR"
@@ -57,12 +59,12 @@ def convert_outcars_to_cfg(
             continue
 
         out_cfg = run_dir / f"{task_dir.name}.cfg"
-        cmd = [mlp_command, "convert-cfg", str(outcar), str(out_cfg)]
+        cmd = [mlp_command, "convert", str(outcar), str(out_cfg), "--input_format=outcar"]
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"mlp convert-cfg failed for {task_dir.name}:\n"
+                f"mlp convert failed for {task_dir.name}:\n"
                 f"  cmd:    {' '.join(cmd)}\n"
                 f"  stdout: {result.stdout.strip()}\n"
                 f"  stderr: {result.stderr.strip()}"
@@ -71,7 +73,7 @@ def convert_outcars_to_cfg(
         # Verify the file was actually written -- mlp may exit 0 but write nothing
         if not out_cfg.exists() or out_cfg.stat().st_size == 0:
             raise RuntimeError(
-                f"mlp convert-cfg exited 0 but produced no output for {task_dir.name}.\n"
+                f"mlp convert exited 0 but produced no output for {task_dir.name}.\n"
                 f"  cmd:    {' '.join(cmd)}\n"
                 f"  stdout: {result.stdout.strip()}\n"
                 f"  stderr: {result.stderr.strip()}\n"
