@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,24 +13,33 @@ def run_calculate_efs(
     output_cfg: Path,
 ) -> None:
     """
-    mlp calculate_efs model.almtp input.cfg output.cfg
-    Writes predicted EFS into output_cfg.
+    mlp calculate_efs takes exactly 2 positional args:
+        mlp calculate_efs model.almtp configs.cfg
+    It overwrites configs.cfg in-place, adding MTP-predicted EFS alongside
+    the existing DFT values.
+
+    Strategy: copy input_cfg → output_cfg first, then run on the copy.
+    That way input_cfg (DFT reference) is untouched and output_cfg holds
+    the MTP-predicted version for parity comparison.
     """
+    shutil.copy2(input_cfg, output_cfg)
+
     cmd = [
         mlp_command,
         "calculate_efs",
         str(model_path),
-        str(input_cfg),
-        str(output_cfg),
+        str(output_cfg),       # overwritten in-place by mlp
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not output_cfg.exists():
+    if result.returncode != 0:
         raise RuntimeError(
             f"calculate_efs failed.\n"
             f"  cmd: {' '.join(cmd)}\n"
             f"  stdout: {result.stdout.strip()}\n"
             f"  stderr: {result.stderr.strip()}"
         )
+    if not output_cfg.exists():
+        raise RuntimeError(f"calculate_efs ran but output not found: {output_cfg}")
 
 
 def parse_cfg_efs(cfg_path: Path) -> list[dict]:
@@ -52,9 +62,10 @@ def parse_cfg_efs(cfg_path: Path) -> list[dict]:
         size_m = re.search(r"Size\s+(\d+)", block)
         natoms = int(size_m.group(1)) if size_m else None
 
-        # energy
-        e_m = re.search(r"Energy\s+([\d.eE+\-]+)", block)
-        energy = float(e_m.group(1)) if e_m else None
+        # energy — take the LAST Energy line in the block so MTP value
+        # (written after DFT) is used when parsing predicted_cfg
+        e_matches = list(re.finditer(r"Energy\s+([\d.eE+\-]+)", block))
+        energy = float(e_matches[-1].group(1)) if e_matches else None
 
         # forces from AtomData block: cols are id type x y z fx fy fz ...
         forces: list[float] = []
