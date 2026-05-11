@@ -1,7 +1,7 @@
 # src/mlip_pipeline/models.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -40,11 +40,11 @@ class VaspParallelConfig:
     def to_incar_dict(self) -> dict[str, int]:
         return {"NCORE": self.ncore, "KPAR": self.kpar}
 
+
 class ScalingPolicy:
     def __init__(self, yaml_cfg: dict):
         self.threshold = yaml_cfg.get("size_threshold", 150)
         self.k_scaling = yaml_cfg.get("kpoint_scaling", 0.5)
-        # Configs for "Small" vs "Large"
         self.small_cfg = yaml_cfg.get("small_system", {})
         self.large_cfg = yaml_cfg.get("large_system", {})
 
@@ -73,21 +73,23 @@ class LabelResult:
 
     @classmethod
     def load_from_dir(cls, label_root: Path) -> LabelResult:
-        """
-        The 'Senior' way: Use the manifest as the source of truth.
-        """
         manifest_path = label_root / "label_manifest.json"
         if not manifest_path.exists():
-            raise FileNotFoundError(f"No manifest found at {manifest_path}. Did the labeling step finish?")
-
-        # In a real senior-level app, you'd use a JSON library to parse this
-        # and validate that the task_dirs listed actually exist.
+            raise FileNotFoundError(
+                f"No manifest found at {manifest_path}. Did the labeling step finish?"
+            )
         import json
         data = json.loads(manifest_path.read_text())
-
         return cls(
             label_root=label_root,
             task_dirs=[Path(d) for d in data["task_dirs"]],
             task_count=data["task_count"],
-            manifest_path=manifest_path
+            manifest_path=manifest_path,
         )
+
+
+@dataclass
+class EvaluateResult:
+    eval_dir: Path
+    metrics_csv: Path
+    plots: list[Path] = field(default_factory=list)

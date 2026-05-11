@@ -13,17 +13,21 @@ from mlip_pipeline.models import FitResult, LabelResult
 from mlip_pipeline.select.runner import run_selection
 from mlip_pipeline.label.runner import run_labeling
 from mlip_pipeline.label.local_runner import run_vasp_local
-from mlip_pipeline.io.dardel import submit_label_jobs, sync_inputs_to_dardel, submit_jobs_on_dardel, watch_queue, \
-    sync_outputs_from_dardel
+from mlip_pipeline.io.dardel import (
+    submit_label_jobs,
+    sync_inputs_to_dardel,
+    submit_jobs_on_dardel,
+    watch_queue,
+    sync_outputs_from_dardel,
+)
 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-
+from mlip_pipeline.evaluate.runner import run_evaluation
 
 
 def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
     fit_dir = resolved_paths["runs_root"] / config["fit"]["output_subdir"]
     fit_model = fit_dir / config["fit"]["trained_potential_name"]
     fit_log = fit_dir / "train.log"
-
     return FitResult(
         run_dir=fit_dir,
         model_path=fit_model,
@@ -67,7 +71,6 @@ def cmd_label(config: dict, resolved_paths: dict) -> None:
 
 def cmd_label_run(config: dict, resolved_paths: dict) -> None:
     """Run already-labeled VASP tasks locally using mpirun (no scheduler)."""
-    from mlip_pipeline.models import LabelResult
     from pathlib import Path
 
     label_cfg  = config["label"]
@@ -87,47 +90,32 @@ def cmd_label_run(config: dict, resolved_paths: dict) -> None:
         task_count=len(task_dirs),
         manifest_path=label_root / "label_manifest.json",
     )
-
     run_vasp_local(label_result, config)
 
 
 def cmd_sync_to_remote(label_result: LabelResult, config: dict, resolved_paths: dict):
-    """Command 1: Only move files."""
     label_cfg = config["label"]
     d_cfg = label_cfg["dardel"]
-
-    # Use resolved_paths instead of config for the 'runs_root'
     runs_root = resolved_paths["runs_root"]
     remote_dir = f"{d_cfg['remote_root']}/{runs_root.name}/{label_cfg['output_subdir']}"
-
     sync_inputs_to_dardel(
         label_result.label_root,
         d_cfg["user"],
         d_cfg.get("host", "dardel.pdc.kth.se"),
-        remote_dir
+        remote_dir,
     )
 
 
 def cmd_submit_and_watch(label_result: LabelResult, config: dict, resolved_paths: dict):
-    """
-    Submits jobs, waits for completion, and automatically pulls results.
-    """
     label_cfg = config["label"]
     d_cfg = label_cfg["dardel"]
     user = d_cfg["user"]
     host = d_cfg.get("host", "dardel.pdc.kth.se")
-
     runs_root = resolved_paths["runs_root"]
     remote_dir = f"{d_cfg['remote_root']}/{runs_root.name}/{label_cfg['output_subdir']}"
-
-    # 1. Submit
     print(f"Submitting jobs in {remote_dir}...")
     submit_jobs_on_dardel(user, host, remote_dir)
-
-    # 2. Watch (returns when done)
     finished_cleanly = watch_queue(user, host, poll_interval=d_cfg.get("poll_interval", 60))
-
-    # 3. Auto-sync back
     if finished_cleanly:
         sync_outputs_from_dardel(label_result.label_root, user, host, remote_dir)
 
@@ -137,6 +125,13 @@ def cmd_convert_cfg(config: dict, resolved_paths: dict) -> None:
     label_result = LabelResult.load_from_dir(label_root)
     merged = convert_outcars_to_cfg(label_result, config, resolved_paths)
     print(merged)
+
+
+def cmd_evaluate(config: dict, resolved_paths: dict) -> None:
+    fit_result = build_fit_result(config, resolved_paths)
+    result = run_evaluation(config, resolved_paths, fit_result)
+    for p in result.plots:
+        print(p)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
         "watch-remote",
         "sync-from-remote",
         "convert-cfg",
+        "evaluate",
     ]
 
     for name in commands:
@@ -163,7 +159,6 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--config", required=True)
 
     return parser
-
 
 
 def main() -> None:
@@ -205,7 +200,6 @@ def main() -> None:
 
     if args.command == "sync-to-remote":
         result = LabelResult.load_from_dir(label_root)
-        # Pass resolved_paths as the third argument
         cmd_sync_to_remote(result, config, resolved_paths)
         return
 
@@ -217,7 +211,6 @@ def main() -> None:
 
     if args.command == "watch-remote":
         d_cfg = config["label"]["dardel"]
-        # Now returns cleanly when queue is empty, but doesn't trigger sync
         watch_queue(d_cfg["user"], d_cfg.get("host"), poll_interval=d_cfg.get("poll_interval", 60))
         return
 
@@ -230,6 +223,10 @@ def main() -> None:
 
     if args.command == "convert-cfg":
         cmd_convert_cfg(config, resolved_paths)
+        return
+
+    if args.command == "evaluate":
+        cmd_evaluate(config, resolved_paths)
         return
 
     raise ValueError(f"unknown command: {args.command}")
