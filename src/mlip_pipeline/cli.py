@@ -130,7 +130,7 @@ def cmd_convert_cfg(config: dict, resolved_paths: dict) -> None:
 def cmd_evaluate(config: dict, resolved_paths: dict) -> None:
     fit_result = build_fit_result(config, resolved_paths)
     result = run_evaluation(config, resolved_paths, fit_result)
-    for p in result.plots:
+    for p in result.plot_paths.values():
         print(p)
 
 
