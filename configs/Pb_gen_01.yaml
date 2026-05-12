@@ -19,8 +19,9 @@ fit:
   mpi_prefix: mpirun -np 32
   template_dir: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/MTP_templates
   mtp_level: 20
-  output_subdir: Pb_gen_00_fit
+  output_subdir: Pb_gen_01_fit
   trained_potential_name: pb20.almtp
+  train_cfg: datasets/converted_cfg/train.cfg
   extra_args:
     - --energy-weight=1
     - --force-weight=0.01
@@ -42,15 +43,15 @@ materials_project:
 
 explore:
   temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
-  output_subdir: Pb_gen_00_explore
+  output_subdir: Pb_gen_01_explore
   ensemble: npt
   timestep: 0.00001
   nsteps: 50000
   dump_every: 50
-  pressure_bar: [-5000, 0, 5000]
+  pressure_bar: [0, 1, 5, 10]
   seed_base: 492845
 
-  replicate: [4, 4, 4]
+  replicate: [1, 1, 1]
   tdamp: 2
   pdamp: 10.0
   neighbor_skin: 4.0
@@ -87,8 +88,8 @@ explore:
 
 
 select:
-  input_subdir: Pb_gen_00_explore
-  output_subdir: Pb_gen_00_select
+  input_subdir: Pb_gen_01_explore
+  output_subdir: Pb_gen_01_select
 
   strategy: mlip_select_add
   candidate_filename: preselected.cfg
@@ -99,3 +100,65 @@ select:
   merged_candidates_filename: candidates_merged.cfg
   selected_filename: selected.cfg
   write_manifest: true
+
+
+label:
+  input_subdir: Pb_gen_01_select
+  output_subdir: Pb_gen_01_label
+  selected_filename: selected.cfg
+  type_map: /home/saitto/data/Pb108eq/type_map.raw
+  template_dir: datasets/pb_cfg/vasp_template   # KPOINTS + POTCAR only
+  incar:
+    ALGO:   Fast
+    PREC:   Accurate
+    ISTART: 0
+    ICHARG: 2
+    LREAL:  .False.
+    LWAVE:  .False.
+    ENCUT:  400
+    NELM:   200
+    EDIFF:  1E-05
+    IBRION: -1
+    EDIFFG: -0.01
+    ISIF:   0
+    ISMEAR: 1
+    SIGMA:  0.2
+    NSW:    0
+  scaling_rules:
+    size_threshold: 150
+    kpoint_scaling: 0.5
+    small_system:
+      partition: "shared"
+      nodes: 1
+      ntasks: 32
+      ncore: 1
+      kpar: 16
+    large_system:
+      partition: "main"
+      nodes: 2
+      ntasks: 256
+      ncore: 32
+      kpar: 2
+  dardel:
+    user: saitto
+    host: dardel.pdc.kth.se
+    remote_root: /cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1
+    poll_interval: 300
+  local:
+    source_env: ~/vasp_env.sh
+    vasp_bin: /opt/vasp/vasp.6.5.1_cpu/bin/vasp_std
+    np: 32
+    parallel: 4
+  slurm:
+    account: naiss2025-3-54
+    vasp_cmd: vasp_std
+    env_block: |
+      export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
+      module load PrgEnv-intel/8.5.0
+
+
+convert:
+  output_subdir: converted_cfg
+  run_name: run_01
+  merge_name: train.cfg
+  # origin_cfg: pb_cfg/train.cfg    # optional — derived automatically from training block
