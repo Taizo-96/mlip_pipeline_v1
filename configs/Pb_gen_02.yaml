@@ -19,7 +19,7 @@ fit:
   mpi_prefix: mpirun -np 32
   template_dir: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/MTP_templates
   mtp_level: 20
-  output_subdir: Pb_gen_01_fit
+  output_subdir: Pb_gen_02_fit
   trained_potential_name: pb20.almtp
   train_cfg: datasets/converted_cfg/train.cfg
   extra_args:
@@ -88,8 +88,8 @@ explore:
 
 
 select:
-  input_subdir: Pb_gen_01_explore
-  output_subdir: Pb_gen_01_select
+  input_subdir: Pb_gen_02_explore
+  output_subdir: Pb_gen_02_select
 
   strategy: mlip_select_add
   candidate_filename: preselected.cfg
@@ -103,8 +103,8 @@ select:
 
 
 label:
-  input_subdir: Pb_gen_01_select
-  output_subdir: Pb_gen_01_label
+  input_subdir: Pb_gen_02_select
+  output_subdir: Pb_gen_02_label
   selected_filename: selected.cfg
   type_map: /home/saitto/data/Pb108eq/type_map.raw
   template_dir: datasets/pb_cfg/vasp_template   # KPOINTS + POTCAR only
@@ -159,6 +159,6 @@ label:
 
 convert:
   output_subdir: converted_cfg
-  run_name: run_01
+  run_name: run_02
   merge_name: train.cfg
   # origin_cfg: pb_cfg/train.cfg    # optional — derived automatically from training block
