@@ -89,7 +89,9 @@ class LabelResult:
 
 
 @dataclass
-class EvaluateResult:
+class EvaluationResult:
+    rmse_energy: float
+    rmse_forces: float
+    rmse_stress: float
     eval_dir: Path
-    metrics_csv: Path
-    plots: list[Path] = field(default_factory=list)
+    plot_paths: dict[str, Path] = field(default_factory=dict)

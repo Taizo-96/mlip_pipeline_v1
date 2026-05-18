@@ -18,9 +18,9 @@ fit:
   mlp_command: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
   mpi_prefix: mpirun -np 32
   template_dir: /home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/MTP_templates
-  mtp_level: 20
+  mtp_level: 16
   output_subdir: Pb_gen_01_fit
-  trained_potential_name: pb20.almtp
+  trained_potential_name: pb16.almtp
   train_cfg: datasets/converted_cfg/train.cfg
   extra_args:
     - --energy-weight=1
@@ -95,6 +95,8 @@ select:
   candidate_filename: preselected.cfg
 
   mlip_command: mlp
+  mpi_np: 16           # ← add this; omit entirely to run without MPI
+  # mpi_command: srun  # ← optional override (default: mpirun)
   training_cfg: datasets/converted_cfg/train.cfg
 
   merged_candidates_filename: candidates_merged.cfg

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mlip_pipeline.models import FitResult, EvaluateResult
+from mlip_pipeline.models import FitResult, EvaluationResult
 from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.evaluate.log_parser import parse_train_log, write_metrics_csv
 from mlip_pipeline.evaluate.parity import run_calculate_efs, parse_cfg_efs, build_parity_data
 from mlip_pipeline.evaluate.gamma import parse_grades_from_cfg
 from mlip_pipeline.evaluate import plots
+
 
 
 def _resolve_train_cfg(config: dict, resolved_paths: dict) -> Path:
@@ -37,7 +38,7 @@ def run_evaluation(
     config: dict,
     resolved_paths: dict,
     fit_result: FitResult,
-) -> EvaluateResult:
+) -> EvaluationResult:
     fit_cfg   = config["fit"]
     mlp_cmd   = fit_cfg.get("mlp_command", "mlp")
     eval_dir  = ensure_dir(fit_result.run_dir / "eval")
@@ -130,8 +131,10 @@ def run_evaluation(
         print("  [gamma]   WARNING: no preselected/selected cfg found")
 
     print(f"\nEvaluation complete — {len(plot_paths)} plot(s) in {eval_dir}/")
-    return EvaluateResult(
+    return EvaluationResult(
+        rmse_energy=metrics.get("rmse_e", float("nan")),
+        rmse_forces=metrics.get("rmse_f", float("nan")),
+        rmse_stress=metrics.get("rmse_s", float("nan")),
         eval_dir=eval_dir,
-        metrics_csv=eval_dir / "metrics.csv",
-        plots=plot_paths,
+        plot_paths={p.stem: p for p in plot_paths},
     )

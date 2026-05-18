@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-
+from mlip_pipeline.utils.shell import run_command
 from mlip_pipeline.models import LabelResult
 
 

@@ -110,23 +110,44 @@ def parse_cfg_efs(cfg_path: Path) -> list[dict]:
 def build_parity_data(ref_records: list[dict], pred_records: list[dict]) -> dict:
     """
     Align reference and predicted records into flat lists for plotting.
+    Only keep matched data and enforce equal x/y lengths for every channel.
     """
     n = min(len(ref_records), len(pred_records))
-    energies_ref  = [ref_records[i]["energy_per_atom"] for i in range(n)]
-    energies_pred = [pred_records[i]["energy_per_atom"] for i in range(n)]
-    forces_ref    = [f for i in range(n) for f in ref_records[i]["forces"]]
-    forces_pred   = [f for i in range(n) for f in pred_records[i]["forces"]]
 
-    stress_ref, stress_pred = None, None
-    if ref_records[0].get("stress") and pred_records[0].get("stress"):
-        stress_ref  = [s for i in range(n) for s in (ref_records[i]["stress"] or [])]
-        stress_pred = [s for i in range(n) for s in (pred_records[i]["stress"] or [])]
+    energies_ref, energies_pred = [], []
+    forces_ref, forces_pred = [], []
+    stress_ref, stress_pred = [], []
+
+    for i in range(n):
+        ref = ref_records[i]
+        pred = pred_records[i]
+
+        # Energy: only if both are present
+        if ref.get("energy_per_atom") is not None and pred.get("energy_per_atom") is not None:
+            energies_ref.append(ref["energy_per_atom"])
+            energies_pred.append(pred["energy_per_atom"])
+
+        # Forces: trim per-config to matched component count
+        ref_forces = ref.get("forces") or []
+        pred_forces = pred.get("forces") or []
+        nf = min(len(ref_forces), len(pred_forces))
+        if nf > 0:
+            forces_ref.extend(ref_forces[:nf])
+            forces_pred.extend(pred_forces[:nf])
+
+        # Stress: only include configs where both sides have stress
+        ref_stress = ref.get("stress") or []
+        pred_stress = pred.get("stress") or []
+        ns = min(len(ref_stress), len(pred_stress))
+        if ns > 0:
+            stress_ref.extend(ref_stress[:ns])
+            stress_pred.extend(pred_stress[:ns])
 
     return {
-        "energies_ref":  energies_ref,
+        "energies_ref": energies_ref,
         "energies_pred": energies_pred,
-        "forces_ref":    forces_ref,
-        "forces_pred":   forces_pred,
-        "stress_ref":    stress_ref,
-        "stress_pred":   stress_pred,
+        "forces_ref": forces_ref,
+        "forces_pred": forces_pred,
+        "stress_ref": stress_ref if stress_ref else None,
+        "stress_pred": stress_pred if stress_pred else None,
     }
