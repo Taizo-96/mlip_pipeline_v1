@@ -1,184 +1,140 @@
-"""mlip_pipeline/evaluate/runner.py
-Parses MLIP-3 output and drives all evaluation plots.
-"""
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from dataclasses import dataclass, field
 
-import numpy as np
-
+from mlip_pipeline.models import FitResult, EvaluationResult
+from mlip_pipeline.utils.fs import ensure_dir
+from mlip_pipeline.evaluate.log_parser import parse_train_log, write_metrics_csv
+from mlip_pipeline.evaluate.parity import run_calculate_efs, parse_cfg_efs, build_parity_data
+from mlip_pipeline.evaluate.gamma import parse_grades_from_cfg
 from mlip_pipeline.evaluate import plots
 
 
-# ── result dataclass ──────────────────────────────────────────────────────────
 
-@dataclass
-class EvaluationResult:
-    rmse_energy: float
-    rmse_forces: float
-    rmse_stress: float
-    eval_dir: Path
-    plot_paths: dict[str, Path] = field(default_factory=dict)
+def _resolve_train_cfg(config: dict, resolved_paths: dict) -> Path:
+    """Resolve training cfg with the same fallback chain as trainer.py."""
+    fit_cfg = config["fit"]
+    if "train_cfg" in fit_cfg:
+        p = Path(fit_cfg["train_cfg"])
+        return (resolved_paths["project_root"] / p).resolve() if not p.is_absolute() else p
 
+    convert_cfg = config.get("convert", {})
+    if convert_cfg.get("output_subdir"):
+        return (
+            resolved_paths["datasets_root"]
+            / convert_cfg["output_subdir"]
+            / convert_cfg.get("merge_name", "train.cfg")
+        ).resolve()
 
-# ── MLIP-3 log parser ─────────────────────────────────────────────────────────
+    training_block = config["training"]
+    return (
+        resolved_paths["datasets_root"]
+        / training_block.get("output_subdir", "pb_cfg")
+        / training_block.get("merge_name", "train.cfg")
+    ).resolve()
 
-def _parse_mlip3_log(log_path: Path) -> dict:
-    """
-    Parse the MLIP-3 ``calc-grade`` / ``calc-errors`` output.
-
-    The parser is section-aware and intentionally lenient:
-    lines that don't match the expected column count are skipped.
-    Sections are detected by header keywords written by MLIP-3.
-    """
-    energy_ref, energy_pred = [], []
-    force_ref,  force_pred  = [], []
-    stress_ref, stress_pred = [], []
-    gamma_vals              = []
-
-    in_energy_section  = False
-    in_force_section   = False
-    in_stress_section  = False
-    in_grade_section   = False
-
-    with open(log_path) as fh:
-        lines = fh.readlines()
-
-    for line in lines:
-        stripped = line.strip()
-        low = stripped.lower()
-
-        # section header detection
-        if "energy" in low and ("ref" in low or "predicted" in low):
-            in_energy_section = True
-            in_force_section = in_stress_section = in_grade_section = False
-            continue
-        if "force" in low and ("ref" in low or "predicted" in low):
-            in_force_section = True
-            in_energy_section = in_stress_section = in_grade_section = False
-            continue
-        if "stress" in low and ("ref" in low or "predicted" in low):
-            in_stress_section = True
-            in_energy_section = in_force_section = in_grade_section = False
-            continue
-        if "grade" in low or "gamma" in low:
-            in_grade_section = True
-            in_energy_section = in_force_section = in_stress_section = False
-            continue
-        if stripped.startswith("#") or not stripped:
-            continue
-
-        nums = []
-        for tok in stripped.split():
-            try:
-                nums.append(float(tok))
-            except ValueError:
-                pass
-
-        if not nums:
-            continue
-
-        if in_energy_section and len(nums) >= 2:
-            energy_ref.append(nums[0])
-            energy_pred.append(nums[1])
-        elif in_force_section and len(nums) >= 6:
-            force_ref.append(nums[0:3])
-            force_pred.append(nums[3:6])
-        elif in_stress_section and len(nums) >= 12:
-            stress_ref.append(nums[0:6])
-            stress_pred.append(nums[6:12])
-        elif in_grade_section and len(nums) >= 1:
-            gamma_vals.append(nums[-1])
-
-    return {
-        "energy_ref":  np.array(energy_ref),
-        "energy_pred": np.array(energy_pred),
-        "force_ref":   np.array(force_ref)  if force_ref  else np.empty((0, 3)),
-        "force_pred":  np.array(force_pred) if force_pred else np.empty((0, 3)),
-        "stress_ref":  np.array(stress_ref)  if stress_ref  else np.empty((0, 6)),
-        "stress_pred": np.array(stress_pred) if stress_pred else np.empty((0, 6)),
-        "gamma":       np.array(gamma_vals),
-    }
-
-
-def _rmse(ref, pred) -> float:
-    r = np.asarray(ref, dtype=float).ravel()
-    p = np.asarray(pred, dtype=float).ravel()
-    n = min(len(r), len(p))
-    if n == 0:
-        return float("nan")
-    return float(np.sqrt(np.mean((r[:n] - p[:n]) ** 2)))
-
-
-# ── public entry point ────────────────────────────────────────────────────────
 
 def run_evaluation(
     config: dict,
     resolved_paths: dict,
-    fit_result,
-    *,
-    config_labels=None,
-    gamma_threshold: float | None = None,
+    fit_result: FitResult,
 ) -> EvaluationResult:
-    """
-    Parse MLIP-3 evaluation log, compute RMSEs, and produce all plots.
+    fit_cfg   = config["fit"]
+    mlp_cmd   = fit_cfg.get("mlp_command", "mlp")
+    eval_dir  = ensure_dir(fit_result.run_dir / "eval")
+    plot_paths: list[Path] = []
+    metrics: dict = {}
 
-    Parameters
-    ----------
-    config_labels :
-        Optional list/array of string labels (one per structure) used for
-        the per-config-type RMSE bar chart.  If None that plot is skipped.
-    gamma_threshold :
-        The gamma threshold used in active learning; drawn as a vertical line
-        on the gamma histogram.  Falls back to config["select"]["gamma_break"]
-        if present.
-    """
-    eval_cfg = config.get("evaluate", {})
-    eval_dir = resolved_paths["runs_root"] / eval_cfg.get("output_subdir", "evaluate")
-    eval_dir.mkdir(parents=True, exist_ok=True)
-
-    log_path = fit_result.log_path
-
-    # ── parse ─────────────────────────────────────────────────────────────────
-    parity = _parse_mlip3_log(log_path)
-
-    rmse_e = _rmse(parity["energy_ref"],  parity["energy_pred"])
-    rmse_f = _rmse(parity["force_ref"],   parity["force_pred"])
-    rmse_s = _rmse(parity["stress_ref"],  parity["stress_pred"])
-
-    print(f"  [loss]    rmse_e = {rmse_e:.6g}")
-    print(f"  [loss]    rmse_f = {rmse_f:.6g}")
-    print(f"  [loss]    rmse_s = {rmse_s:.6g}")
-
-    all_paths: dict[str, Path] = {}
-
-    # 1. parity plots (E, F per x/y/z, S per Voigt component)
-    parity_paths = plots.plot_parity(parity, eval_dir)
-    all_paths.update(parity_paths)
-
-    # 2. error histograms
-    hist_paths = plots.plot_error_histograms(parity, eval_dir)
-    all_paths.update(hist_paths)
-
-    # 3. gamma histogram
-    if len(parity["gamma"]) > 0:
-        thr = gamma_threshold or config.get("select", {}).get("gamma_break")
-        p   = plots.plot_gamma_histogram(parity["gamma"], eval_dir, threshold=thr)
-        all_paths["gamma"] = p
+    # ── 1. Loss summary from train.log ────────────────────────────────────────
+    if fit_result.log_path.exists():
+        metrics = parse_train_log(fit_result.log_path)
+        if metrics:
+            metrics_csv = write_metrics_csv(metrics, eval_dir / "metrics.csv")
+            p = plots.plot_summary_metrics(metrics, eval_dir / "loss_summary.png")
+            plot_paths.append(p)
+            for k, v in metrics.items():
+                print(f"  [loss]    {k} = {v:.6g}")
+        else:
+            print("  [loss]    WARNING: no RMSE summary found in train.log")
     else:
-        print("  [info] no gamma values in log; skipping gamma histogram.")
+        print(f"  [loss]    WARNING: train.log not found at {fit_result.log_path}")
 
-    # 4. per-config-type RMSE (optional)
-    if config_labels is not None:
-        p = plots.plot_per_config_rmse(parity, config_labels, eval_dir)
-        all_paths["per_config_rmse"] = p
+    # ── 2. Parity plots via calculate_efs ────────────────────────────────────
+    train_cfg     = _resolve_train_cfg(config, resolved_paths)
+    predicted_cfg = eval_dir / "predicted_train.cfg"
 
+    if train_cfg.exists() and fit_result.model_path.exists():
+        try:
+            run_calculate_efs(mlp_cmd, fit_result.model_path, train_cfg, predicted_cfg)
+            ref_records  = parse_cfg_efs(train_cfg)
+            pred_records = parse_cfg_efs(predicted_cfg)
+            parity       = build_parity_data(ref_records, pred_records)
+            parity_paths = plots.plot_parity(parity, eval_dir)
+            plot_paths.extend(parity_paths)
+            print(f"  [parity]  {len(ref_records)} configs → {[p.name for p in parity_paths]}")
+        except RuntimeError as exc:
+            print(f"  [parity]  WARNING: {exc}")
+    else:
+        missing = []
+        if not train_cfg.exists():
+            missing.append(f"train_cfg ({train_cfg})")
+        if not fit_result.model_path.exists():
+            missing.append(f"model ({fit_result.model_path})")
+        print(f"  [parity]  WARNING: missing {', '.join(missing)}, skipping parity")
+
+    # ── 3. Gamma histogram ────────────────────────────────────────────────────
+    explore_cfg  = config.get("explore", {})
+    explore_root = resolved_paths["runs_root"] / explore_cfg.get("output_subdir", "")
+    presel_name  = (
+        explore_cfg.get("active_learning", {})
+        .get("save_extrapolative_to", "preselected.cfg")
+    )
+
+    grade_cfgs: list[Path] = []
+    if explore_root.exists():
+        grade_cfgs = sorted(explore_root.rglob(presel_name))
+
+    # fallback: selected.cfg from select step
+    if not grade_cfgs:
+        select_cfg  = config.get("select", {})
+        select_root = resolved_paths["runs_root"] / select_cfg.get("output_subdir", "")
+        sel_path    = select_root / select_cfg.get("selected_filename", "selected.cfg")
+        if sel_path.exists():
+            grade_cfgs = [sel_path]
+
+    if grade_cfgs:
+        all_grades: list[float] = []
+        for gc in grade_cfgs:
+            all_grades.extend(parse_grades_from_cfg(gc))
+
+        if all_grades:
+            al_cfg = explore_cfg.get("active_learning", {})
+            thresholds = {
+                k: v
+                for k, v in {
+                    "save":  al_cfg.get("threshold_save"),
+                    "break": al_cfg.get("threshold_break"),
+                }.items()
+                if v is not None
+            }
+            p = plots.plot_gamma_histogram(
+                all_grades, thresholds, eval_dir / "gamma_hist.png"
+            )
+            plot_paths.append(p)
+            print(
+                f"  [gamma]   {len(all_grades):,} grades from "
+                f"{len(grade_cfgs)} cfg(s) → {p.name}"
+            )
+        else:
+            print("  [gamma]   WARNING: no grade values found in cfg files")
+    else:
+        print("  [gamma]   WARNING: no preselected/selected cfg found")
+
+    print(f"\nEvaluation complete — {len(plot_paths)} plot(s) in {eval_dir}/")
     return EvaluationResult(
-        rmse_energy=rmse_e,
-        rmse_forces=rmse_f,
-        rmse_stress=rmse_s,
+        rmse_energy=metrics.get("rmse_e", float("nan")),
+        rmse_forces=metrics.get("rmse_f", float("nan")),
+        rmse_stress=metrics.get("rmse_s", float("nan")),
         eval_dir=eval_dir,
-        plot_paths=all_paths,
+        plot_paths={p.stem: p for p in plot_paths},
     )

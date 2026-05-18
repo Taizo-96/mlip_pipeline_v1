@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 import glob
 import os
+import json   # NEW
 import numpy as np
 
 from mlip_pipeline.models import PrepareTrainResult
 from mlip_pipeline.utils.fs import ensure_dir
 
 
-def _write_cfg(system_dir: str | Path, out_path: str | Path) -> None:
+def _write_cfg(system_dir: str | Path, out_path: str | Path) -> int:
     system_dir = Path(system_dir)
     out_path = Path(out_path)
     base = system_dir / "set.000"
@@ -61,6 +62,8 @@ def _write_cfg(system_dir: str | Path, out_path: str | Path) -> None:
             f.write(f"   {i}\n")
             f.write("END_CFG\n\n")
 
+    return nframes
+
 
 def prepare_training_cfgs(config: dict, resolved_paths: dict) -> PrepareTrainResult:
     train_cfg = config["training"]
@@ -76,11 +79,19 @@ def prepare_training_cfgs(config: dict, resolved_paths: dict) -> PrepareTrainRes
         resolved_paths["datasets_root"] / train_cfg.get("output_subdir", "pb_cfg")
     )
     generated: list[Path] = []
+
+    # NEW: track cfg counts per system
+    cfg_counts: dict[str, int] = {}
+    total_cfgs = 0
+
     for system_dir in systems:
         name = Path(system_dir).name
         out_path = output_dir / f"{name}.cfg"
-        _write_cfg(system_dir, out_path)
+        n_cfgs = _write_cfg(system_dir, out_path)  # now returns count
         generated.append(out_path)
+
+        cfg_counts[name] = n_cfgs
+        total_cfgs += n_cfgs
 
     merge_name = train_cfg.get("merge_name", "train.cfg")
     merged_cfg: Path | None = None
@@ -93,6 +104,26 @@ def prepare_training_cfgs(config: dict, resolved_paths: dict) -> PrepareTrainRes
                 if not text.endswith("\n"):
                     merged.write("\n")
 
+    # NEW: write manifest
+    manifest_name = train_cfg.get("manifest_name", "manifest.json")
+    manifest_path = output_dir / manifest_name
+
+    manifest = {
+        "total_cfgs": total_cfgs,
+        "per_system": cfg_counts,
+        "merged_cfg": str(merged_cfg) if merged_cfg is not None else None,
+        "generated_cfgs": [str(p) for p in generated],
+    }
+
+    # If you already have a JSON/YAML helper in mlip_pipeline.utils.fs,
+    # you can replace this with that function.
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
     return PrepareTrainResult(
-        output_dir=output_dir, merged_cfg=merged_cfg, generated_cfgs=generated
+        output_dir=output_dir,
+        merged_cfg=merged_cfg,
+        generated_cfgs=generated,
+        # optionally add manifest_path here if PrepareTrainResult supports it
+        # manifest_path=manifest_path,
     )

@@ -26,6 +26,8 @@ def run_selection(
     )
     selected_filename = select_cfg.get("selected_filename", "selected.cfg")
     mlip_command = select_cfg.get("mlip_command", "mlp")
+    mpi_np      = select_cfg.get("mpi_np", None)          # ← new: number of MPI ranks, None = disabled
+    mpi_command = select_cfg.get("mpi_command", "mpirun")  # ← new: override mpirun/srun/etc.
     write_manifest = bool(select_cfg.get("write_manifest", True))
 
     training_cfg = Path(select_cfg["training_cfg"])
@@ -51,14 +53,20 @@ def run_selection(
 
     merge_cfg_files(candidate_paths, merged_candidates_path)
 
-    command = [
-        mlip_command,
-        "select_add",
-        model_path.name,
-        str(training_cfg),
-        merged_candidates_path.name,
-        selected_cfg_path.name,
-    ]
+    mlp_args = [
+      mlip_command,
+      "select_add",
+      model_path.name,
+      str(training_cfg),
+      merged_candidates_path.name,
+      selected_cfg_path.name,
+      ]
+
+    if mpi_np is not None:
+        command = [mpi_command, "-np", str(mpi_np)] + mlp_args
+    else:
+        command = mlp_args
+    
 
     log_path = select_root / "select_add.log"
     return_code = run_command(command, cwd=select_root, log_file=log_path)
@@ -90,6 +98,7 @@ def run_selection(
             "selected_count": len(selected_cfg_paths),
             "candidate_sources": source_map,
             "selected_block_files": [str(p) for p in selected_cfg_paths],
+            "mpi_np": mpi_np,   # ← add inside the manifest dict
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
     else:
