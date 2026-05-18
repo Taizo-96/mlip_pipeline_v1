@@ -1,31 +1,33 @@
 from __future__ import annotations
-
-from pathlib import Path
 import subprocess
-
+from pathlib import Path
+from typing import Sequence
+from mlip_pipeline.utils.logging import info
 
 def run_command(
-    command: list[str],
+    command: Sequence[str],
+    *,
     cwd: str | Path | None = None,
     log_file: str | Path | None = None,
-    env: dict | None = None, # Added for source_env support
+    live_tail: bool = False,
+    env: dict | None = None,
 ) -> int:
-    cwd_path = Path(cwd).resolve() if cwd is not None else None
-
-    if log_file is None:
-        result = subprocess.run(command, cwd=cwd_path)
-        return result.returncode
-
-    log_path = Path(log_file).resolve()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(log_path, "w", encoding="utf-8") as fh:
-        result = subprocess.run(
-            command,
-            cwd=cwd_path,
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env  # Pass environment through
+    cwd = Path(cwd) if cwd else None
+    info(f"$ {' '.join(str(a) for a in command)}")
+    lf = open(log_file, "w", encoding="utf-8") if log_file else None
+    try:
+        proc = subprocess.Popen(
+            [str(a) for a in command],
+            cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, env=env,
         )
-        return result.returncode
+        for line in proc.stdout:
+            if lf:
+                lf.write(line)
+            if live_tail:
+                print(f"  │ {line.rstrip()}", flush=True)
+        proc.wait()
+        return proc.returncode
+    finally:
+        if lf:
+            lf.close()
