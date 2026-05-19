@@ -186,7 +186,9 @@ class EvaluationResult:
 
 # ── Generation state (automation) ─────────────────────────────────────────────
 
-STEPS = ("fit", "explore", "select", "label", "label_hpc", "convert")
+# HPC mode: label prepares inputs, label_hpc submits to Dardel and waits.
+# Local mode: label prepares inputs, label_local runs VASP via mpirun.
+STEPS = ("fit", "explore", "select", "label", "label_hpc", "label_local", "convert")
 
 @dataclass
 class GenerationState:

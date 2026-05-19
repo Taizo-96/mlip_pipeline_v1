@@ -67,11 +67,16 @@ def run_single_generation(
             state.mark_step_start(step)
             step_header(step.upper())
 
+            # ── fit ────────────────────────────────────────────────────────
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential
-                result = train_potential(config, paths, )
+                result = train_potential(config, paths)
                 state.model_path = str(result.model_path)
 
+<<<<<<< HEAD
+=======
+            # ── explore ────────────────────────────────────────────────────
+>>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
             elif step == "explore":
                 from mlip_pipeline.explore.prepare import prepare_exploration
                 from mlip_pipeline.explore.runner import run_exploration_runs
@@ -79,6 +84,7 @@ def run_single_generation(
                 prepare_exploration(config, paths, explore_dir)
                 run_exploration_runs(config, paths, explore_dir, )
 
+            # ── select ─────────────────────────────────────────────────────
             elif step == "select":
                 fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
                 fit_result = (
@@ -87,10 +93,12 @@ def run_single_generation(
                     else FitResult.load_manifest(fit_dir)
                 )
                 from mlip_pipeline.select.runner import run_selection
-                run_selection(config, paths, fit_result, )
+                run_selection(config, paths, fit_result)
 
+            # ── label (prepare VASP input dirs) ────────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
+<<<<<<< HEAD
                 run_labeling(config, paths, )
 
 
@@ -100,20 +108,55 @@ def run_single_generation(
                 if not sentinel.exists():
                     # submit and exit — user re-runs the loop tomorrow
                     _submit_to_dardel(config, paths, gen_tag)
+=======
+                run_labeling(config, paths)
+
+            # ── label_local (run VASP locally via mpirun) ──────────────────
+            elif step == "label_local":
+                from mlip_pipeline.label.runner import run_labeling
+                from mlip_pipeline.label.local_runner import run_vasp_local
+                label_dir = paths.get("label_dir",
+                    paths["runs_root"] / config["label"]["output_subdir"])
+                label_result = LabelResult.load_manifest(label_dir)
+                run_vasp_local(label_result, config)
+
+            # ── label_hpc (submit to Dardel + wait for OUTCARs) ────────────
+            elif step == "label_hpc":
+                from mlip_pipeline.label.runner import run_labeling
+                from mlip_pipeline.io.dardel import submit_label_jobs
+                label_result = run_labeling(config, paths)
+                submit_label_jobs(label_result, config)
+                label_root = label_result.label_root
+                outcars = list(label_root.glob("task.*/OUTCAR"))
+                if not outcars:
+>>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
                     raise RuntimeError(
                         f"Jobs submitted to Dardel. Re-run when complete:\n"
                         f"  mlip-pipeline run-loop ... --start-gen {generation}"
                     )
+<<<<<<< HEAD
 
                 # sentinel exists → already synced back, proceed to convert
+=======
+>>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
 
+            # ── convert ────────────────────────────────────────────────────
             elif step == "convert":
+<<<<<<< HEAD
                 label_dir    = paths.get("label_dir", paths["runs_root"] / "label")
+=======
+                label_dir = paths.get("label_dir",
+                    paths["runs_root"] / config["label"]["output_subdir"])
+>>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
                 result = convert_outcars_to_cfg(label_result, config, paths)
                 state.merged_cfg = str(result.merged_cfg)
 
+<<<<<<< HEAD
+=======
+            # ── mark done (single call, always) ────────────────────────────
+>>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
             state.mark_step_done(step)
 
     except Exception as exc:
