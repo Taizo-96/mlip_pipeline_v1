@@ -174,6 +174,22 @@ class ConvertResult:
             "completed_at": self.completed_at,
         })
 
+@dataclass
+class EvaluationResult:
+    run_dir: Path
+    plot_paths: dict = field(default_factory=dict)
+    metrics: dict = field(default_factory=dict)
+    completed_at: str = field(default_factory=_now)
+
+    def save_manifest(self) -> Path:
+        from mlip_pipeline.utils.fs import write_json
+        return write_json(self.run_dir / "evaluate_manifest.json", {
+            "step": "evaluate",
+            "plot_paths": {k: str(v) for k, v in self.plot_paths.items()},
+            "metrics": self.metrics,
+            "completed_at": self.completed_at,
+        })
+
 # ── Generation state (automation) ─────────────────────────────────────────────
 
 STEPS = ("fit", "explore", "select", "label", "convert")
