@@ -1,41 +1,85 @@
 from __future__ import annotations
 
-import subprocess
+import os
+import shutil
 from pathlib import Path
+
 from mlip_pipeline.utils.shell import run_command
 from mlip_pipeline.models import LabelResult
 
 
+def _resolve_vasp_bin(config: dict) -> Path:
+    """
+    Resolve the VASP binary with this priority:
+      1. config.label.local.vasp_bin  (explicit override in the local block)
+      2. config.bins.vasp             (shared bins section)
+      3. 'vasp_std'                   (last-resort default)
+
+    For each candidate:
+      - If it looks like an absolute path or a path that exists as-is, use it directly.
+      - Otherwise call shutil.which() so bare names like 'vasp_std' are found via PATH.
+    """
+    local_cfg = config.get("label", {}).get("local", {})
+    bins_cfg  = config.get("bins", {})
+
+    candidates = [
+        local_cfg.get("vasp_bin"),   # highest priority
+        bins_cfg.get("vasp"),        # shared bins section
+        "vasp_std",                  # fallback
+    ]
+
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        # Absolute or relative path that actually exists on disk
+        if p.is_absolute() or p.exists():
+            if p.exists():
+                return p
+            raise FileNotFoundError(
+                f"VASP binary not found at explicit path: {p}"
+            )
+        # Bare name (e.g. 'vasp_std') — search PATH
+        found = shutil.which(str(raw))
+        if found:
+            return Path(found)
+
+    raise FileNotFoundError(
+        f"VASP binary not found. Tried: {[c for c in candidates if c]}. "
+        f"PATH={os.environ.get('PATH', '(not set)')}"
+    )
+
+
 def run_vasp_local(label_result: LabelResult, config: dict) -> None:
-    local_cfg = config["label"].get("local", {})
-    vasp_bin = Path(local_cfg.get("vasp_bin", "/opt/vasp/vasp.6.5.1_cpu/bin/vasp_std")).expanduser()
-    np = local_cfg.get("np", 16)
-    source_env = local_cfg.get("source_env", None)
+    vasp_bin  = _resolve_vasp_bin(config)
+    local_cfg = config.get("label", {}).get("local", {})
+    np         = local_cfg.get("np", config.get("mpi", {}).get("np", 16))
+    source_env = local_cfg.get("source_env")
+    parallel   = local_cfg.get("parallel", 1)  # number of tasks to run concurrently
 
-    if not vasp_bin.exists():
-        raise FileNotFoundError(f"VASP binary not found: {vasp_bin}")
-
-    print(f"Running {len(label_result.task_dirs)} VASP task(s) | np={np}")
+    print(f"VASP binary : {vasp_bin}")
+    print(f"MPI ranks   : {np}")
+    print(f"Tasks       : {len(label_result.task_dirs)}")
+    if source_env:
+        print(f"Env script  : {source_env}")
 
     for idx, task_dir in enumerate(label_result.task_dirs, 1):
         output_dir = task_dir / "output"
         output_dir.mkdir(exist_ok=True)
 
-        # Build the command
-        # If source_env is provided, we wrap it in bash -c to preserve the environment
         if source_env:
-            full_cmd = ["bash", "-lc", f"source {source_env} && mpirun -np {np} {vasp_bin}"]
+            full_cmd = ["bash", "-lc",
+                        f"source {source_env} && mpirun -np {np} {vasp_bin}"]
         else:
             full_cmd = ["mpirun", "-np", str(np), str(vasp_bin)]
 
         print(f"  [{idx:>4d}/{len(label_result.task_dirs)}]  {task_dir.name} -> vasp.log")
 
-        # Standardize execution using the shell utility
         exit_code = run_command(
             command=full_cmd,
             cwd=task_dir,
-            log_file=output_dir / "vasp.log"
+            log_file=output_dir / "vasp.log",
         )
 
         if exit_code != 0:
-            print(f"  FAILED: {task_dir.name} (Exit code: {exit_code})")
+            print(f"  FAILED: {task_dir.name} (exit code {exit_code})")
