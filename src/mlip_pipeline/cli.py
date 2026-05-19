@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import typer
 from typing_extensions import Annotated
 from pathlib import Path
@@ -11,7 +12,7 @@ from mlip_pipeline.explore.runner import run_exploration_runs
 from mlip_pipeline.fit.trainer import train_potential
 from mlip_pipeline.integrations.lammps_export import export_mp_structures_to_lammps
 from mlip_pipeline.integrations.materials_project import download_structures_from_mp
-from mlip_pipeline.models import FitResult, LabelResult
+from mlip_pipeline.models import FitResult, LabelResult, STEPS
 from mlip_pipeline.select.runner import run_selection
 from mlip_pipeline.label.runner import run_labeling
 from mlip_pipeline.label.local_runner import run_vasp_local
@@ -174,6 +175,72 @@ def evaluate(config: Annotated[str, typer.Option(..., help="Path to config yaml"
         print(p)
 
 
+# --- STATE MANAGEMENT ---
+
+@app.command("reset-steps")
+def reset_steps(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    gen: Annotated[int, typer.Option(..., "--gen", help="Generation number")],
+    steps: Annotated[str, typer.Option(..., "--steps", help="Comma-separated steps to reset")],
+):
+    """
+    Remove one or more steps from a generation's completed_steps so the loop
+    will re-run them on the next invocation.
+
+    Example:
+        mlip-pipeline reset-steps --config configs/Pb_loop.yaml --gen 8 --steps label,label_local,convert
+    """
+    valid = set(STEPS)
+    requested = [s.strip() for s in steps.split(",") if s.strip()]
+    unknown = [s for s in requested if s not in valid]
+    if unknown:
+        raise typer.BadParameter(
+            f"Unknown step(s): {unknown}. Valid steps: {sorted(valid)}",
+            param_hint="--steps",
+        )
+
+    cfg, paths = get_paths(config)
+    gen_tag = f"gen_{gen:02d}"
+    state_file = paths["runs_root"] / gen_tag / "state.json"
+
+    if not state_file.exists():
+        typer.echo(f"No state.json found at {state_file} — nothing to reset.", err=True)
+        raise typer.Exit(1)
+
+    state = json.loads(state_file.read_text())
+    before = list(state.get("completed_steps", []))
+    state["completed_steps"] = [s for s in before if s not in requested]
+
+    # If we reset any steps, the generation is no longer "completed"
+    if state["completed_steps"] != before:
+        if state.get("status") == "completed":
+            state["status"] = "running"
+        state["error"] = None
+        state["completed_at"] = None
+        state_file.write_text(json.dumps(state, indent=2))
+        removed = [s for s in before if s in requested]
+        typer.echo(f"Reset step(s) {removed} for {gen_tag}.")
+    else:
+        typer.echo(f"None of {requested} were in completed_steps for {gen_tag} — no changes made.")
+
+
+@app.command("show-state")
+def show_state(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    gen: Annotated[int, typer.Option(..., "--gen", help="Generation number")],
+):
+    """Print the current state.json for a generation."""
+    cfg, paths = get_paths(config)
+    gen_tag = f"gen_{gen:02d}"
+    state_file = paths["runs_root"] / gen_tag / "state.json"
+
+    if not state_file.exists():
+        typer.echo(f"No state.json found at {state_file}.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(state_file.read_text())
+
+
 # --- ACTIVE LEARNING LOOPS ---
 
 @app.command("run-loop")
@@ -213,6 +280,7 @@ def run_gen(
     skip_steps = [s.strip() for s in skip.split(",") if s.strip()]
     only_steps = [s.strip() for s in only.split(",") if s.strip()] or None
     run_single_generation(base, gen, force=force, skip_steps=skip_steps, only_steps=only_steps)
+
 
 main = app
 
