@@ -4,11 +4,6 @@ from pathlib import Path
 import yaml
 
 
-def load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
 # Matches {{ some.dotted.key }} or {{ simple_key }}
 _TEMPLATE_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 
@@ -26,8 +21,8 @@ def _flatten(d: dict, prefix: str = "") -> dict:
     for k, v in d.items():
         full = f"{prefix}.{k}" if prefix else k
         if isinstance(v, dict):
-            out[full] = v                       # keep the dict itself
-            out.update(_flatten(v, full))       # recurse for dotted access
+            out[full] = v
+            out.update(_flatten(v, full))
         elif isinstance(v, (str, int, float, bool)) or v is None:
             out[full] = v
     return out
@@ -39,13 +34,10 @@ def _resolve_value(value, context: dict, local_context: dict | None = None):
     Resolution order:
       1. local_context  – sibling keys in the same block (e.g. mtp_level inside fit:)
       2. context        – flattened whole-config keys
-
-    Raises KeyError with a helpful message on unknown keys.
     """
     if isinstance(value, str):
         def _sub(m):
             key = m.group(1)
-            # local first, then global
             if local_context and key in local_context:
                 return str(local_context[key])
             if key in context:
@@ -57,7 +49,6 @@ def _resolve_value(value, context: dict, local_context: dict | None = None):
         return _TEMPLATE_RE.sub(_sub, value)
 
     if isinstance(value, dict):
-        # Build a local context from the scalar siblings in this block
         local = {k: v for k, v in value.items() if isinstance(v, (str, int, float, bool))}
         return {k: _resolve_value(v, context, local) for k, v in value.items()}
 
@@ -70,21 +61,20 @@ def _resolve_value(value, context: dict, local_context: dict | None = None):
 def render_config(config: dict) -> dict:
     """Render all {{ }} template references in a config dict.
 
-    Supports:
-      - Top-level scalars:   {{ project_root }}
-      - Dotted nested paths: {{ mpi.prefix }}, {{ paths.datasets_root }}
-      - Sibling keys:        {{ mtp_level }} inside the same block
-
-    Rendering is done in two passes so that a ref that itself contains a
-    template (e.g. paths.runs_root = "{{ project_root }}/runs") resolves
-    correctly before being used by downstream refs.
+    Two passes handle chained refs (A → B → C).
     """
     cfg = copy.deepcopy(config)
-    # Two passes handle chained refs (A → B → C)
     for _ in range(2):
         context = _flatten(cfg)
         cfg = _resolve_value(cfg, context)
     return cfg
+
+
+def load_yaml(path: str | Path) -> dict:
+    """Load a YAML file and immediately resolve all {{ }} template tokens."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return render_config(raw)
 
 
 def project_paths(config: dict) -> dict:
@@ -117,10 +107,12 @@ def gen_paths(config: dict, resolved: dict) -> dict:
 
 
 def build_gen_config(base_config: dict, generation: int) -> dict:
+    """Build a generation-specific config (templates already resolved by load_yaml)."""
     cfg = copy.deepcopy(base_config)
     cfg["generation"] = str(generation).zfill(2)
-    return render_config(cfg)
+    return render_config(cfg)  # re-render to pick up {{ generation }} if used
 
 
 def load_and_render(path: str | Path) -> dict:
-    return render_config(load_yaml(path))
+    """Alias kept for backward compatibility."""
+    return load_yaml(path)
