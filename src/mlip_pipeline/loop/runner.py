@@ -16,29 +16,25 @@ def run_single_generation(
     force: bool = False,
     skip_steps: list[str] | None = None,
     only_steps: list[str] | None = None,
+    prev_state: GenerationState | None = None,
 ) -> GenerationState:
-    config  = build_gen_config(base_config, generation)
+    config   = build_gen_config(base_config, generation)
     resolved = project_paths(config)
-    paths = gen_paths(config, resolved)
+    paths    = gen_paths(config, resolved)
 
     gen_tag = f"gen_{str(generation).zfill(2)}"
 
-    # Inject per-gen subdirs for all steps
     config["fit"]["output_subdir"]     = f"{gen_tag}/fit"
     config["explore"]["output_subdir"] = f"{gen_tag}/explore"
     config["select"]["output_subdir"]  = f"{gen_tag}/select"
     config["select"]["input_subdir"]   = f"{gen_tag}/explore"
     config["label"]["output_subdir"]   = f"{gen_tag}/label"
     config["label"]["input_subdir"]    = f"{gen_tag}/select"
-
-    # convert: inject a per-gen storage subdir but do NOT touch output_subdir
-    # (output_subdir = accumulation root = where train.cfg lives, must be stable)
     config.setdefault("convert", {})["gen_subdir"] = f"{gen_tag}/convert"
 
     gen_dir = paths["gen_dir"]
     ensure_dir(gen_dir)
 
-    # Snapshot config for reproducibility (written once, never overwritten)
     snapshot = gen_dir / "config_snapshot.yaml"
     if not snapshot.exists():
         snapshot.write_text(yaml.dump(config, default_flow_style=False))
@@ -71,6 +67,42 @@ def run_single_generation(
 
             # ── fit ────────────────────────────────────────────────────
             if step == "fit":
+                # ── integrity check: train.cfg must equal prev_train + prev_selected
+                if prev_state is not None:
+                    from mlip_pipeline.checks import check_training_cfg_count
+                    fit_cfg    = config["fit"]
+                    train_cfg  = Path(
+                        fit_cfg.get(
+                            "train_cfg",
+                            resolved["datasets_root"]
+                            / config["convert"].get("output_subdir", "converted_cfg")
+                            / config["convert"].get("merge_name", "train.cfg"),
+                        )
+                    ).expanduser().resolve()
+                    prev_selected = (
+                        resolved["datasets_root"]
+                        / f"gen_{str(generation - 1).zfill(2)}/select"
+                        / config["select"].get("selected_filename", "selected.cfg")
+                    )
+                    # selected.cfg lives under runs, not datasets
+                    prev_selected_runs = (
+                        resolved["runs_root"]
+                        / f"gen_{str(generation - 1).zfill(2)}/select"
+                        / config["select"].get("selected_filename", "selected.cfg")
+                    )
+                    selected_path = (
+                        prev_selected_runs
+                        if prev_selected_runs.exists()
+                        else prev_selected
+                    )
+                    check_training_cfg_count(
+                        current_train_cfg=train_cfg,
+                        prev_train_cfg=Path(prev_state.merged_cfg) if prev_state.merged_cfg else None,
+                        prev_selected_cfg=selected_path,
+                        generation=generation,
+                        strict=True,
+                    )
+
                 from mlip_pipeline.fit.trainer import train_potential
                 result = train_potential(config, paths)
                 state.model_path = str(result.model_path)
@@ -88,7 +120,7 @@ def run_single_generation(
                 explore_dir = create_exploration_runs(config, paths, fit_result)
                 run_exploration_runs(config, paths, explore_dir)
 
-            # ── select ──────────────────────────────────────────────────
+            # ── select ─────────────────────────────────────────────────
             elif step == "select":
                 fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
                 fit_result = (
@@ -99,12 +131,12 @@ def run_single_generation(
                 from mlip_pipeline.select.runner import run_selection
                 run_selection(config, paths, fit_result)
 
-            # ── label (prepare VASP input dirs) ─────────────────────────
+            # ── label ──────────────────────────────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
 
-            # ── label_local (run VASP locally via mpirun) ───────────────
+            # ── label_local ───────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_dir = paths.get("label_dir",
@@ -112,7 +144,7 @@ def run_single_generation(
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc (submit to Dardel + wait for OUTCARs) ─────────
+            # ── label_hpc ───────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
@@ -132,11 +164,9 @@ def run_single_generation(
                     paths["runs_root"] / config["label"]["output_subdir"])
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-                # returns Path to the merged train.cfg in the accumulation root
                 merged_cfg_path = convert_outcars_to_cfg(label_result, config, paths)
                 state.merged_cfg = str(merged_cfg_path)
 
-            # ── mark done ──────────────────────────────────────────────
             state.mark_step_done(step)
 
     except Exception as exc:
@@ -159,13 +189,6 @@ def run_loop(
     only_steps: list[str] | None = None,
     stop_on_failure: bool = True,
 ) -> list[GenerationState]:
-    """
-    Run generations start_gen … end_gen (inclusive) sequentially.
-
-    - Fully idempotent: completed gens and steps are skipped on re-run.
-    - Passes merged_cfg from gen N → gen N+1 automatically.
-    - Interrupt anytime; re-run with the same command to resume.
-    """
     base_config = load_yaml(base_config_path)
     states: list[GenerationState] = []
     failed: list[int] = []
@@ -173,7 +196,27 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
-        # Chain: propagate previous gen's merged_cfg as next gen's train set
+        prev_state: GenerationState | None = states[-1] if states else None
+
+        if prev_state is None and gen > start_gen:
+            # Try to load the previous gen's state from disk (resume scenario)
+            prev_gen_dir = (
+                Path(load_yaml(base_config_path).get("paths", {}).get(
+                    "runs_root",
+                    str(Path(base_config_path).parent / "runs")
+                ))
+                / f"gen_{str(gen - 1).zfill(2)}"
+            )
+            if prev_gen_dir.exists():
+                try:
+                    prev_state = GenerationState.load(prev_gen_dir)
+                except Exception:
+                    pass
+
+        if prev_state is None and gen > start_gen:
+            # Cannot load previous state from disk either
+            warn(f"  No previous state found for gen {gen-1:02d} — skipping integrity check.")
+
         if states and states[-1].merged_cfg:
             base_config = copy.deepcopy(base_config)
             base_config.setdefault("training", {})["origin_cfg"] = states[-1].merged_cfg
@@ -184,6 +227,7 @@ def run_loop(
                 base_config, gen,
                 skip_steps=skip_steps,
                 only_steps=only_steps,
+                prev_state=prev_state,
             )
             states.append(state)
         except Exception as exc:
