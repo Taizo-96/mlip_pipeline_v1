@@ -113,7 +113,6 @@ def run_single_generation(
 
             # ── label_local (run VASP locally via mpirun) ──────────────────
             elif step == "label_local":
-                from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_dir = paths.get("label_dir",
                     paths["runs_root"] / config["label"]["output_subdir"])
@@ -150,8 +149,9 @@ def run_single_generation(
 >>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-                result = convert_outcars_to_cfg(label_result, config, paths)
-                state.merged_cfg = str(result.merged_cfg)
+                # convert_outcars_to_cfg returns a plain Path (the merged train.cfg)
+                merged_cfg_path = convert_outcars_to_cfg(label_result, config, paths)
+                state.merged_cfg = str(merged_cfg_path)
 
 <<<<<<< HEAD
 =======
