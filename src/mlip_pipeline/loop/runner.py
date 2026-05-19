@@ -5,7 +5,7 @@ import yaml
 
 from mlip_pipeline.config import build_gen_config, project_paths, gen_paths, load_yaml
 from mlip_pipeline.models import GenerationState, FitResult, LabelResult, STEPS
-from mlip_pipeline.utils.fs import ensure_dir, write_json
+from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.utils.logging import step_header, info, warn, success, error
 
 
@@ -67,44 +67,29 @@ def run_single_generation(
 
             # ── fit ────────────────────────────────────────────────────
             if step == "fit":
-                # ── integrity check: train.cfg must equal prev_train + prev_selected
+                from mlip_pipeline.fit.trainer import train_potential, resolve_train_cfg
+                from mlip_pipeline.checks import check_training_cfg_count
+
+                train_cfg = resolve_train_cfg(config["fit"], config, resolved)
+
                 if prev_state is not None:
-                    from mlip_pipeline.checks import check_training_cfg_count
-                    fit_cfg    = config["fit"]
-                    train_cfg  = Path(
-                        fit_cfg.get(
-                            "train_cfg",
-                            resolved["datasets_root"]
-                            / config["convert"].get("output_subdir", "converted_cfg")
-                            / config["convert"].get("merge_name", "train.cfg"),
-                        )
-                    ).expanduser().resolve()
                     prev_selected = (
-                        resolved["datasets_root"]
-                        / f"gen_{str(generation - 1).zfill(2)}/select"
-                        / config["select"].get("selected_filename", "selected.cfg")
-                    )
-                    # selected.cfg lives under runs, not datasets
-                    prev_selected_runs = (
                         resolved["runs_root"]
                         / f"gen_{str(generation - 1).zfill(2)}/select"
                         / config["select"].get("selected_filename", "selected.cfg")
                     )
-                    selected_path = (
-                        prev_selected_runs
-                        if prev_selected_runs.exists()
-                        else prev_selected
-                    )
                     check_training_cfg_count(
                         current_train_cfg=train_cfg,
-                        prev_train_cfg=Path(prev_state.merged_cfg) if prev_state.merged_cfg else None,
-                        prev_selected_cfg=selected_path,
+                        prev_train_cfg=(
+                            Path(prev_state.merged_cfg)
+                            if prev_state.merged_cfg else None
+                        ),
+                        prev_selected_cfg=prev_selected,
                         generation=generation,
                         strict=True,
                     )
 
-                from mlip_pipeline.fit.trainer import train_potential
-                result = train_potential(config, paths)
+                result = train_potential(config, resolved)
                 state.model_path = str(result.model_path)
 
             # ── explore ────────────────────────────────────────────────
@@ -131,40 +116,43 @@ def run_single_generation(
                 from mlip_pipeline.select.runner import run_selection
                 run_selection(config, paths, fit_result)
 
-            # ── label ──────────────────────────────────────────────────
+            # ── label ─────────────────────────────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
 
-            # ── label_local ───────────────────────────────────────────
+            # ── label_local ──────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
-                label_dir = paths.get("label_dir",
-                    paths["runs_root"] / config["label"]["output_subdir"])
+                label_dir = (
+                    paths.get("label_dir")
+                    or paths["runs_root"] / config["label"]["output_subdir"]
+                )
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc ───────────────────────────────────────────
+            # ── label_hpc ──────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
                 label_result = run_labeling(config, paths)
                 submit_label_jobs(label_result, config)
-                label_root = label_result.label_root
-                outcars = list(label_root.glob("task.*/OUTCAR"))
+                outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
                 if not outcars:
                     raise RuntimeError(
-                        f"label_hpc: no OUTCARs found in {label_root}. "
+                        f"label_hpc: no OUTCARs found in {label_result.label_root}. "
                         "VASP jobs likely failed — check job.sh env_block and vasp_cmd."
                     )
 
-            # ── convert ───────────────────────────────────────────────
+            # ── convert ──────────────────────────────────────────────
             elif step == "convert":
-                label_dir = paths.get("label_dir",
-                    paths["runs_root"] / config["label"]["output_subdir"])
+                label_dir = (
+                    paths.get("label_dir")
+                    or paths["runs_root"] / config["label"]["output_subdir"]
+                )
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-                merged_cfg_path = convert_outcars_to_cfg(label_result, config, paths)
+                merged_cfg_path = convert_outcars_to_cfg(label_result, config, resolved)
                 state.merged_cfg = str(merged_cfg_path)
 
             state.mark_step_done(step)
@@ -196,26 +184,17 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
+        # Resolve previous state: from this run's list, or from disk (resume)
         prev_state: GenerationState | None = states[-1] if states else None
-
         if prev_state is None and gen > start_gen:
-            # Try to load the previous gen's state from disk (resume scenario)
             prev_gen_dir = (
-                Path(load_yaml(base_config_path).get("paths", {}).get(
-                    "runs_root",
-                    str(Path(base_config_path).parent / "runs")
-                ))
-                / f"gen_{str(gen - 1).zfill(2)}"
+                resolved_paths_for(base_config, gen - 1)
             )
-            if prev_gen_dir.exists():
+            if prev_gen_dir and prev_gen_dir.exists():
                 try:
                     prev_state = GenerationState.load(prev_gen_dir)
                 except Exception:
-                    pass
-
-        if prev_state is None and gen > start_gen:
-            # Cannot load previous state from disk either
-            warn(f"  No previous state found for gen {gen-1:02d} — skipping integrity check.")
+                    warn(f"  Could not load state for gen_{gen-1:02d} — skipping integrity check.")
 
         if states and states[-1].merged_cfg:
             base_config = copy.deepcopy(base_config)
@@ -244,3 +223,14 @@ def run_loop(
         success(f"All generations {start_gen}–{end_gen} complete.")
 
     return states
+
+
+def resolved_paths_for(base_config: dict, generation: int) -> Path | None:
+    """Return the gen_dir Path for a given generation, or None on error."""
+    try:
+        config   = build_gen_config(base_config, generation)
+        resolved = project_paths(config)
+        paths    = gen_paths(config, resolved)
+        return paths["gen_dir"]
+    except Exception:
+        return None
