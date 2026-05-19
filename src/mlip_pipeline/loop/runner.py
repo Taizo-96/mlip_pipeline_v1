@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import shutil
 from pathlib import Path
 import yaml
 
@@ -11,22 +12,12 @@ from mlip_pipeline.utils.logging import step_header, info, warn, success, error
 _LABEL_STEPS = {"label", "label_local", "label_hpc", "convert"}
 
 
-def _next_replicate(config: dict, current: list) -> list | None:
-    """Return the next replicate tier after `current`, or None if exhausted."""
+def _replicate_schedule(config: dict) -> list[list[int]]:
+    """Return the full replicate schedule, falling back to [replicate] if not set."""
     schedule = config.get("explore", {}).get("replicate_schedule")
-    if not schedule:
-        return None
-    # normalise: compare as tuples
-    current_t = tuple(current)
-    tiers = [tuple(t) for t in schedule]
-    try:
-        idx = tiers.index(current_t)
-    except ValueError:
-        # current not in schedule — start from the beginning
-        return list(schedule[0]) if schedule else None
-    if idx + 1 < len(tiers):
-        return list(schedule[idx + 1])
-    return None  # already at last tier
+    if schedule:
+        return [list(t) for t in schedule]
+    return [list(config.get("explore", {}).get("replicate", [1, 1, 1]))]
 
 
 def run_single_generation(
@@ -65,8 +56,18 @@ def run_single_generation(
         if state.status == "completed":
             success(f"Generation {generation:02d} already completed — skipping.")
             return state
+        # Reset 'failed' status so steps can resume
+        if state.status == "failed":
+            state.status = "running"
+            state.error = None
+            state.save()
     else:
         state = GenerationState.init(str(generation).zfill(2), gen_dir)
+
+    # Apply the replicate tier that was active when we last ran (for resume)
+    schedule = _replicate_schedule(config)
+    tier = min(state.replicate_tier, len(schedule) - 1)
+    config["explore"]["replicate"] = schedule[tier]
 
     step_header(f"Generation {generation:02d}", str(generation).zfill(2))
 
@@ -78,8 +79,20 @@ def run_single_generation(
 
     try:
         for step in active:
+            # ———————————————————————————————————————————————
+            # Skip logic: step already in completed_steps OR label already
+            # written to disk (so label step never re-runs on hpc retry).
+            # ———————————————————————————————————————————————
             if state.is_step_done(step):
                 info(f"  step '{step}' already done — skipping.")
+                continue
+
+            # If label task dirs already exist on disk, skip label and go
+            # straight to label_hpc / label_local without re-writing them.
+            label_dir = resolved["runs_root"] / config["label"]["output_subdir"]
+            if step == "label" and state.label_prepared:
+                info(f"  step 'label' already prepared (task dirs on disk) — skipping.")
+                state.mark_step_done("label")
                 continue
 
             state.mark_step_start(step)
@@ -138,11 +151,9 @@ def run_single_generation(
 
                 # No candidates — try growing the cell via replicate_schedule
                 while sel_result.selected_count == 0:
-                    current_rep = list(config["explore"].get("replicate", [1, 1, 1]))
-                    next_rep    = _next_replicate(config, current_rep)
-
-                    if next_rep is None:
-                        # All tiers exhausted — genuinely converged at every cell size
+                    next_tier = state.replicate_tier + 1
+                    if next_tier >= len(schedule):
+                        # All tiers exhausted — genuinely converged
                         warn(
                             f"Generation {generation:02d}: no candidates at any "
                             f"replicate tier — marking as converged."
@@ -152,44 +163,45 @@ def run_single_generation(
                                 state.mark_step_done(s)
                         break
 
+                    next_rep = schedule[next_tier]
+                    current_rep = schedule[state.replicate_tier]
                     info(
                         f"Generation {generation:02d}: 0 candidates at replicate "
                         f"{current_rep} — growing cell to {next_rep} and re-running explore."
                     )
+
+                    # Advance tier in state BEFORE wiping explore, so a crash
+                    # here resumes at the new (bigger) tier, not the old one.
+                    state.replicate_tier = next_tier
+                    state.save()
                     config["explore"]["replicate"] = next_rep
 
-                    # Wipe the previous explore output dir so LAMMPS inputs
-                    # are regenerated with the new cell size
+                    # Wipe the previous explore output so LAMMPS inputs are
+                    # regenerated with the new cell size.
                     explore_out = resolved["runs_root"] / config["explore"]["output_subdir"]
                     if explore_out.exists():
-                        import shutil
                         shutil.rmtree(explore_out)
-                    state.completed_steps = [
-                        s for s in state.completed_steps
-                        if s not in ("explore", "select")
-                    ]
-                    state.save()
 
-                    # Re-run explore with bigger cell
+                    # Re-run explore + select with bigger cell
                     from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
                     from mlip_pipeline.explore.runner import run_exploration_runs
                     explore_dir = create_exploration_runs(config, resolved, fit_result)
                     run_exploration_runs(config, resolved, explore_dir)
-
-                    # Re-run select
                     sel_result = run_selection(config, resolved, fit_result)
 
             # ── label ─────────────────────────────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
+                state.label_prepared = True
+                state.save()
 
             # ── label_local ──────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_dir = (
                     paths.get("label_dir")
-                    or paths["runs_root"] / config["label"]["output_subdir"]
+                    or resolved["runs_root"] / config["label"]["output_subdir"]
                 )
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
@@ -198,7 +210,16 @@ def run_single_generation(
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
-                label_result = run_labeling(config, paths)
+                label_dir = (
+                    paths.get("label_dir")
+                    or resolved["runs_root"] / config["label"]["output_subdir"]
+                )
+                # Only re-prepare label task dirs if they haven't been written yet
+                if not state.label_prepared:
+                    run_labeling(config, paths)
+                    state.label_prepared = True
+                    state.save()
+                label_result = LabelResult.load_manifest(label_dir)
                 submit_label_jobs(label_result, config)
                 outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
                 if not outcars:
@@ -211,7 +232,7 @@ def run_single_generation(
             elif step == "convert":
                 label_dir = (
                     paths.get("label_dir")
-                    or paths["runs_root"] / config["label"]["output_subdir"]
+                    or resolved["runs_root"] / config["label"]["output_subdir"]
                 )
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg

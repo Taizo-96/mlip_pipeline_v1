@@ -8,7 +8,7 @@ from typing import Optional
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-# ── VASP scaling ──────────────────────────────────────────────────────────────
+# ── VASP scaling ───────────────────────────────────────────────────────────────
 
 @dataclass
 class VaspParallelConfig:
@@ -58,7 +58,7 @@ class ScalingPolicy:
         factor = max(1, self.get_config(n_atoms).kpar)
         return [max(1, round(k / factor)) for k in base]
 
-# ── Step results ──────────────────────────────────────────────────────────────
+# ── Step results ───────────────────────────────────────────────────────────────
 
 @dataclass
 class PrepareTrainResult:
@@ -187,7 +187,7 @@ class EvaluationResult:
     completed_at: str = field(default_factory=_now)
 
 
-# ── Generation state (automation) ─────────────────────────────────────────────
+# ── Generation state (automation) ─────────────────────────────────────────────────
 
 # HPC mode: label prepares inputs, label_hpc submits to Dardel and waits.
 # Local mode: label prepares inputs, label_local runs VASP via mpirun.
@@ -205,6 +205,13 @@ class GenerationState:
     completed_at: Optional[str] = None
     model_path: Optional[str] = None
     merged_cfg: Optional[str] = None
+    # Replicate-schedule tier reached during this generation (0-based index).
+    # Updated in-place when the cell is grown; never reset on failure so that
+    # resume skips tiers that were already tried.
+    replicate_tier: int = 0
+    # True once the label task directories have been written to disk.
+    # Allows label_hpc/label_local to be re-tried without re-running label.
+    label_prepared: bool = False
 
     @property
     def _state_path(self) -> Path:
@@ -222,6 +229,8 @@ class GenerationState:
             "completed_at": self.completed_at,
             "model_path": self.model_path,
             "merged_cfg": self.merged_cfg,
+            "replicate_tier": self.replicate_tier,
+            "label_prepared": self.label_prepared,
         })
 
     @classmethod
