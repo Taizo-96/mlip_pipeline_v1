@@ -19,20 +19,22 @@ def run_single_generation(
 ) -> GenerationState:
     config  = build_gen_config(base_config, generation)
     resolved = project_paths(config)
-    paths   = gen_paths(config, resolved)
-    config = build_gen_config(base_config, generation)
-    resolved = project_paths(config)
     paths = gen_paths(config, resolved)
 
-    # Inject gen-specific output subdirs → all step runners write into gen_NN/step/
     gen_tag = f"gen_{str(generation).zfill(2)}"
-    config["fit"]["output_subdir"] = f"{gen_tag}/fit"
+
+    # Inject per-gen subdirs for all steps
+    config["fit"]["output_subdir"]     = f"{gen_tag}/fit"
     config["explore"]["output_subdir"] = f"{gen_tag}/explore"
-    config["select"]["output_subdir"] = f"{gen_tag}/select"
-    config["select"]["input_subdir"] = f"{gen_tag}/explore"
-    config["label"]["output_subdir"] = f"{gen_tag}/label"
-    config["label"]["input_subdir"] = f"{gen_tag}/select"
-    config.setdefault("convert", {})["output_subdir"] = f"{gen_tag}/convert"
+    config["select"]["output_subdir"]  = f"{gen_tag}/select"
+    config["select"]["input_subdir"]   = f"{gen_tag}/explore"
+    config["label"]["output_subdir"]   = f"{gen_tag}/label"
+    config["label"]["input_subdir"]    = f"{gen_tag}/select"
+
+    # convert: inject a per-gen storage subdir but do NOT touch output_subdir
+    # (output_subdir = accumulation root = where train.cfg lives, must be stable)
+    config.setdefault("convert", {})["gen_subdir"] = f"{gen_tag}/convert"
+
     gen_dir = paths["gen_dir"]
     ensure_dir(gen_dir)
 
@@ -67,24 +69,26 @@ def run_single_generation(
             state.mark_step_start(step)
             step_header(step.upper())
 
-            # ── fit ────────────────────────────────────────────────────────
+            # ── fit ────────────────────────────────────────────────────
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential
                 result = train_potential(config, paths)
                 state.model_path = str(result.model_path)
 
-<<<<<<< HEAD
-=======
-            # ── explore ────────────────────────────────────────────────────
->>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
+            # ── explore ────────────────────────────────────────────────
             elif step == "explore":
-                from mlip_pipeline.explore.prepare import prepare_exploration
+                from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
                 from mlip_pipeline.explore.runner import run_exploration_runs
-                explore_dir = paths.get("explore_dir", paths["runs_root"] / "explore")
-                prepare_exploration(config, paths, explore_dir)
-                run_exploration_runs(config, paths, explore_dir, )
+                fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
+                fit_result = (
+                    FitResult(run_dir=fit_dir, model_path=Path(state.model_path))
+                    if state.model_path
+                    else FitResult.load_manifest(fit_dir)
+                )
+                explore_dir = create_exploration_runs(config, paths, fit_result)
+                run_exploration_runs(config, paths, explore_dir)
 
-            # ── select ─────────────────────────────────────────────────────
+            # ── select ──────────────────────────────────────────────────
             elif step == "select":
                 fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
                 fit_result = (
@@ -95,23 +99,12 @@ def run_single_generation(
                 from mlip_pipeline.select.runner import run_selection
                 run_selection(config, paths, fit_result)
 
-            # ── label (prepare VASP input dirs) ────────────────────────────
+            # ── label (prepare VASP input dirs) ─────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
-<<<<<<< HEAD
-                run_labeling(config, paths, )
-
-
-            elif step == "label_hpc":
-                label_dir = paths["label_dir"]
-                sentinel = label_dir / "dardel_done.flag"
-                if not sentinel.exists():
-                    # submit and exit — user re-runs the loop tomorrow
-                    _submit_to_dardel(config, paths, gen_tag)
-=======
                 run_labeling(config, paths)
 
-            # ── label_local (run VASP locally via mpirun) ──────────────────
+            # ── label_local (run VASP locally via mpirun) ───────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_dir = paths.get("label_dir",
@@ -119,7 +112,7 @@ def run_single_generation(
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc (submit to Dardel + wait for OUTCARs) ────────────
+            # ── label_hpc (submit to Dardel + wait for OUTCARs) ─────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
@@ -128,35 +121,22 @@ def run_single_generation(
                 label_root = label_result.label_root
                 outcars = list(label_root.glob("task.*/OUTCAR"))
                 if not outcars:
->>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
                     raise RuntimeError(
-                        f"Jobs submitted to Dardel. Re-run when complete:\n"
-                        f"  mlip-pipeline run-loop ... --start-gen {generation}"
+                        f"label_hpc: no OUTCARs found in {label_root}. "
+                        "VASP jobs likely failed — check job.sh env_block and vasp_cmd."
                     )
-<<<<<<< HEAD
 
-                # sentinel exists → already synced back, proceed to convert
-=======
->>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
-
-            # ── convert ────────────────────────────────────────────────────
+            # ── convert ───────────────────────────────────────────────
             elif step == "convert":
-<<<<<<< HEAD
-                label_dir    = paths.get("label_dir", paths["runs_root"] / "label")
-=======
                 label_dir = paths.get("label_dir",
                     paths["runs_root"] / config["label"]["output_subdir"])
->>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-                # convert_outcars_to_cfg returns a plain Path (the merged train.cfg)
+                # returns Path to the merged train.cfg in the accumulation root
                 merged_cfg_path = convert_outcars_to_cfg(label_result, config, paths)
                 state.merged_cfg = str(merged_cfg_path)
 
-<<<<<<< HEAD
-=======
-            # ── mark done (single call, always) ────────────────────────────
->>>>>>> 3a5f067 (fix: add label_local step to STEPS and loop/runner.py)
+            # ── mark done ──────────────────────────────────────────────
             state.mark_step_done(step)
 
     except Exception as exc:
