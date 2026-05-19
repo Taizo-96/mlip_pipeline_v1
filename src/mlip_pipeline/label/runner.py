@@ -138,15 +138,13 @@ def _write_vasp_inputs(template_dir: Path, task_dir: Path, n_atoms: int, label_c
     policy = ScalingPolicy(label_cfg.get("scaling_rules", {}))
     sys_cfg = policy.get_config(n_atoms)
 
-    # 1. KPOINTS with scaling
     _scale_kpoints_file(template_dir / "KPOINTS", task_dir / "KPOINTS", n_atoms, policy)
     copy_if_exists(template_dir / "POTCAR", task_dir / "POTCAR")
-
-    # 2. INCAR (merge base tags with the NCORE/KPAR from our policy)
     write_incar(task_dir, label_cfg["incar"], sys_cfg.to_incar_dict())
 
-    # 3. Job Script (Pass the sys_cfg object instead of just a dict)
-    write_job_sh(task_dir, n_atoms, slurm_cfg=label_cfg.get("slurm"), sys_override=sys_cfg)
+    # Fix: slurm is under dardel.slurm, not top-level label.slurm
+    slurm_cfg = label_cfg.get("dardel", {}).get("slurm") or label_cfg.get("slurm")
+    write_job_sh(task_dir, n_atoms, slurm_cfg=slurm_cfg, sys_override=sys_cfg)
 
 
 # ---------------------------------------------------------------------------
