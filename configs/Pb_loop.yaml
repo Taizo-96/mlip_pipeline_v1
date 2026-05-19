@@ -21,14 +21,14 @@ mpi:
   prefix: "mpirun -np 32"
 
 
-# ── Binary paths  (machine-specific) ────────────────────────────────────────
+# ── Binary paths  (machine-specific) ─────────────────────────────────────────
 bins:
   mlp:    "mlp"       # uses PATH → active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
   lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
   vasp:   "vasp_std"
 
 
-# ── Materials Project ────────────────────────────────────────────────────────
+# ── Materials Project ──────────────────────────────────────────────────────────
 materials_project:
   api_key:              "${MP_API_KEY}"
   material_ids:         ["mp-20483"]
@@ -47,7 +47,7 @@ training:
   merge_name:    "train.cfg"
 
 
-# ── Fit ──────────────────────────────────────────────────────────────────────
+# ── Fit ─────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
   mpi_prefix:             "{{ mpi.prefix }}"
@@ -62,7 +62,7 @@ fit:
     - "--max-iter=1000"
 
 
-# ── Explore ──────────────────────────────────────────────────────────────────
+# ── Explore ─────────────────────────────────────────────────────────────────
 explore:
   lammps_command: "{{ bins.lammps }}"
   mpi_prefix:     "{{ mpi.prefix }}"
@@ -75,7 +75,15 @@ explore:
   dump_every:   50
   seed_base:    492845
 
-  replicate:     [1, 1, 1]
+  # Starting cell size. When 0 candidates are found at this size the pipeline
+  # automatically advances through replicate_schedule until candidates are
+  # found or all tiers are exhausted (= truly converged).
+  replicate: [1, 1, 1]
+  replicate_schedule:
+    - [1, 1, 1]
+    - [2, 2, 2]
+    - [3, 3, 3]
+
   tdamp:         2
   pdamp:         10.0
   neighbor_skin: 4.0
@@ -108,7 +116,7 @@ explore:
       rescale: true
 
 
-# ── Select ────────────────────────────────────────────────────────────────────
+# ── Select ───────────────────────────────────────────────────────────────────
 select:
   mlip_command:               "mlp"
   mpi_np:                     "{{ mpi.np }}"
@@ -179,7 +187,7 @@ label:
     np:         32
     parallel:   4
 
-# ── Convert ───────────────────────────────────────────────────────────────────
+# ── Convert ─────────────────────────────────────────────────────────────────────
 convert:
   output_subdir: "converted_cfg"
   merge_name:    "train.cfg"

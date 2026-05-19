@@ -8,6 +8,26 @@ from mlip_pipeline.models import GenerationState, FitResult, LabelResult, STEPS
 from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.utils.logging import step_header, info, warn, success, error
 
+_LABEL_STEPS = {"label", "label_local", "label_hpc", "convert"}
+
+
+def _next_replicate(config: dict, current: list) -> list | None:
+    """Return the next replicate tier after `current`, or None if exhausted."""
+    schedule = config.get("explore", {}).get("replicate_schedule")
+    if not schedule:
+        return None
+    # normalise: compare as tuples
+    current_t = tuple(current)
+    tiers = [tuple(t) for t in schedule]
+    try:
+        idx = tiers.index(current_t)
+    except ValueError:
+        # current not in schedule — start from the beginning
+        return list(schedule[0]) if schedule else None
+    if idx + 1 < len(tiers):
+        return list(schedule[idx + 1])
+    return None  # already at last tier
+
 
 def run_single_generation(
     base_config: dict,
@@ -102,10 +122,10 @@ def run_single_generation(
                     if state.model_path
                     else FitResult.load_manifest(fit_dir)
                 )
-                explore_dir = create_exploration_runs(config, paths, fit_result)
-                run_exploration_runs(config, paths, explore_dir)
+                explore_dir = create_exploration_runs(config, resolved, fit_result)
+                run_exploration_runs(config, resolved, explore_dir)
 
-            # ── select ─────────────────────────────────────────────────
+            # ── select ────────────────────────────────────────────────
             elif step == "select":
                 fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
                 fit_result = (
@@ -114,7 +134,50 @@ def run_single_generation(
                     else FitResult.load_manifest(fit_dir)
                 )
                 from mlip_pipeline.select.runner import run_selection
-                run_selection(config, paths, fit_result)
+                sel_result = run_selection(config, resolved, fit_result)
+
+                # No candidates — try growing the cell via replicate_schedule
+                while sel_result.selected_count == 0:
+                    current_rep = list(config["explore"].get("replicate", [1, 1, 1]))
+                    next_rep    = _next_replicate(config, current_rep)
+
+                    if next_rep is None:
+                        # All tiers exhausted — genuinely converged at every cell size
+                        warn(
+                            f"Generation {generation:02d}: no candidates at any "
+                            f"replicate tier — marking as converged."
+                        )
+                        for s in _LABEL_STEPS:
+                            if s in active and not state.is_step_done(s):
+                                state.mark_step_done(s)
+                        break
+
+                    info(
+                        f"Generation {generation:02d}: 0 candidates at replicate "
+                        f"{current_rep} — growing cell to {next_rep} and re-running explore."
+                    )
+                    config["explore"]["replicate"] = next_rep
+
+                    # Wipe the previous explore output dir so LAMMPS inputs
+                    # are regenerated with the new cell size
+                    explore_out = resolved["runs_root"] / config["explore"]["output_subdir"]
+                    if explore_out.exists():
+                        import shutil
+                        shutil.rmtree(explore_out)
+                    state.completed_steps = [
+                        s for s in state.completed_steps
+                        if s not in ("explore", "select")
+                    ]
+                    state.save()
+
+                    # Re-run explore with bigger cell
+                    from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
+                    from mlip_pipeline.explore.runner import run_exploration_runs
+                    explore_dir = create_exploration_runs(config, resolved, fit_result)
+                    run_exploration_runs(config, resolved, explore_dir)
+
+                    # Re-run select
+                    sel_result = run_selection(config, resolved, fit_result)
 
             # ── label ─────────────────────────────────────────────────
             elif step == "label":
@@ -184,12 +247,9 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
-        # Resolve previous state: from this run's list, or from disk (resume)
         prev_state: GenerationState | None = states[-1] if states else None
         if prev_state is None and gen > start_gen:
-            prev_gen_dir = (
-                resolved_paths_for(base_config, gen - 1)
-            )
+            prev_gen_dir = resolved_paths_for(base_config, gen - 1)
             if prev_gen_dir and prev_gen_dir.exists():
                 try:
                     prev_state = GenerationState.load(prev_gen_dir)
