@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 from mlip_pipeline.config import load_yaml, project_paths
 from mlip_pipeline.data.training_data import prepare_training_cfgs
@@ -24,6 +26,30 @@ from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
 from mlip_pipeline.evaluate.runner import run_evaluation
 
 
+# ---------------------------------------------------------------------------
+# Valid step names (used for reset-steps validation)
+# ---------------------------------------------------------------------------
+ALL_STEPS = ["fit", "explore", "select", "label", "label_hpc", "convert", "evaluate"]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _state_path(runs_root: Path, gen: int) -> Path:
+    return runs_root / f"gen_{gen:02d}" / "state.json"
+
+
+def _load_state(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"state.json not found: {path}")
+    return json.loads(path.read_text())
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.write_text(json.dumps(state, indent=2))
+
+
 def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
     fit_dir = resolved_paths["runs_root"] / config["fit"]["output_subdir"]
     fit_model = fit_dir / config["fit"]["trained_potential_name"]
@@ -34,6 +60,10 @@ def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
         log_path=fit_log,
     )
 
+
+# ---------------------------------------------------------------------------
+# Step commands
+# ---------------------------------------------------------------------------
 
 def cmd_download_structures(config: dict, resolved_paths: dict) -> None:
     downloaded = download_structures_from_mp(config, resolved_paths)
@@ -71,8 +101,6 @@ def cmd_label(config: dict, resolved_paths: dict) -> None:
 
 def cmd_label_run(config: dict, resolved_paths: dict) -> None:
     """Run already-labeled VASP tasks locally using mpirun (no scheduler)."""
-    from pathlib import Path
-
     label_cfg  = config["label"]
     runs_root  = resolved_paths["runs_root"]
     label_root = runs_root / label_cfg["output_subdir"]
@@ -134,11 +162,66 @@ def cmd_evaluate(config: dict, resolved_paths: dict) -> None:
         print(p)
 
 
+# ---------------------------------------------------------------------------
+# reset-steps command
+# ---------------------------------------------------------------------------
+
+def cmd_reset_steps(args: argparse.Namespace, config: dict, resolved_paths: dict) -> None:
+    """
+    Remove specific steps from state.json completed_steps so the loop
+    will re-run them on the next invocation.
+
+    Examples:
+      mlip-pipeline reset-steps --config cfg.yaml --gen 8 --steps label_hpc convert
+      mlip-pipeline reset-steps --config cfg.yaml --gen 8 --steps all
+    """
+    runs_root = resolved_paths["runs_root"]
+    gen = args.gen
+    steps_to_reset = args.steps
+
+    state_file = _state_path(runs_root, gen)
+    state = _load_state(state_file)
+
+    before = list(state.get("completed_steps", []))
+
+    if steps_to_reset == ["all"]:
+        state["completed_steps"] = []
+    else:
+        # Validate step names
+        unknown = [s for s in steps_to_reset if s not in ALL_STEPS]
+        if unknown:
+            raise ValueError(
+                f"Unknown step(s): {unknown}. Valid steps: {ALL_STEPS}"
+            )
+        state["completed_steps"] = [
+            s for s in before if s not in steps_to_reset
+        ]
+
+    state["status"] = "running"
+    state["current_step"] = None
+
+    _save_state(state_file, state)
+
+    after = state["completed_steps"]
+    removed = [s for s in before if s not in after]
+
+    print(f"\ngen_{gen:02d} state.json updated:")
+    print(f"  Before : {before}")
+    print(f"  Removed: {removed}")
+    print(f"  After  : {after}")
+    print(f"\nRe-run the loop to execute the reset step(s).")
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlip-pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    commands = [
+    # --- standard single-step commands ---
+    single_step_commands = [
         "download-structures",
         "prepare-train",
         "fit",
@@ -153,83 +236,126 @@ def build_parser() -> argparse.ArgumentParser:
         "convert-cfg",
         "evaluate",
     ]
-
-    for name in commands:
+    for name in single_step_commands:
         sub = subparsers.add_parser(name)
         sub.add_argument("--config", required=True)
 
+    # --- run-loop ---
+    loop_sub = subparsers.add_parser(
+        "run-loop",
+        help="Run multiple generations end-to-end.",
+    )
+    loop_sub.add_argument("config", help="Path to loop YAML config")
+    loop_sub.add_argument("--start-gen", type=int, required=True)
+    loop_sub.add_argument("--end-gen",   type=int, required=True)
+    loop_sub.add_argument(
+        "--local",
+        action="store_true",
+        default=False,
+        help=(
+            "Run VASP locally via mpirun instead of submitting to Dardel. "
+            "Skips label_hpc and uses label-run in its place."
+        ),
+    )
+
+    # --- reset-steps ---
+    reset_sub = subparsers.add_parser(
+        "reset-steps",
+        help="Remove completed steps from state.json so the loop re-runs them.",
+    )
+    reset_sub.add_argument("--config", required=True)
+    reset_sub.add_argument(
+        "--gen", type=int, required=True,
+        help="Generation number to reset (e.g. 8)",
+    )
+    reset_sub.add_argument(
+        "--steps", nargs="+", required=True,
+        metavar="STEP",
+        help=(
+            f"Steps to un-complete. One or more of: {ALL_STEPS}. "
+            "Use 'all' to reset every step."
+        ),
+    )
+
     return parser
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    config = load_yaml(args.config)
+    # reset-steps has its own config loading path (no resolved_paths needed
+    # beyond runs_root, but we load fully for consistency)
+    config_path = getattr(args, "config", None)
+    if config_path is None:
+        parser.print_help()
+        return
+
+    config = load_yaml(config_path)
     resolved_paths = project_paths(config)
 
     label_root = resolved_paths["runs_root"] / config["label"]["output_subdir"]
 
     if args.command == "download-structures":
         cmd_download_structures(config, resolved_paths)
-        return
 
-    if args.command == "prepare-train":
+    elif args.command == "prepare-train":
         cmd_prepare_train(config, resolved_paths)
-        return
 
-    if args.command == "fit":
+    elif args.command == "fit":
         cmd_fit(config, resolved_paths)
-        return
 
-    if args.command == "explore":
+    elif args.command == "explore":
         cmd_explore(config, resolved_paths)
-        return
 
-    if args.command == "select":
+    elif args.command == "select":
         cmd_select(config, resolved_paths)
-        return
 
-    if args.command == "label":
+    elif args.command == "label":
         cmd_label(config, resolved_paths)
-        return
 
-    if args.command == "label-run":
+    elif args.command == "label-run":
         cmd_label_run(config, resolved_paths)
-        return
 
-    if args.command == "sync-to-remote":
+    elif args.command == "sync-to-remote":
         result = LabelResult.load_from_dir(label_root)
         cmd_sync_to_remote(result, config, resolved_paths)
-        return
 
-    if args.command == "submit-remote":
+    elif args.command == "submit-remote":
         d_cfg = config["label"]["dardel"]
         remote_dir = f"{d_cfg['remote_root']}/{resolved_paths['runs_root'].name}/{config['label']['output_subdir']}"
         submit_jobs_on_dardel(d_cfg["user"], d_cfg.get("host"), remote_dir)
-        return
 
-    if args.command == "watch-remote":
+    elif args.command == "watch-remote":
         d_cfg = config["label"]["dardel"]
         watch_queue(d_cfg["user"], d_cfg.get("host"), poll_interval=d_cfg.get("poll_interval", 60))
-        return
 
-    if args.command == "sync-from-remote":
+    elif args.command == "sync-from-remote":
         result = LabelResult.load_from_dir(label_root)
         d_cfg = config["label"]["dardel"]
         remote_dir = f"{d_cfg['remote_root']}/{resolved_paths['runs_root'].name}/{config['label']['output_subdir']}"
         sync_outputs_from_dardel(result.label_root, d_cfg["user"], d_cfg.get("host"), remote_dir)
-        return
 
-    if args.command == "convert-cfg":
+    elif args.command == "convert-cfg":
         cmd_convert_cfg(config, resolved_paths)
-        return
 
-    if args.command == "evaluate":
+    elif args.command == "evaluate":
         cmd_evaluate(config, resolved_paths)
-        return
 
-    raise ValueError(f"unknown command: {args.command}")
+    elif args.command == "run-loop":
+        # import here to avoid circular imports at module level
+        from mlip_pipeline.loop import run_loop
+        run_loop(config, resolved_paths, args.start_gen, args.end_gen, local=args.local)
+
+    elif args.command == "reset-steps":
+        cmd_reset_steps(args, config, resolved_paths)
+
+    else:
+        raise ValueError(f"unknown command: {args.command}")
 
 
 if __name__ == "__main__":
