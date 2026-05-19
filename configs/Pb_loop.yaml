@@ -1,6 +1,7 @@
 # ════════════════════════════════════════════════════════════════════════════
-# base.yaml  –  Single source of truth for the mlip_pipeline
+# Pb_loop.yaml  –  Single source of truth for the Pb mlip_pipeline
 #
+# Template syntax:  {{ key }}  or  {{ section.key }}
 # The `generation` key is injected automatically by run-loop / run-gen.
 # To run a single generation manually, add:  generation: "07"  at the top.
 # ════════════════════════════════════════════════════════════════════════════
@@ -8,7 +9,7 @@
 project_root: "/home/saitto/mlip_pipeline_v1"
 
 paths:
-  data_root:       "{{ project_root }}/data"
+  data_root:       "/home/saitto/data"
   runs_root:       "{{ project_root }}/runs"
   structures_root: "{{ project_root }}/structures"
   datasets_root:   "{{ project_root }}/datasets"
@@ -16,18 +17,18 @@ paths:
 
 # ── Shared MPI ──────────────────────────────────────────────────────────────
 mpi:
-  np:      32
-  prefix:  "mpirun -np 32"
+  np:     32
+  prefix: "mpirun -np 32"
 
-# ── Binary paths  (machine-specific, keep here not scattered) ───────────────
+
+# ── Binary paths  (machine-specific) ────────────────────────────────────────
 bins:
-  mlp:    "/home/saitto/active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp"
-  lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
+  mlp:    "{{ project_root }}/codes/mlip-3/bin/mlp"
+  lammps: "{{ project_root }}/codes/interface-lammps-mlip-3/lmp_mpi"
   vasp:   "/opt/vasp/vasp.6.5.1_cpu/bin/vasp_std"
 
 
 # ── Materials Project ────────────────────────────────────────────────────────
-
 materials_project:
   api_key:              "${MP_API_KEY}"
   material_ids:         ["mp-20483"]
@@ -48,11 +49,12 @@ training:
 
 # ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
+  mlp_command:            "{{ bins.mlp }}"
   mpi_prefix:             "{{ mpi.prefix }}"
-  template_dir:           "{{ project_root }}/MTP_templates"
+  template_dir:           "{{ project_root }}/codes/mlip-3/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
-  train_cfg:              "{{ project_root }}/datasets/converted_cfg/train.cfg"
+  train_cfg:              "{{ paths.datasets_root }}/converted_cfg/train.cfg"
   extra_args:
     - "--energy-weight=1"
     - "--force-weight=0.01"
@@ -60,23 +62,25 @@ fit:
     - "--max-iter=1000"
 
 
-# ── Explore ───────────────────────────────────────────────────────────────────
+# ── Explore ──────────────────────────────────────────────────────────────────
 explore:
+  lammps_command: "{{ bins.lammps }}"
   mpi_prefix:     "{{ mpi.prefix }}"
-  temperatures:   [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
-  pressure_bar:   [0, 1, 5, 10]
-  ensemble:       "npt"
-  timestep:       0.00001
-  nsteps:         50000
-  dump_every:     50
-  seed_base:      492845
 
-  replicate:      [1, 1, 1]
-  tdamp:          2
-  pdamp:          10.0
-  neighbor_skin:  4.0
-  thermo_every:   50
-  nvt_pre_steps:  2000
+  temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
+  pressure_bar: [0, 1, 5, 10]
+  ensemble:     "npt"
+  timestep:     0.00001
+  nsteps:       50000
+  dump_every:   50
+  seed_base:    492845
+
+  replicate:     [1, 1, 1]
+  tdamp:         2
+  pdamp:         10.0
+  neighbor_skin: 4.0
+  thermo_every:  50
+  nvt_pre_steps: 2000
 
   dump:
     attributes: [id, type, x, y, z, fx, fy, fz]
@@ -87,9 +91,9 @@ explore:
     units:  yes
 
   active_learning:
-    enabled:              true
-    threshold_save:       1.5
-    threshold_break:      10.0
+    enabled:               true
+    threshold_save:        1.5
+    threshold_break:       10.0
     save_extrapolative_to: "preselected.cfg"
 
   stabilization:
@@ -107,8 +111,7 @@ explore:
 # ── Select ────────────────────────────────────────────────────────────────────
 select:
   mlip_command:               "mlp"
-  mpi_np:                     32
-  # mpi_command:              "srun"   # override if on Dardel (default: mpirun)
+  mpi_np:                     "{{ mpi.np }}"
   strategy:                   "mlip_select_add"
   candidate_filename:         "preselected.cfg"
   merged_candidates_filename: "candidates_merged.cfg"
@@ -119,8 +122,8 @@ select:
 
 # ── Label ─────────────────────────────────────────────────────────────────────
 label:
-  type_map:     "{{ project_root }}/type_map.raw"
-  template_dir: "{{ project_root }}/vasp_templates"
+  type_map:          "{{ paths.data_root }}/Pb108eq/type_map.raw"
+  template_dir:      "{{ paths.datasets_root }}/pb_cfg/vasp_template"
   selected_filename: "selected.cfg"
 
   incar:
@@ -142,8 +145,8 @@ label:
 
   # Size-based VASP parallelisation
   scaling_rules:
-    size_threshold:  150
-    kpoint_scaling:  0.5
+    size_threshold: 150
+    kpoint_scaling: 0.5
     small_system:
       partition: "shared"
       nodes:     1
@@ -159,29 +162,28 @@ label:
 
   # Remote HPC (Dardel)
   dardel:
-    user:        "saitto"
-    host:        "dardel.pdc.kth.se"
-    remote_root: "/cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1"
+    user:          "saitto"
+    host:          "dardel.pdc.kth.se"
+    remote_root:   "/cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1"
     poll_interval: 300
 
   # Local execution fallback
   local:
     source_env: "~/vasp_env.sh"
-    np: 32
-    parallel: 4
-
-    # SLURM job template
+    vasp_bin:   "{{ bins.vasp }}"
+    np:         32
+    parallel:   4
     slurm:
-      account: "naiss2025-3-54"
+      account:  "naiss2025-3-54"
       vasp_cmd: "vasp_std"
       env_block: |
         export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
         module load PrgEnv-intel/8.5.0
 
 
-  # ── Convert ───────────────────────────────────────────────────────────────────
-  convert:
-    output_subdir: "converted_cfg"
-    merge_name: "train.cfg"
-    # run_name is derived automatically from the generation number: run_NN
-    # origin_cfg: derived automatically from the training block
+# ── Convert ───────────────────────────────────────────────────────────────────
+convert:
+  output_subdir: "converted_cfg"
+  merge_name:    "train.cfg"
+  # run_name is derived automatically from the generation number
+  # origin_cfg is injected automatically by run-loop from previous gen
