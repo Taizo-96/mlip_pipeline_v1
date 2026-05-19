@@ -73,6 +73,7 @@ class FitResult:
     run_dir: Path
     model_path: Path
     log_path: Optional[Path] = None
+    train_cfg: Optional[Path] = None   # path to train.cfg used for this fit
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
@@ -80,7 +81,8 @@ class FitResult:
         return write_json(self.run_dir / "fit_manifest.json", {
             "step": "fit",
             "model_path": str(self.model_path),
-            "log_path": str(self.log_path),
+            "log_path": str(self.log_path) if self.log_path else None,
+            "train_cfg": str(self.train_cfg) if self.train_cfg else None,
             "completed_at": self.completed_at,
         })
 
@@ -91,6 +93,7 @@ class FitResult:
             run_dir=run_dir,
             model_path=Path(d["model_path"]),
             log_path=Path(d["log_path"]) if d.get("log_path") else None,
+            train_cfg=Path(d["train_cfg"]) if d.get("train_cfg") else None,
             completed_at=d.get("completed_at", ""),
         )
 
