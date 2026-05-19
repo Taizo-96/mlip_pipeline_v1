@@ -1,81 +1,62 @@
 from __future__ import annotations
-
-import re
+import copy, os, re
 from pathlib import Path
 import yaml
 
-
-# ---------------------------------------------------------------------------
-# Simple {{ key }} / {{ section.key }} template resolver
-# ---------------------------------------------------------------------------
-
-def _resolve_templates(config: dict) -> dict:
-    """
-    Expand {{ token }} placeholders in all string values.
-    Supports:
-      {{ project_root }}           -> top-level key
-      {{ paths.runs_root }}        -> nested key (already resolved)
-      {{ bins.mlp }}               -> nested key
-    Two passes handle chains like {{ project_root }}/runs where
-    project_root itself may contain a resolved value.
-    """
-    # Build a flat lookup of scalar values
-    def _flat(d: dict, prefix: str = "") -> dict:
-        out = {}
-        for k, v in d.items():
-            key = f"{prefix}.{k}" if prefix else k
-            if isinstance(v, dict):
-                out.update(_flat(v, key))
-            elif isinstance(v, (str, int, float)):
-                out[key] = str(v)
-                # also register under short name for top-level keys
-                if not prefix:
-                    out[k] = str(v)
-        return out
-
-    def _expand(value: str, lookup: dict) -> str:
-        def _sub(m):
-            token = m.group(1).strip()
-            return lookup.get(token, m.group(0))
-        return re.sub(r'\{\{\s*([\w\.]+)\s*\}\}', _sub, value)
-
-    def _walk(obj, lookup: dict):
-        if isinstance(obj, dict):
-            return {k: _walk(v, lookup) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_walk(v, lookup) for v in obj]
-        if isinstance(obj, str):
-            return _expand(obj, lookup)
-        return obj
-
-    # Two passes so that tokens that reference other tokens resolve correctly
-    for _ in range(2):
-        lookup = _flat(config)
-        config = _walk(config, lookup)
-    return config
-
-
 def load_yaml(path: str | Path) -> dict:
-    with open(path, 'r', encoding='utf-8') as f:
-        raw = yaml.safe_load(f) or {}
-    return _resolve_templates(raw)
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
+_TEMPLATE_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+def _render_value(value, context: dict):
+    if isinstance(value, str):
+        def _sub(m):
+            key = m.group(1)
+            if key not in context:
+                raise KeyError(f"Template var '{key}' not found. Available: {list(context)}")
+            return str(context[key])
+        return _TEMPLATE_RE.sub(_sub, value)
+    if isinstance(value, dict):
+        return {k: _render_value(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_render_value(v, context) for v in value]
+    return value
+
+def render_config(config: dict) -> dict:
+    context = {k: v for k, v in config.items() if isinstance(v, (str, int, float))}
+    return _render_value(copy.deepcopy(config), context)
 
 def project_paths(config: dict) -> dict:
-    project_root = Path(config.get('project_root', '.')).expanduser().resolve()
-    paths = config.get('paths', {})
-
-    def _p(val: str, default: str) -> Path:
-        """Resolve a path value: absolute stays absolute, relative is under project_root."""
-        p = Path(val if val else default).expanduser()
-        if p.is_absolute():
-            return p.resolve()
-        return (project_root / p).resolve()
-
+    root = Path(config.get("project_root", ".")).expanduser().resolve()
+    p    = config["paths"]
     return {
-        'project_root': project_root,
-        'data_root':      _p(paths.get('data_root', 'data'), 'data'),
-        'runs_root':      _p(paths.get('runs_root', 'runs'), 'runs'),
-        'structures_root':_p(paths.get('structures_root', 'structures'), 'structures'),
-        'datasets_root':  _p(paths.get('datasets_root', 'datasets'), 'datasets'),
+        "project_root":    root,
+        "data_root":       Path(p["data_root"]).expanduser().resolve(),
+        "runs_root":       (root / p.get("runs_root", "runs")).resolve(),
+        "structures_root": (root / p.get("structures_root", "structures")).resolve(),
+        "datasets_root":   (root / p.get("datasets_root", "datasets")).resolve(),
     }
+
+def gen_paths(config: dict, resolved: dict) -> dict:
+    gen = config.get("generation")
+    if gen is None:
+        return resolved
+    gen_tag = f"gen_{str(gen).zfill(2)}"
+    gen_dir = resolved["runs_root"] / gen_tag
+    return {
+        **resolved,
+        "gen_dir":     gen_dir,
+        "fit_dir":     gen_dir / "fit",
+        "explore_dir": gen_dir / "explore",
+        "select_dir":  gen_dir / "select",
+        "label_dir":   gen_dir / "label",
+    }
+
+def build_gen_config(base_config: dict, generation: int) -> dict:
+    cfg = copy.deepcopy(base_config)
+    cfg["generation"] = str(generation).zfill(2)
+    return render_config(cfg)
+
+def load_and_render(path: str | Path) -> dict:
+    return render_config(load_yaml(path))

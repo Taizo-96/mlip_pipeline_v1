@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -176,23 +176,17 @@ class ConvertResult:
 
 @dataclass
 class EvaluationResult:
-    run_dir: Path
+    rmse_energy: float
+    rmse_forces: float
+    rmse_stress: float
+    eval_dir: Path
     plot_paths: dict = field(default_factory=dict)
-    metrics: dict = field(default_factory=dict)
     completed_at: str = field(default_factory=_now)
 
-    def save_manifest(self) -> Path:
-        from mlip_pipeline.utils.fs import write_json
-        return write_json(self.run_dir / "evaluate_manifest.json", {
-            "step": "evaluate",
-            "plot_paths": {k: str(v) for k, v in self.plot_paths.items()},
-            "metrics": self.metrics,
-            "completed_at": self.completed_at,
-        })
 
 # ── Generation state (automation) ─────────────────────────────────────────────
 
-STEPS = ("fit", "explore", "select", "label", "convert")
+STEPS = ("fit", "explore", "select", "label", "label_hpc", "convert")
 
 @dataclass
 class GenerationState:
@@ -228,7 +222,8 @@ class GenerationState:
     @classmethod
     def load(cls, gen_dir: Path) -> "GenerationState":
         d = json.loads((gen_dir / "state.json").read_text())
-        return cls(gen_dir=gen_dir, **{k: d[k] for k in d if k != "gen_dir"})
+        known = {f.name for f in fields(cls)}
+        return cls(gen_dir=gen_dir, **{k: v for k, v in d.items() if k in known and k != "gen_dir"})
 
     @classmethod
     def init(cls, generation: str, gen_dir: Path) -> "GenerationState":
