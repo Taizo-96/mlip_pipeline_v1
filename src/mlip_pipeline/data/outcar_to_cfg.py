@@ -26,11 +26,11 @@ def convert_outcars_to_cfg(
 
     Directory layout
     ----------------
-    Per-gen storage  (new cfgs only, one subdir per generation, INSIDE accum_dir):
-        datasets/<accum_subdir>/<gen_subdir>/run_00/task.000000.cfg
-        e.g.  datasets/converted_cfg/gen_11/convert/run_00/
+    Per-gen storage (flat, one dir per generation inside accum_dir):
+        datasets/<accum_subdir>/<gen_tag>/task.000000.cfg
+        e.g.  datasets/converted_cfg/gen_11/task.000000.cfg
 
-    Accumulation root  (fixed, always the same dir across gens):
+    Accumulation root (fixed across all gens):
         datasets/<accum_subdir>/train.cfg
         e.g.  datasets/converted_cfg/train.cfg
 
@@ -39,10 +39,9 @@ def convert_outcars_to_cfg(
     convert_cfg  = config.get("convert", {})
     # Fixed accumulation root — must match config.fit.train_cfg
     accum_subdir = convert_cfg.get("output_subdir", "converted_cfg")
-    # Per-gen subdir injected by runner.py (e.g. "gen_11/convert").
-    # Resolved *inside* accum_dir so cfgs are always co-located with train.cfg.
-    gen_subdir   = convert_cfg.get("gen_subdir", accum_subdir)
-    run_name     = convert_cfg.get("run_name", "run_00")
+    # Per-gen subdir injected by runner.py as just the gen tag, e.g. "gen_11".
+    # Resolved inside accum_dir so cfgs always land next to train.cfg.
+    gen_subdir   = convert_cfg.get("gen_subdir", "gen_00")
     merge_name   = convert_cfg.get("merge_name", "train.cfg")
     mlp_command  = convert_cfg.get(
         "mlp_command", config.get("fit", {}).get("mlp_command", "mlp")
@@ -70,8 +69,9 @@ def convert_outcars_to_cfg(
     # ── Accumulation dir: fixed root that train.cfg lives in
     accum_dir = ensure_dir((datasets_root / accum_subdir).resolve())
 
-    # ── Per-gen dir: always nested INSIDE accum_dir so the scan below finds it
-    gen_dir = ensure_dir((accum_dir / gen_subdir / run_name).resolve())
+    # ── Per-gen dir: flat subdir directly inside accum_dir
+    #   datasets/converted_cfg/gen_11/
+    gen_dir = ensure_dir((accum_dir / gen_subdir).resolve())
 
     # ── 1. Convert each OUTCAR → per-task .cfg ───────────────────────────────
     this_run_cfgs: list[Path] = []
@@ -109,12 +109,10 @@ def convert_outcars_to_cfg(
     if not this_run_cfgs:
         raise FileNotFoundError(f"No OUTCARs found under {label_result.label_root}")
 
-    # ── 2. Collect ALL previously converted cfgs from the accumulation dir ────
-    #    Recursive glob for task.*.cfg so every nested run_00/ subdir is
-    #    included regardless of how deep gen_subdir nests.
+    # ── 2. Collect ALL converted cfgs: one glob per gen subdir (sorted = deterministic)
     all_run_cfgs: list[Path] = sorted(accum_dir.rglob("task.*.cfg"))
 
-    # ── 3. Write accumulated train.cfg into the fixed accumulation root ────────
+    # ── 3. Write accumulated train.cfg ────────────────────────────────────────
     merged_cfg = accum_dir / merge_name
     _write_merged([origin_cfg] + all_run_cfgs, merged_cfg)
 

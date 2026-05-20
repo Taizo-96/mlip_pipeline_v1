@@ -69,7 +69,9 @@ def run_single_generation(
     config["select"]["input_subdir"]   = f"{gen_tag}/explore"
     config["label"]["output_subdir"]   = f"{gen_tag}/label"
     config["label"]["input_subdir"]    = f"{gen_tag}/select"
-    config.setdefault("convert", {})["gen_subdir"] = f"{gen_tag}/convert"
+    # convert: gen_subdir is just the gen tag — cfgs land at
+    #   datasets/converted_cfg/gen_11/task.000000.cfg
+    config.setdefault("convert", {})["gen_subdir"] = gen_tag
 
     gen_dir = paths["gen_dir"]
     ensure_dir(gen_dir)
@@ -131,20 +133,11 @@ def run_single_generation(
             # If label task dirs already exist on disk, skip label and go
             # straight to label_hpc / label_local without re-writing them.
             if step == "label" and state.label_prepared:
-                # ── label_hpc retry: ask whether to re-prepare ──────────
-                # label_hpc failure clears label_prepared, so normally we
-                # won't reach this branch on retry.  But if the user manually
-                # re-set label_prepared or calls with --only label, we still
-                # guard here.
                 info(f"  step 'label' already prepared (task dirs on disk) — skipping.")
                 state.mark_step_done("label")
                 continue
 
             # ── label_hpc retry: offer to re-prepare ───────────────────
-            # If we previously failed at label_hpc, label_prepared was reset
-            # to False and 'label' was removed from completed_steps.  The
-            # prompt below gives the user 120 s to decide whether to wipe
-            # the label dir before re-labelling (default: yes).
             if step == "label" and label_dir.exists() and any(label_dir.iterdir()):
                 if _ask_relabel(label_dir):
                     warn(f"  Wiping {label_dir} before re-labelling.")
