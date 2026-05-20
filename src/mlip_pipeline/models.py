@@ -73,7 +73,7 @@ class FitResult:
     run_dir: Path
     model_path: Path
     log_path: Optional[Path] = None
-    train_cfg: Optional[Path] = None   # path to train.cfg used for this fit
+    train_cfg: Optional[Path] = None
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
@@ -103,16 +103,11 @@ class ExploreResult:
     explore_root: Path
     run_dirs: list[Path]
     n_runs: int
-    # Counts of ok / failed LAMMPS exits
     n_ok: int = 0
     n_failed: int = 0
-    # Cell replication used for this exploration run, e.g. [2, 2, 2]
     replicate: list[int] = field(default_factory=lambda: [1, 1, 1])
-    # Per-run records: {run_dir (relative str), status, exit_code, log}
     run_records: list[dict] = field(default_factory=list)
-    # Paths of preselected .cfg files (populated by the select step)
     preselected_cfgs: list[Path] = field(default_factory=list)
-    # Paths of run dirs that exited non-zero
     failed_runs: list[Path] = field(default_factory=list)
     completed_at: str = field(default_factory=_now)
 
@@ -156,13 +151,6 @@ class SelectionResult:
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
-        """Persist selection metadata to selection_manifest.json.
-
-        NOTE: select/runner.py writes a richer manifest (model_path,
-        candidate_sources, etc.) directly via write_json during the run.
-        This method provides a lightweight round-trip complement so that
-        callers can reload a SelectionResult without re-running selection.
-        """
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.select_root / "selection_manifest.json", {
             "step": "select",
@@ -192,8 +180,6 @@ class LabelResult:
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
-        """Write label_manifest.json.  Call this instead of bare write_json
-        in label/runner.py so manifest ownership lives on the class."""
         from mlip_pipeline.utils.fs import write_json
         manifest_path = self.label_root / "label_manifest.json"
         write_json(manifest_path, {
@@ -217,7 +203,6 @@ class LabelResult:
 
     @classmethod
     def load_from_dir(cls, label_root: Path) -> "LabelResult":
-        """Alias for load_manifest — used by cli.py sync/submit commands."""
         return cls.load_manifest(label_root)
 
 
@@ -263,8 +248,6 @@ class EvaluationResult:
 
 # ── Generation state (automation) ─────────────────────────────────────────────────
 
-# HPC mode: label prepares inputs, label_hpc submits to Dardel and waits.
-# Local mode: label prepares inputs, label_local runs VASP via mpirun.
 STEPS = ("fit", "explore", "select", "label", "label_hpc", "label_local", "convert")
 
 @dataclass
@@ -279,12 +262,14 @@ class GenerationState:
     completed_at: Optional[str] = None
     model_path: Optional[str] = None
     merged_cfg: Optional[str] = None
-    # Replicate-schedule tier reached during this generation (0-based index).
-    # Updated in-place when the cell is grown; never reset on failure so that
-    # resume skips tiers that were already tried.
+    # Index into replicate_schedule; updated in-place as the cell is grown.
+    # Never reset on failure so resume skips already-tried tiers.
     replicate_tier: int = 0
-    # True once the label task directories have been written to disk.
-    # Allows label_hpc/label_local to be re-tried without re-running label.
+    # The tier index that was active when candidates were finally found
+    # (or the highest tier tried when the generation converged with 0
+    # candidates). Written once at mark_done(); used by the next generation
+    # to inherit the correct starting tier.
+    converged_replicate_tier: int = 0
     label_prepared: bool = False
 
     @property
@@ -294,17 +279,18 @@ class GenerationState:
     def save(self) -> None:
         from mlip_pipeline.utils.fs import write_json
         write_json(self._state_path, {
-            "generation": self.generation,
-            "status": self.status,
-            "completed_steps": self.completed_steps,
-            "current_step": self.current_step,
-            "error": self.error,
-            "started_at": self.started_at,
-            "completed_at": self.completed_at,
-            "model_path": self.model_path,
-            "merged_cfg": self.merged_cfg,
-            "replicate_tier": self.replicate_tier,
-            "label_prepared": self.label_prepared,
+            "generation":               self.generation,
+            "status":                   self.status,
+            "completed_steps":          self.completed_steps,
+            "current_step":             self.current_step,
+            "error":                    self.error,
+            "started_at":               self.started_at,
+            "completed_at":             self.completed_at,
+            "model_path":               self.model_path,
+            "merged_cfg":               self.merged_cfg,
+            "replicate_tier":           self.replicate_tier,
+            "converged_replicate_tier": self.converged_replicate_tier,
+            "label_prepared":           self.label_prepared,
         })
 
     @classmethod
@@ -334,10 +320,41 @@ class GenerationState:
         self.save()
 
     def mark_done(self) -> None:
+        """Finalise the generation, locking in converged_replicate_tier."""
+        self.converged_replicate_tier = self.replicate_tier
         self.status = "completed"
         self.current_step = None
         self.completed_at = _now()
         self.save()
+
+    def save_convergence_report(
+        self,
+        schedule: list[list[int]],
+    ) -> Path:
+        """Write gen_dir/convergence.json with the tier reached this generation.
+
+        Called by run_single_generation after mark_done() so the file is
+        always present for completed generations and can be read independently
+        of state.json.
+
+        Parameters
+        ----------
+        schedule:
+            The full replicate_schedule list (e.g. [[1,1,1],[2,2,2],...]).
+        """
+        from mlip_pipeline.utils.fs import write_json
+        tier = self.converged_replicate_tier
+        replicate = schedule[min(tier, len(schedule) - 1)]
+        report = {
+            "generation":               self.generation,
+            "converged_replicate_tier": tier,
+            "converged_replicate":      replicate,
+            "schedule":                 schedule,
+            "completed_at":             self.completed_at,
+        }
+        path = self.gen_dir / "convergence.json"
+        write_json(path, report)
+        return path
 
     def mark_failed(self, exc: Exception) -> None:
         self.status = "failed"

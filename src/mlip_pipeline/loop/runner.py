@@ -16,12 +16,6 @@ _RELABEL_TIMEOUT = 120  # seconds before auto-confirming re-label
 
 
 def _ask_relabel(label_dir: Path, timeout: int = _RELABEL_TIMEOUT) -> bool:
-    """Ask whether to wipe *label_dir* and re-prepare before re-submitting.
-
-    Returns True  if the user says yes (or the timeout elapses).
-    Returns False if the user explicitly says no.
-    The question auto-confirms 'yes' after *timeout* seconds.
-    """
     prompt = (
         f"\n[label_hpc retry] The previous VASP submission failed.\n"
         f"  Label dir : {label_dir}\n"
@@ -34,14 +28,12 @@ def _ask_relabel(label_dir: Path, timeout: int = _RELABEL_TIMEOUT) -> bool:
     if ready:
         answer = sys.stdin.readline().strip().lower()
         return answer not in ("n", "no")
-    # Timeout — default to yes
     sys.stdout.write("\n(timeout — defaulting to yes)\n")
     sys.stdout.flush()
     return True
 
 
 def _replicate_schedule(config: dict) -> list[list[int]]:
-    """Return the full replicate schedule, falling back to [replicate] if not set."""
     schedule = config.get("explore", {}).get("replicate_schedule")
     if schedule:
         return [list(t) for t in schedule]
@@ -69,8 +61,6 @@ def run_single_generation(
     config["select"]["input_subdir"]   = f"{gen_tag}/explore"
     config["label"]["output_subdir"]   = f"{gen_tag}/label"
     config["label"]["input_subdir"]    = f"{gen_tag}/select"
-    # convert: gen_subdir is just the gen tag — cfgs land at
-    #   datasets/converted_cfg/gen_11/task.000000.cfg
     config.setdefault("convert", {})["gen_subdir"] = gen_tag
 
     gen_dir = paths["gen_dir"]
@@ -84,8 +74,6 @@ def run_single_generation(
     if state_file.exists():
         state = GenerationState.load(gen_dir)
 
-        # ── --force: remove the targeted steps from completed_steps so they
-        #   re-run even if the generation is marked 'completed'.
         if force:
             steps_to_force = set(only_steps) if only_steps else set(STEPS)
             removed = [s for s in state.completed_steps if s in steps_to_force]
@@ -102,7 +90,6 @@ def run_single_generation(
         if state.status == "completed":
             success(f"Generation {generation:02d} already completed — skipping.")
             return state
-        # Reset 'failed' status so steps can resume
         if state.status == "failed":
             state.status = "running"
             state.error = None
@@ -110,16 +97,22 @@ def run_single_generation(
     else:
         state = GenerationState.init(str(generation).zfill(2), gen_dir)
 
-    # Apply the replicate tier that was active when we last ran (for resume).
-    # For a brand-new state (tier == 0) inherit from the previous generation
-    # so the cell never regresses below the tier the protocol already reached.
+    # ── Replicate-tier inheritance ─────────────────────────────────────────
+    # For a brand-new state (tier == 0) inherit from the previous generation's
+    # *converged* tier so the cell never regresses.  We use
+    # prev_state.converged_replicate_tier (set at mark_done) rather than
+    # replicate_tier so we get the tier that actually *worked*, not one that
+    # was merely reached mid-run.
     schedule = _replicate_schedule(config)
     if state.replicate_tier == 0 and prev_state is not None:
-        inherited_tier = min(prev_state.replicate_tier, len(schedule) - 1)
+        inherited_tier = min(
+            prev_state.converged_replicate_tier, len(schedule) - 1
+        )
         if inherited_tier > 0:
             info(
                 f"Generation {generation:02d}: inheriting replicate tier "
-                f"{inherited_tier} ({schedule[inherited_tier]}) from previous generation."
+                f"{inherited_tier} ({schedule[inherited_tier]}) "
+                f"from gen_{prev_state.generation}."
             )
             state.replicate_tier = inherited_tier
             state.save()
@@ -139,21 +132,15 @@ def run_single_generation(
 
     try:
         for step in active:
-            # ───────────────────────────────────────────────────────────
-            # Skip logic
-            # ───────────────────────────────────────────────────────────
             if state.is_step_done(step):
                 info(f"  step '{step}' already done — skipping.")
                 continue
 
-            # If label task dirs already exist on disk, skip label and go
-            # straight to label_hpc / label_local without re-writing them.
             if step == "label" and state.label_prepared:
                 info(f"  step 'label' already prepared (task dirs on disk) — skipping.")
                 state.mark_step_done("label")
                 continue
 
-            # ── label_hpc retry: offer to re-prepare ───────────────────
             if step == "label" and label_dir.exists() and any(label_dir.iterdir()):
                 if _ask_relabel(label_dir):
                     warn(f"  Wiping {label_dir} before re-labelling.")
@@ -219,7 +206,6 @@ def run_single_generation(
                 from mlip_pipeline.select.runner import run_selection
                 sel_result = run_selection(config, resolved, fit_result)
 
-                # No candidates — try growing the cell via replicate_schedule
                 while sel_result.selected_count == 0:
                     next_tier = state.replicate_tier + 1
                     if next_tier >= len(schedule):
@@ -293,7 +279,6 @@ def run_single_generation(
             state.mark_step_done(step)
 
     except Exception as exc:
-        # ── label_hpc failure: reset label so it re-runs on next attempt ──
         if state.current_step == "label_hpc":
             if "label" in state.completed_steps:
                 state.completed_steps.remove("label")
@@ -307,6 +292,8 @@ def run_single_generation(
         raise
 
     state.mark_done()
+    report_path = state.save_convergence_report(schedule)
+    info(f"Generation {generation:02d}: convergence report → {report_path}")
     success(f"Generation {generation:02d} complete.")
     return state
 
@@ -328,8 +315,11 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
+        # ── Resolve prev_state from disk when not yet in the in-memory list ──
+        # This covers the case where --start-gen N > 1, so states[] is empty
+        # at the first iteration but gen N-1 already ran in a previous session.
         prev_state: GenerationState | None = states[-1] if states else None
-        if prev_state is None and gen > start_gen:
+        if prev_state is None and gen > 1:
             prev_gen_dir = resolved_paths_for(base_config, gen - 1)
             if prev_gen_dir and prev_gen_dir.exists():
                 try:
@@ -368,7 +358,6 @@ def run_loop(
 
 
 def resolved_paths_for(base_config: dict, generation: int) -> Path | None:
-    """Return the gen_dir Path for a given generation, or None on error."""
     try:
         config   = build_gen_config(base_config, generation)
         resolved = project_paths(config)
