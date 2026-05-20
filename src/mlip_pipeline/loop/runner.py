@@ -97,12 +97,7 @@ def run_single_generation(
     else:
         state = GenerationState.init(str(generation).zfill(2), gen_dir)
 
-    # ── Replicate-tier inheritance ─────────────────────────────────────────
-    # For a brand-new state (tier == 0) inherit from the previous generation's
-    # *converged* tier so the cell never regresses.  We use
-    # prev_state.converged_replicate_tier (set at mark_done) rather than
-    # replicate_tier so we get the tier that actually *worked*, not one that
-    # was merely reached mid-run.
+    # ── Replicate-tier inheritance ───────────────────────────────────────
     schedule = _replicate_schedule(config)
     if state.replicate_tier == 0 and prev_state is not None:
         inherited_tier = min(
@@ -155,7 +150,7 @@ def run_single_generation(
             state.mark_step_start(step)
             step_header(step.upper())
 
-            # ── fit ────────────────────────────────────────────────────
+            # ── fit ────────────────────────────────────────────────────────
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential, resolve_train_cfg
                 from mlip_pipeline.checks import check_training_cfg_count
@@ -182,7 +177,7 @@ def run_single_generation(
                 result = train_potential(config, resolved)
                 state.model_path = str(result.model_path)
 
-            # ── explore ────────────────────────────────────────────────
+            # ── explore ──────────────────────────────────────────────────
             elif step == "explore":
                 from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
                 from mlip_pipeline.explore.runner import run_exploration_runs
@@ -195,7 +190,7 @@ def run_single_generation(
                 explore_dir = create_exploration_runs(config, resolved, fit_result)
                 run_exploration_runs(config, resolved, explore_dir)
 
-            # ── select ────────────────────────────────────────────────
+            # ── select ──────────────────────────────────────────────────
             elif step == "select":
                 fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
                 fit_result = (
@@ -239,20 +234,20 @@ def run_single_generation(
                     run_exploration_runs(config, resolved, explore_dir)
                     sel_result = run_selection(config, resolved, fit_result)
 
-            # ── label ─────────────────────────────────────────────────
+            # ── label ──────────────────────────────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
                 state.label_prepared = True
                 state.save()
 
-            # ── label_local ──────────────────────────────────────────
+            # ── label_local ────────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc ──────────────────────────────────────────
+            # ── label_hpc ─────────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
@@ -269,12 +264,13 @@ def run_single_generation(
                         "VASP jobs likely failed — check job.sh env_block and vasp_cmd."
                     )
 
-            # ── convert ──────────────────────────────────────────────
+            # ── convert ───────────────────────────────────────────────
             elif step == "convert":
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
-                merged_cfg_path = convert_outcars_to_cfg(label_result, config, resolved)
-                state.merged_cfg = str(merged_cfg_path)
+                convert_result = convert_outcars_to_cfg(label_result, config, resolved)
+                # ConvertResult.merged_cfg is the accumulated train.cfg path
+                state.merged_cfg = str(convert_result.merged_cfg)
 
             state.mark_step_done(step)
 
@@ -315,9 +311,6 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
-        # ── Resolve prev_state from disk when not yet in the in-memory list ──
-        # This covers the case where --start-gen N > 1, so states[] is empty
-        # at the first iteration but gen N-1 already ran in a previous session.
         prev_state: GenerationState | None = states[-1] if states else None
         if prev_state is None and gen > 1:
             prev_gen_dir = resolved_paths_for(base_config, gen - 1)
