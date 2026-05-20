@@ -1,10 +1,10 @@
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 # Pb_loop.yaml  –  Single source of truth for the Pb mlip_pipeline
 #
 # Template syntax:  {{ key }}  or  {{ section.key }}
 # The `generation` key is injected automatically by run-loop / run-gen.
 # To run a single generation manually, add:  generation: "07"  at the top.
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
 project_root: "/home/saitto/mlip_pipeline_v1"
 
@@ -16,19 +16,21 @@ paths:
 
 
 # ── Shared MPI ──────────────────────────────────────────────────────────────
+# np:     number of MPI ranks used by fit AND select
+# prefix: full mpirun prefix string consumed by fit (split into argv tokens)
 mpi:
-  np:     32
-  prefix: "mpi_prefix: mpirun --oversubscribe -np 64"
+  np:     64
+  prefix: "mpirun --oversubscribe -np 64"
 
 
-# ── Binary paths  (machine-specific) ─────────────────────────────────────────
+# ── Binary paths  (machine-specific) ──────────────────────────────────────
 bins:
   mlp:    "mlp"       # uses PATH → active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
   lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
   vasp:   "vasp_std"
 
 
-# ── Materials Project ──────────────────────────────────────────────────────────
+# ── Materials Project ────────────────────────────────────────────────────────
 materials_project:
   api_key:              "${MP_API_KEY}"
   material_ids:         ["mp-20483"]
@@ -47,7 +49,7 @@ training:
   merge_name:    "train.cfg"
 
 
-# ── Fit ─────────────────────────────────────────────────────────────────────
+# ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
   mpi_prefix:             "{{ mpi.prefix }}"
@@ -62,7 +64,7 @@ fit:
     - "--max-iter=1000"
 
 
-# ── Explore ─────────────────────────────────────────────────────────────────
+# ── Explore ───────────────────────────────────────────────────────────────────
 explore:
   lammps_command: "{{ bins.lammps }}"
   mpi_prefix:     "{{ mpi.prefix }}"
@@ -119,9 +121,9 @@ explore:
       rescale: true
 
 
-# ── Select ───────────────────────────────────────────────────────────────────
+# ── Select ──────────────────────────────────────────────────────────────────────
 select:
-  mlip_command:               "mlp"
+  mlip_command:               "{{ bins.mlp }}"
   mpi_np:                     "{{ mpi.np }}"
   strategy:                   "mlip_select_add"
   candidate_filename:         "preselected.cfg"
@@ -131,7 +133,7 @@ select:
   write_manifest:             true
 
 
-# ── Label ─────────────────────────────────────────────────────────────────────
+# ── Label ─────────────────────────────────────────────────────────────────────────
 label:
   type_map:          "{{ paths.data_root }}/Pb108eq/type_map.raw"
   template_dir:      "{{ paths.datasets_root }}/vasp_template"
@@ -190,7 +192,7 @@ label:
     np:         32
     parallel:   4
 
-# ── Convert ─────────────────────────────────────────────────────────────────────
+# ── Convert ─────────────────────────────────────────────────────────────────────────
 convert:
   output_subdir: "converted_cfg"
   merge_name:    "train.cfg"
