@@ -155,6 +155,34 @@ class SelectionResult:
     selected_count: int = 0
     completed_at: str = field(default_factory=_now)
 
+    def save_manifest(self) -> Path:
+        """Persist selection metadata to selection_manifest.json.
+
+        NOTE: select/runner.py writes a richer manifest (model_path,
+        candidate_sources, etc.) directly via write_json during the run.
+        This method provides a lightweight round-trip complement so that
+        callers can reload a SelectionResult without re-running selection.
+        """
+        from mlip_pipeline.utils.fs import write_json
+        return write_json(self.select_root / "selection_manifest.json", {
+            "step": "select",
+            "selected_count": self.selected_count,
+            "selected_block_files": [str(p) for p in self.selected_cfg_paths],
+            "completed_at": self.completed_at,
+        })
+
+    @classmethod
+    def load_manifest(cls, select_root: Path) -> "SelectionResult":
+        d = json.loads((select_root / "selection_manifest.json").read_text())
+        return cls(
+            select_root=select_root,
+            manifest_path=select_root / "selection_manifest.json",
+            selected_cfg_paths=[Path(p) for p in d.get("selected_block_files", [])],
+            selected_count=d.get("selected_count", 0),
+            completed_at=d.get("completed_at", ""),
+        )
+
+
 @dataclass
 class LabelResult:
     label_root: Path
@@ -162,6 +190,20 @@ class LabelResult:
     task_count: int
     manifest_path: Optional[Path] = None
     completed_at: str = field(default_factory=_now)
+
+    def save_manifest(self) -> Path:
+        """Write label_manifest.json.  Call this instead of bare write_json
+        in label/runner.py so manifest ownership lives on the class."""
+        from mlip_pipeline.utils.fs import write_json
+        manifest_path = self.label_root / "label_manifest.json"
+        write_json(manifest_path, {
+            "step": "label",
+            "task_count": self.task_count,
+            "task_dirs": [str(t) for t in self.task_dirs],
+            "completed_at": self.completed_at,
+        })
+        self.manifest_path = manifest_path
+        return manifest_path
 
     @classmethod
     def load_manifest(cls, label_root: Path) -> "LabelResult":
@@ -177,6 +219,7 @@ class LabelResult:
     def load_from_dir(cls, label_root: Path) -> "LabelResult":
         """Alias for load_manifest — used by cli.py sync/submit commands."""
         return cls.load_manifest(label_root)
+
 
 @dataclass
 class ConvertResult:
@@ -195,6 +238,18 @@ class ConvertResult:
             "n_total_cfgs": self.n_total_cfgs,
             "completed_at": self.completed_at,
         })
+
+    @classmethod
+    def load_manifest(cls, run_dir: Path) -> "ConvertResult":
+        d = json.loads((run_dir / "convert_manifest.json").read_text())
+        return cls(
+            merged_cfg=Path(d["merged_cfg"]),
+            run_dir=run_dir,
+            n_new_cfgs=d.get("n_new_cfgs", 0),
+            n_total_cfgs=d.get("n_total_cfgs", 0),
+            completed_at=d.get("completed_at", ""),
+        )
+
 
 @dataclass
 class EvaluationResult:
