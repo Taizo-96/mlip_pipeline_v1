@@ -74,19 +74,33 @@ def run_loop(
 
         # --- helpers that inject gen-specific config overrides -------------
         def _config_for_gen() -> dict:
-            """Return a shallow config copy with generation-specific overrides."""
+            """Return a config copy with generation-specific overrides.
+
+            IMPORTANT: only per-generation steps (fit, explore, select, label)
+            get their output_subdir redirected to runs/gen_NN/<step>/.
+            The 'convert' step is intentionally excluded — it must always write
+            into a single fixed accumulation directory (datasets/converted_cfg/)
+            so that each generation's run_NN sub-folder is collected and the
+            merged train.cfg grows correctly across all generations.
+            """
             import copy
             cfg = copy.deepcopy(config)
             cfg["generation"] = tag
-            # Inject gen-specific subdirs so each step writes to gen_NN/
-            for section in ("fit", "explore", "select", "label", "convert"):
+            # Only redirect per-run steps — NOT convert
+            for section in ("fit", "explore", "select", "label"):
                 if section in cfg:
-                    cfg[section].setdefault("output_subdir", f"{tag}/{section}")
-                    # Override so files land under gen_NN/
                     cfg[section]["output_subdir"] = f"{tag}/{section}"
+            # convert keeps whatever output_subdir is in the YAML
+            # (default: "converted_cfg") so run subdirs accumulate there
             return cfg
 
         gen_cfg = _config_for_gen()
+
+        # Also inject the per-generation run_name into convert so each gen
+        # writes to converted_cfg/gen_NN/ instead of always run_00
+        if "convert" not in gen_cfg:
+            gen_cfg["convert"] = {}
+        gen_cfg["convert"]["run_name"] = tag
 
         def _build_fit_result() -> FitResult:
             fit_dir = runs_root / tag / "fit"
