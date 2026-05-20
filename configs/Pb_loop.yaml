@@ -21,8 +21,8 @@ paths:
 # set mpi_prefix / mpi_np directly in that section (see fit/explore/select
 # below for examples).  The override only affects that one step.
 mpi:
-  np:     64
-  prefix: "mpirun --oversubscribe -np 64"
+  np:     32
+  prefix: "mpirun -np 32"
 
 
 # ── Binary paths  (machine-specific) ──────────────────────────────────────
@@ -54,7 +54,7 @@ training:
 # ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
-  mpi_prefix:             "{{ mpi.prefix }}"  # override: "mpirun -np 32" to use fewer cores for fit
+  mpi_prefix:             "mpi_prefix: mpirun --oversubscribe -np 64"  # override: "mpi_prefix: mpirun --oversubscribe -np 64" or maintain "{{ mpi.prefix }}" for fit
   template_dir:           "{{ project_root }}/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
