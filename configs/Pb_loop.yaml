@@ -18,7 +18,7 @@ paths:
 # ── Shared MPI ──────────────────────────────────────────────────────────────
 mpi:
   np:     32
-  prefix: "mpirun -np 32"
+  prefix: "mpi_prefix: mpirun --oversubscribe -np 64"
 
 
 # ── Binary paths  (machine-specific) ─────────────────────────────────────────
@@ -83,6 +83,9 @@ explore:
     - [1, 1, 1]
     - [2, 2, 2]
     - [3, 3, 3]
+    - [4, 4, 4]
+    - [5, 5, 5]
+    - [6, 6, 6]
 
   tdamp:         2
   pdamp:         10.0
@@ -171,7 +174,7 @@ label:
     user:          "saitto"
     host:          "dardel.pdc.kth.se"
     remote_root:   "/cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1"
-    poll_interval: 300
+    poll_interval: 60
   slurm:
     account: "naiss2025-3-54"
     time: "01:00:00"
