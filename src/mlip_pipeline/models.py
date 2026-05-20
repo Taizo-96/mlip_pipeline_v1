@@ -212,6 +212,10 @@ class ConvertResult:
     run_dir: Path
     n_new_cfgs: int
     n_total_cfgs: int
+    # block-count fields — default 0 so old manifests still load cleanly
+    prev_block_count: int = 0
+    new_block_count: int = 0
+    total_block_count: int = 0
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
@@ -221,6 +225,9 @@ class ConvertResult:
             "merged_cfg": str(self.merged_cfg),
             "n_new_cfgs": self.n_new_cfgs,
             "n_total_cfgs": self.n_total_cfgs,
+            "prev_block_count": self.prev_block_count,
+            "new_block_count": self.new_block_count,
+            "total_block_count": self.total_block_count,
             "completed_at": self.completed_at,
         })
 
@@ -232,6 +239,9 @@ class ConvertResult:
             run_dir=run_dir,
             n_new_cfgs=d.get("n_new_cfgs", 0),
             n_total_cfgs=d.get("n_total_cfgs", 0),
+            prev_block_count=d.get("prev_block_count", 0),
+            new_block_count=d.get("new_block_count", 0),
+            total_block_count=d.get("total_block_count", 0),
             completed_at=d.get("completed_at", ""),
         )
 
@@ -262,13 +272,7 @@ class GenerationState:
     completed_at: Optional[str] = None
     model_path: Optional[str] = None
     merged_cfg: Optional[str] = None
-    # Index into replicate_schedule; updated in-place as the cell is grown.
-    # Never reset on failure so resume skips already-tried tiers.
     replicate_tier: int = 0
-    # The tier index that was active when candidates were finally found
-    # (or the highest tier tried when the generation converged with 0
-    # candidates). Written once at mark_done(); used by the next generation
-    # to inherit the correct starting tier.
     converged_replicate_tier: int = 0
     label_prepared: bool = False
 
@@ -331,17 +335,6 @@ class GenerationState:
         self,
         schedule: list[list[int]],
     ) -> Path:
-        """Write gen_dir/convergence.json with the tier reached this generation.
-
-        Called by run_single_generation after mark_done() so the file is
-        always present for completed generations and can be read independently
-        of state.json.
-
-        Parameters
-        ----------
-        schedule:
-            The full replicate_schedule list (e.g. [[1,1,1],[2,2,2],...]).
-        """
         from mlip_pipeline.utils.fs import write_json
         tier = self.converged_replicate_tier
         replicate = schedule[min(tier, len(schedule) - 1)]
