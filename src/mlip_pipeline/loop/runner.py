@@ -83,6 +83,22 @@ def run_single_generation(
     state_file = gen_dir / "state.json"
     if state_file.exists():
         state = GenerationState.load(gen_dir)
+
+        # ── --force: remove the targeted steps from completed_steps so they
+        #   re-run even if the generation is marked 'completed'.
+        if force:
+            steps_to_force = set(only_steps) if only_steps else set(STEPS)
+            removed = [s for s in state.completed_steps if s in steps_to_force]
+            if removed:
+                state.completed_steps = [s for s in state.completed_steps
+                                          if s not in steps_to_force]
+                if state.status == "completed":
+                    state.status = "running"
+                    state.completed_at = None
+                state.error = None
+                state.save()
+                warn(f"Generation {generation:02d}: --force reset step(s): {removed}")
+
         if state.status == "completed":
             success(f"Generation {generation:02d} already completed — skipping.")
             return state
@@ -329,6 +345,7 @@ def run_loop(
         try:
             state = run_single_generation(
                 base_config, gen,
+                force=force,
                 skip_steps=skip_steps,
                 only_steps=only_steps,
                 prev_state=prev_state,
