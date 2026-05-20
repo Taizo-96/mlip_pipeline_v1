@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
+from mlip_pipeline.utils.fs import write_json
 from mlip_pipeline.utils.shell import run_command
-from mlip_pipeline.utils.logging import warn
+from mlip_pipeline.utils.logging import info, warn
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def run_exploration_runs(
@@ -15,17 +21,22 @@ def run_exploration_runs(
     some runs may diverge (e.g. near the melt) and that is expected.
     The select step downstream will simply find fewer preselected.cfg
     candidates from those runs.
+
+    Writes ``explore_manifest.json`` to *explore_root* on completion.
     """
     explore_cfg    = config["explore"]
     lammps_command = explore_cfg.get("lammps_command", "lmp")
     mpi_prefix     = explore_cfg.get("mpi_prefix", "")
+    replicate      = explore_cfg.get("replicate", [1, 1, 1])
 
     input_files = sorted(explore_root.rglob("in.mlip.pb"))
     if not input_files:
         raise FileNotFoundError(f"No exploration inputs found in {explore_root}")
 
+    run_records: list[dict] = []
     n_ok   = 0
     n_fail = 0
+
     for input_file in input_files:
         command: list[str] = []
         if mpi_prefix:
@@ -34,6 +45,14 @@ def run_exploration_runs(
 
         log_path    = input_file.with_suffix(input_file.suffix + ".log")
         return_code = run_command(command, cwd=input_file.parent, log_file=log_path)
+
+        status = "ok" if return_code == 0 else "failed"
+        run_records.append({
+            "run_dir":   str(input_file.parent.relative_to(explore_root)),
+            "status":    status,
+            "exit_code": return_code,
+            "log":       str(log_path.relative_to(explore_root)),
+        })
 
         if return_code != 0:
             warn(
@@ -46,3 +65,16 @@ def run_exploration_runs(
 
     if n_fail:
         warn(f"Exploration complete: {n_ok} ok, {n_fail} failed (non-fatal).")
+
+    manifest = {
+        "step":        "explore",
+        "replicate":   replicate,
+        "n_runs":      len(run_records),
+        "n_ok":        n_ok,
+        "n_failed":    n_fail,
+        "runs":        run_records,
+        "completed_at": _now(),
+    }
+    manifest_path = explore_root / "explore_manifest.json"
+    write_json(manifest_path, manifest)
+    info(f"Explore manifest written → {manifest_path}")
