@@ -123,8 +123,12 @@ def cmd_submit_and_watch(label_result: LabelResult, config: dict, resolved_paths
 def cmd_convert_cfg(config: dict, resolved_paths: dict) -> None:
     label_root = resolved_paths["runs_root"] / config["label"]["output_subdir"]
     label_result = LabelResult.load_from_dir(label_root)
-    merged = convert_outcars_to_cfg(label_result, config, resolved_paths)
-    print(merged)
+    result = convert_outcars_to_cfg(label_result, config, resolved_paths)
+    print(f"merged_cfg      : {result.merged_cfg}")
+    print(f"prev_blocks     : {result.prev_block_count}")
+    print(f"new_cfgs        : {result.new_cfg_count}")
+    print(f"total_blocks    : {result.total_block_count}")
+    print(f"run_dir         : {result.run_dir}")
 
 
 def cmd_evaluate(config: dict, resolved_paths: dict) -> None:

@@ -1,4 +1,3 @@
-# src/mlip_pipeline/models.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -95,3 +94,18 @@ class EvaluationResult:
     rmse_stress: float
     eval_dir: Path
     plot_paths: dict[str, Path] = field(default_factory=dict)
+
+
+@dataclass
+class ConvertResult:
+    """Returned by convert_outcars_to_cfg.
+
+    Carries the merged cfg path together with the block counts so that
+    callers (cli, tests) can assert the handoff is correct before
+    launching the next fit.
+    """
+    merged_cfg: Path
+    prev_block_count: int   # blocks in train.cfg BEFORE this run's cfgs were added
+    new_cfg_count: int      # number of new per-task cfg files added this run
+    total_block_count: int  # blocks in the written merged_cfg  (must == prev + new)
+    run_dir: Path           # e.g. datasets/converted_cfg/run_01

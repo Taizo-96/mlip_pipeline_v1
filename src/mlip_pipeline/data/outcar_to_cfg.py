@@ -3,8 +3,13 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from mlip_pipeline.models import LabelResult
+from mlip_pipeline.models import LabelResult, ConvertResult
 from mlip_pipeline.utils.fs import ensure_dir
+
+
+def _count_cfg_blocks(path: Path) -> int:
+    """Count BEGIN_CFG markers in a cfg file.  O(file-size), no parsing."""
+    return path.read_text(encoding="utf-8").count("BEGIN_CFG")
 
 
 def _write_merged(sources: list[Path], dest: Path) -> None:
@@ -20,12 +25,11 @@ def convert_outcars_to_cfg(
     label_result: LabelResult,
     config: dict,
     resolved_paths: dict,
-) -> Path:
+) -> ConvertResult:
     convert_cfg = config.get("convert", {})
     base_subdir = convert_cfg.get("output_subdir", "converted_cfg")
     run_name    = convert_cfg.get("run_name", "run_00")
     merge_name  = convert_cfg.get("merge_name", "train.cfg")
-    # Reuse the mlp binary from the fit block so there's only one place to set it
     mlp_command = convert_cfg.get("mlp_command", config.get("fit", {}).get("mlp_command", "mlp"))
 
     # Derive origin_cfg from training block (e.g. datasets/pb_cfg/train.cfg)
@@ -48,9 +52,11 @@ def convert_outcars_to_cfg(
     base_dir = (resolved_paths["datasets_root"] / base_subdir).resolve()
     run_dir  = ensure_dir(base_dir / run_name)
 
-    # ── 1. Convert each OUTCAR → per-task .cfg (MLIP-3 syntax) ────────────────
-    # MLIP-3: mlp convert OUTCAR out.cfg --input_format=outcar
-    # MLIP-2: mlp convert-cfg OUTCAR out.cfg --input-format=vasp-outcar
+    # ── 1. Snapshot the block count BEFORE we add anything ───────────────────
+    merged_cfg = base_dir / merge_name
+    prev_block_count = _count_cfg_blocks(merged_cfg) if merged_cfg.exists() else 0
+
+    # ── 2. Convert each OUTCAR → per-task .cfg ────────────────────────────────
     this_run_cfgs: list[Path] = []
     for task_dir in sorted(label_result.task_dirs):
         outcar = task_dir / "OUTCAR"
@@ -70,7 +76,6 @@ def convert_outcars_to_cfg(
                 f"  stderr: {result.stderr.strip()}"
             )
 
-        # Verify the file was actually written -- mlp may exit 0 but write nothing
         if not out_cfg.exists() or out_cfg.stat().st_size == 0:
             raise RuntimeError(
                 f"mlp convert exited 0 but produced no output for {task_dir.name}.\n"
@@ -86,15 +91,50 @@ def convert_outcars_to_cfg(
     if not this_run_cfgs:
         raise FileNotFoundError(f"No OUTCARs found under {label_result.label_root}")
 
-    # ── 2. Collect all run cfgs by scanning subdirs in sorted order ───────────
+    # ── 3. Count blocks contributed by the new cfgs ───────────────────────────
+    new_cfg_block_count = sum(_count_cfg_blocks(p) for p in this_run_cfgs)
+
+    # ── 4. Collect ALL run cfgs (historical + this run) in sorted order ───────
     all_run_cfgs: list[Path] = []
     for run_subdir in sorted(d for d in base_dir.iterdir() if d.is_dir()):
         all_run_cfgs.extend(sorted(run_subdir.glob("task.*.cfg")))
 
-    # ── 3. Rebuild accumulated train.cfg: origin first, then all run cfgs ─────
-    merged_cfg = base_dir / merge_name
+    # ── 5. Rebuild accumulated train.cfg ──────────────────────────────────────
     _write_merged([origin_cfg] + all_run_cfgs, merged_cfg)
 
+    # ── 6. Verify the written file has the expected number of blocks ──────────
+    total_block_count = _count_cfg_blocks(merged_cfg)
+    origin_block_count = _count_cfg_blocks(origin_cfg)
+    expected_total = origin_block_count + sum(
+        _count_cfg_blocks(p)
+        for run_subdir in sorted(d for d in base_dir.iterdir() if d.is_dir())
+        for p in sorted(run_subdir.glob("task.*.cfg"))
+    )
+
+    if total_block_count != expected_total:
+        raise RuntimeError(
+            f"Block count mismatch in {merged_cfg.name} after convert-cfg:\n"
+            f"  Expected : {expected_total}  "
+            f"(origin {origin_block_count} + all run cfgs)\n"
+            f"  Actual   : {total_block_count}\n"
+            f"  This run : {len(this_run_cfgs)} files, {new_cfg_block_count} blocks\n"
+            f"  File     : {merged_cfg}\n"
+            f"\n"
+            f"Do NOT run 'fit' — the training set is incomplete.  "
+            f"Re-run 'convert-cfg' or inspect {run_dir} for partial/empty cfgs."
+        )
+
     print(f"\nDone. {len(this_run_cfgs)} new cfg(s) added to {run_dir.name}/")
-    print(f"Accumulated {merge_name}: origin({origin_cfg.name}) + {len(all_run_cfgs)} run cfg(s) → {merged_cfg}")
-    return merged_cfg
+    print(
+        f"Accumulated {merge_name}: "
+        f"origin({origin_block_count}) + all run cfgs → "
+        f"{total_block_count} blocks total  [{merged_cfg}]"
+    )
+
+    return ConvertResult(
+        merged_cfg=merged_cfg,
+        prev_block_count=prev_block_count,
+        new_cfg_count=len(this_run_cfgs),
+        total_block_count=total_block_count,
+        run_dir=run_dir,
+    )
