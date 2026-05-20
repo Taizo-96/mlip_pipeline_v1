@@ -16,10 +16,13 @@ paths:
 
 
 # ── Shared MPI defaults ────────────────────────────────────────────────────────
-# These are the fallback values used by all sections that reference
-# {{ mpi.prefix }} or {{ mpi.np }}.  To override for a specific step,
-# set mpi_prefix / mpi_np directly in that section (see fit/explore/select
-# below for examples).  The override only affects that one step.
+# Used by all sections via {{ mpi.prefix }} / {{ mpi.np }}.
+# To override for a specific step only, set mpi_prefix / mpi_np directly
+# in that section with a plain string, e.g.:
+#   fit:
+#     mpi_prefix: "mpirun --oversubscribe -np 64"
+#   select:
+#     mpi_np: 32
 mpi:
   np:     32
   prefix: "mpirun -np 32"
@@ -27,7 +30,7 @@ mpi:
 
 # ── Binary paths  (machine-specific) ──────────────────────────────────────
 bins:
-  mlp:    "mlp"       # uses PATH → active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
+  mlp:    "mlp"
   lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
   vasp:   "vasp_std"
 
@@ -54,7 +57,7 @@ training:
 # ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
-  mpi_prefix:             "mpi_prefix: mpirun --oversubscribe -np 64"  # override: "mpi_prefix: mpirun --oversubscribe -np 64" or maintain "{{ mpi.prefix }}" for fit
+  mpi_prefix:             "{{ mpi.prefix }}"
   template_dir:           "{{ project_root }}/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
@@ -69,7 +72,7 @@ fit:
 # ── Explore ───────────────────────────────────────────────────────────────────
 explore:
   lammps_command: "{{ bins.lammps }}"
-  mpi_prefix:     "{{ mpi.prefix }}"  # override: "mpirun -np 8" to run LAMMPS with fewer ranks
+  mpi_prefix:     "{{ mpi.prefix }}"
 
   temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
   pressure_bar: [0, 1, 5, 10]
@@ -123,7 +126,7 @@ explore:
 # ── Select ──────────────────────────────────────────────────────────────────────
 select:
   mlip_command:               "{{ bins.mlp }}"
-  mpi_np:                     "{{ mpi.np }}"  # override: 32 to use fewer ranks for select_add
+  mpi_np:                     "{{ mpi.np }}"
   strategy:                   "mlip_select_add"
   candidate_filename:         "preselected.cfg"
   merged_candidates_filename: "candidates_merged.cfg"
@@ -189,7 +192,7 @@ label:
     parallel:   4
 
 
-# ── Convert ─────────────────────────────────────────────────────────────────────────
+# ── Convert ──────────────────────────────────────────────────────────────────══
 convert:
   output_subdir: "converted_cfg"
   merge_name:    "train.cfg"
