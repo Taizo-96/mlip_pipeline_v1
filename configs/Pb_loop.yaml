@@ -23,9 +23,9 @@ mpi:
 
 # ── Binary paths  (machine-specific) ────────────────────────────────────────
 bins:
-  mlp:    "{{ project_root }}/codes/mlip-3/bin/mlp"
-  lammps: "{{ project_root }}/codes/interface-lammps-mlip-3/lmp_mpi"
-  vasp:   "/opt/vasp/vasp.6.5.1_cpu/bin/vasp_std"
+  mlp:    "mlp"       # uses PATH → active-learning-ML-potential-KTH/codes/mlip-3/bin/mlp
+  lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
+  vasp:   "vasp_std"
 
 
 # ── Materials Project ────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ training:
 fit:
   mlp_command:            "{{ bins.mlp }}"
   mpi_prefix:             "{{ mpi.prefix }}"
-  template_dir:           "{{ project_root }}/codes/mlip-3/MTP_templates"
+  template_dir:           "{{ project_root }}/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
   train_cfg:              "{{ paths.datasets_root }}/converted_cfg/train.cfg"
@@ -123,7 +123,7 @@ select:
 # ── Label ─────────────────────────────────────────────────────────────────────
 label:
   type_map:          "{{ paths.data_root }}/Pb108eq/type_map.raw"
-  template_dir:      "{{ paths.datasets_root }}/pb_cfg/vasp_template"
+  template_dir:      "{{ paths.datasets_root }}/vasp_template"
   selected_filename: "selected.cfg"
 
   incar:
@@ -145,20 +145,18 @@ label:
 
   # Size-based VASP parallelisation
   scaling_rules:
-    size_threshold: 150
-    kpoint_scaling: 0.5
-    small_system:
+    1: # small_system: 1–149 atoms
       partition: "shared"
-      nodes:     1
-      ntasks:    32
-      ncore:     1
-      kpar:      16
-    large_system:
+      nodes: 1
+      ntasks: 32
+      ncore: 1
+      kpar: 16
+    150: # large_system: 150+ atoms (your size_threshold)
       partition: "main"
-      nodes:     2
-      ntasks:    256
-      ncore:     32
-      kpar:      2
+      nodes: 2
+      ntasks: 256
+      ncore: 32
+      kpar: 2
 
   # Remote HPC (Dardel)
   dardel:
@@ -166,6 +164,13 @@ label:
     host:          "dardel.pdc.kth.se"
     remote_root:   "/cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1"
     poll_interval: 300
+  slurm:
+    account: "naiss2025-3-54"
+    time: "01:00:00"
+    vasp_cmd: "vasp_std"
+    env_block: |
+      module load PDC/24.11
+      module load vasp/6.4.3-vanilla
 
   # Local execution fallback
   local:
@@ -173,13 +178,6 @@ label:
     vasp_bin:   "{{ bins.vasp }}"
     np:         32
     parallel:   4
-    slurm:
-      account:  "naiss2025-3-54"
-      vasp_cmd: "vasp_std"
-      env_block: |
-        export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
-        module load PrgEnv-intel/8.5.0
-
 
 # ── Convert ───────────────────────────────────────────────────────────────────
 convert:
