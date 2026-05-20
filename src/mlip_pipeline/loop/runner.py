@@ -64,8 +64,20 @@ def run_single_generation(
     else:
         state = GenerationState.init(str(generation).zfill(2), gen_dir)
 
-    # Apply the replicate tier that was active when we last ran (for resume)
+    # Apply the replicate tier that was active when we last ran (for resume).
+    # For a brand-new state (tier == 0) inherit from the previous generation
+    # so the cell never regresses below the tier the protocol already reached.
     schedule = _replicate_schedule(config)
+    if state.replicate_tier == 0 and prev_state is not None:
+        inherited_tier = min(prev_state.replicate_tier, len(schedule) - 1)
+        if inherited_tier > 0:
+            info(
+                f"Generation {generation:02d}: inheriting replicate tier "
+                f"{inherited_tier} ({schedule[inherited_tier]}) from previous generation."
+            )
+            state.replicate_tier = inherited_tier
+            state.save()
+
     tier = min(state.replicate_tier, len(schedule) - 1)
     config["explore"]["replicate"] = schedule[tier]
 
