@@ -15,9 +15,11 @@ paths:
   datasets_root:   "{{ project_root }}/datasets"
 
 
-# ── Shared MPI ──────────────────────────────────────────────────────────────
-# np:     number of MPI ranks used by fit AND select
-# prefix: full mpirun prefix string consumed by fit (split into argv tokens)
+# ── Shared MPI defaults ────────────────────────────────────────────────────────
+# These are the fallback values used by all sections that reference
+# {{ mpi.prefix }} or {{ mpi.np }}.  To override for a specific step,
+# set mpi_prefix / mpi_np directly in that section (see fit/explore/select
+# below for examples).  The override only affects that one step.
 mpi:
   np:     64
   prefix: "mpirun --oversubscribe -np 64"
@@ -52,7 +54,7 @@ training:
 # ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
-  mpi_prefix:             "{{ mpi.prefix }}"
+  mpi_prefix:             "{{ mpi.prefix }}"  # override: "mpirun -np 32" to use fewer cores for fit
   template_dir:           "{{ project_root }}/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
@@ -67,7 +69,7 @@ fit:
 # ── Explore ───────────────────────────────────────────────────────────────────
 explore:
   lammps_command: "{{ bins.lammps }}"
-  mpi_prefix:     "{{ mpi.prefix }}"
+  mpi_prefix:     "{{ mpi.prefix }}"  # override: "mpirun -np 8" to run LAMMPS with fewer ranks
 
   temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
   pressure_bar: [0, 1, 5, 10]
@@ -77,9 +79,6 @@ explore:
   dump_every:   50
   seed_base:    492845
 
-  # Starting cell size. When 0 candidates are found at this size the pipeline
-  # automatically advances through replicate_schedule until candidates are
-  # found or all tiers are exhausted (= truly converged).
   replicate: [1, 1, 1]
   replicate_schedule:
     - [1, 1, 1]
@@ -124,7 +123,7 @@ explore:
 # ── Select ──────────────────────────────────────────────────────────────────────
 select:
   mlip_command:               "{{ bins.mlp }}"
-  mpi_np:                     "{{ mpi.np }}"
+  mpi_np:                     "{{ mpi.np }}"  # override: 32 to use fewer ranks for select_add
   strategy:                   "mlip_select_add"
   candidate_filename:         "preselected.cfg"
   merged_candidates_filename: "candidates_merged.cfg"
@@ -156,22 +155,20 @@ label:
     SIGMA:  0.2
     NSW:    0
 
-  # Size-based VASP parallelisation
   scaling_rules:
-    1: # small_system: 1–149 atoms
+    1:
       partition: "shared"
       nodes: 1
       ntasks: 32
       ncore: 1
       kpar: 16
-    150: # large_system: 150+ atoms (your size_threshold)
+    150:
       partition: "main"
       nodes: 2
       ntasks: 256
       ncore: 32
       kpar: 2
 
-  # Remote HPC (Dardel)
   dardel:
     user:          "saitto"
     host:          "dardel.pdc.kth.se"
@@ -185,12 +182,12 @@ label:
       export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
       module load PrgEnv-intel/8.5.0
 
-  # Local execution fallback
   local:
     source_env: "~/vasp_env.sh"
     vasp_bin:   "{{ bins.vasp }}"
     np:         32
     parallel:   4
+
 
 # ── Convert ─────────────────────────────────────────────────────────────────────────
 convert:
