@@ -97,23 +97,37 @@ class FitResult:
             completed_at=d.get("completed_at", ""),
         )
 
+
 @dataclass
 class ExploreResult:
     explore_root: Path
     run_dirs: list[Path]
     n_runs: int
+    # Counts of ok / failed LAMMPS exits
+    n_ok: int = 0
+    n_failed: int = 0
+    # Cell replication used for this exploration run, e.g. [2, 2, 2]
+    replicate: list[int] = field(default_factory=lambda: [1, 1, 1])
+    # Per-run records: {run_dir (relative str), status, exit_code, log}
+    run_records: list[dict] = field(default_factory=list)
+    # Paths of preselected .cfg files (populated by the select step)
     preselected_cfgs: list[Path] = field(default_factory=list)
+    # Paths of run dirs that exited non-zero
     failed_runs: list[Path] = field(default_factory=list)
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.explore_root / "explore_manifest.json", {
-            "step": "explore",
-            "n_runs": self.n_runs,
+            "step":             "explore",
+            "replicate":        self.replicate,
+            "n_runs":           self.n_runs,
+            "n_ok":             self.n_ok,
+            "n_failed":         self.n_failed,
+            "runs":             self.run_records,
             "preselected_cfgs": [str(p) for p in self.preselected_cfgs],
-            "failed_runs": [str(p) for p in self.failed_runs],
-            "completed_at": self.completed_at,
+            "failed_runs":      [str(p) for p in self.failed_runs],
+            "completed_at":     self.completed_at,
         })
 
     @classmethod
@@ -123,10 +137,15 @@ class ExploreResult:
             explore_root=explore_root,
             run_dirs=[],
             n_runs=d["n_runs"],
-            preselected_cfgs=[Path(p) for p in d["preselected_cfgs"]],
-            failed_runs=[Path(p) for p in d["failed_runs"]],
+            n_ok=d.get("n_ok", 0),
+            n_failed=d.get("n_failed", 0),
+            replicate=d.get("replicate", [1, 1, 1]),
+            run_records=d.get("runs", []),
+            preselected_cfgs=[Path(p) for p in d.get("preselected_cfgs", [])],
+            failed_runs=[Path(p) for p in d.get("failed_runs", [])],
             completed_at=d.get("completed_at", ""),
         )
+
 
 @dataclass
 class SelectionResult:
