@@ -40,6 +40,23 @@ def _replicate_schedule(config: dict) -> list[list[int]]:
     return [list(config.get("explore", {}).get("replicate", [1, 1, 1]))]
 
 
+def _prev_convert_dir(resolved: dict, config: dict, generation: int) -> Path | None:
+    """
+    Return the directory that holds gen N-1's convert_manifest.json.
+
+    convert writes per-generation cfg files into:
+        datasets/<accum_subdir>/gen_<N-1>/
+    and saves convert_manifest.json there via ConvertResult.save_manifest().
+    """
+    if generation <= 1:
+        return None
+    convert_cfg  = config.get("convert", {})
+    accum_subdir = convert_cfg.get("output_subdir", "converted_cfg")
+    prev_gen_tag = f"gen_{str(generation - 1).zfill(2)}"
+    candidate    = resolved["datasets_root"] / accum_subdir / prev_gen_tag
+    return candidate if candidate.exists() else None
+
+
 def run_single_generation(
     base_config: dict,
     generation: int,
@@ -172,6 +189,7 @@ def run_single_generation(
                         prev_selected_cfg=prev_selected,
                         generation=generation,
                         strict=True,
+                        prev_convert_dir=_prev_convert_dir(resolved, config, generation),
                     )
 
                 result = train_potential(config, resolved)
