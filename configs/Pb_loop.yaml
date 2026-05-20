@@ -57,7 +57,7 @@ training:
 # ── Fit ──────────────────────────────────────────────────────────────────────
 fit:
   mlp_command:            "{{ bins.mlp }}"
-  mpi_prefix:             "{{ mpi.prefix }}"
+  mpi_prefix:             "mpirun --oversubscribe -np 64"
   template_dir:           "{{ project_root }}/MTP_templates"
   mtp_level:              16
   trained_potential_name: "Pb{{ mtp_level }}.almtp"
@@ -88,8 +88,6 @@ explore:
     - [2, 2, 2]
     - [3, 3, 3]
     - [4, 4, 4]
-    - [5, 5, 5]
-    - [6, 6, 6]
 
   tdamp:         2
   pdamp:         10.0
