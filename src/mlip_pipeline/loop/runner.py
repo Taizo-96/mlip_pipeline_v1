@@ -1,6 +1,8 @@
 from __future__ import annotations
 import copy
+import select as _select
 import shutil
+import sys
 from pathlib import Path
 import yaml
 
@@ -10,6 +12,32 @@ from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.utils.logging import step_header, info, warn, success, error
 
 _LABEL_STEPS = {"label", "label_local", "label_hpc", "convert"}
+_RELABEL_TIMEOUT = 120  # seconds before auto-confirming re-label
+
+
+def _ask_relabel(label_dir: Path, timeout: int = _RELABEL_TIMEOUT) -> bool:
+    """Ask whether to wipe *label_dir* and re-prepare before re-submitting.
+
+    Returns True  if the user says yes (or the timeout elapses).
+    Returns False if the user explicitly says no.
+    The question auto-confirms 'yes' after *timeout* seconds.
+    """
+    prompt = (
+        f"\n[label_hpc retry] The previous VASP submission failed.\n"
+        f"  Label dir : {label_dir}\n"
+        f"  Wipe it and re-prepare label task dirs before re-submitting?\n"
+        f"  [Y/n] (auto-yes in {timeout}s): "
+    )
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    ready, _, _ = _select.select([sys.stdin], [], [], timeout)
+    if ready:
+        answer = sys.stdin.readline().strip().lower()
+        return answer not in ("n", "no")
+    # Timeout — default to yes
+    sys.stdout.write("\n(timeout — defaulting to yes)\n")
+    sys.stdout.flush()
+    return True
 
 
 def _replicate_schedule(config: dict) -> list[list[int]]:
@@ -89,23 +117,44 @@ def run_single_generation(
         and s not in (skip_steps or [])
     ]
 
+    label_dir = resolved["runs_root"] / config["label"]["output_subdir"]
+
     try:
         for step in active:
-            # ———————————————————————————————————————————————
-            # Skip logic: step already in completed_steps OR label already
-            # written to disk (so label step never re-runs on hpc retry).
-            # ———————————————————————————————————————————————
+            # ───────────────────────────────────────────────────────────
+            # Skip logic
+            # ───────────────────────────────────────────────────────────
             if state.is_step_done(step):
                 info(f"  step '{step}' already done — skipping.")
                 continue
 
             # If label task dirs already exist on disk, skip label and go
             # straight to label_hpc / label_local without re-writing them.
-            label_dir = resolved["runs_root"] / config["label"]["output_subdir"]
             if step == "label" and state.label_prepared:
+                # ── label_hpc retry: ask whether to re-prepare ──────────
+                # label_hpc failure clears label_prepared, so normally we
+                # won't reach this branch on retry.  But if the user manually
+                # re-set label_prepared or calls with --only label, we still
+                # guard here.
                 info(f"  step 'label' already prepared (task dirs on disk) — skipping.")
                 state.mark_step_done("label")
                 continue
+
+            # ── label_hpc retry: offer to re-prepare ───────────────────
+            # If we previously failed at label_hpc, label_prepared was reset
+            # to False and 'label' was removed from completed_steps.  The
+            # prompt below gives the user 120 s to decide whether to wipe
+            # the label dir before re-labelling (default: yes).
+            if step == "label" and label_dir.exists() and any(label_dir.iterdir()):
+                if _ask_relabel(label_dir):
+                    warn(f"  Wiping {label_dir} before re-labelling.")
+                    shutil.rmtree(label_dir)
+                else:
+                    info("  Keeping existing label dir — jumping straight to submission.")
+                    state.label_prepared = True
+                    state.mark_step_done("label")
+                    state.save()
+                    continue
 
             state.mark_step_start(step)
             step_header(step.upper())
@@ -165,7 +214,6 @@ def run_single_generation(
                 while sel_result.selected_count == 0:
                     next_tier = state.replicate_tier + 1
                     if next_tier >= len(schedule):
-                        # All tiers exhausted — genuinely converged
                         warn(
                             f"Generation {generation:02d}: no candidates at any "
                             f"replicate tier — marking as converged."
@@ -182,19 +230,14 @@ def run_single_generation(
                         f"{current_rep} — growing cell to {next_rep} and re-running explore."
                     )
 
-                    # Advance tier in state BEFORE wiping explore, so a crash
-                    # here resumes at the new (bigger) tier, not the old one.
                     state.replicate_tier = next_tier
                     state.save()
                     config["explore"]["replicate"] = next_rep
 
-                    # Wipe the previous explore output so LAMMPS inputs are
-                    # regenerated with the new cell size.
                     explore_out = resolved["runs_root"] / config["explore"]["output_subdir"]
                     if explore_out.exists():
                         shutil.rmtree(explore_out)
 
-                    # Re-run explore + select with bigger cell
                     from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
                     from mlip_pipeline.explore.runner import run_exploration_runs
                     explore_dir = create_exploration_runs(config, resolved, fit_result)
@@ -211,10 +254,6 @@ def run_single_generation(
             # ── label_local ──────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
-                label_dir = (
-                    paths.get("label_dir")
-                    or resolved["runs_root"] / config["label"]["output_subdir"]
-                )
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
@@ -222,11 +261,6 @@ def run_single_generation(
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import submit_label_jobs
-                label_dir = (
-                    paths.get("label_dir")
-                    or resolved["runs_root"] / config["label"]["output_subdir"]
-                )
-                # Only re-prepare label task dirs if they haven't been written yet
                 if not state.label_prepared:
                     run_labeling(config, paths)
                     state.label_prepared = True
@@ -242,10 +276,6 @@ def run_single_generation(
 
             # ── convert ──────────────────────────────────────────────
             elif step == "convert":
-                label_dir = (
-                    paths.get("label_dir")
-                    or resolved["runs_root"] / config["label"]["output_subdir"]
-                )
                 label_result = LabelResult.load_manifest(label_dir)
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
                 merged_cfg_path = convert_outcars_to_cfg(label_result, config, resolved)
@@ -254,6 +284,15 @@ def run_single_generation(
             state.mark_step_done(step)
 
     except Exception as exc:
+        # ── label_hpc failure: reset label so it re-runs on next attempt ──
+        if state.current_step == "label_hpc":
+            if "label" in state.completed_steps:
+                state.completed_steps.remove("label")
+            state.label_prepared = False
+            warn(
+                "label_hpc failed — 'label' step has been reset so task dirs "
+                "will be re-prepared on next run."
+            )
         state.mark_failed(exc)
         error(f"Generation {generation:02d} failed at '{state.current_step}': {exc}")
         raise
