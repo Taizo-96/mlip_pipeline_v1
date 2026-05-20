@@ -177,8 +177,8 @@ label:
     time: "01:00:00"
     vasp_cmd: "vasp_std"
     env_block: |
-      module load PDC/24.11
-      module load vasp/6.4.3-vanilla
+      export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
+      module load PrgEnv-intel/8.5.0
 
   # Local execution fallback
   local:
