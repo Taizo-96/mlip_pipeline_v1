@@ -22,12 +22,19 @@ def _count_cfgs(path: Path) -> int:
 
 def _prev_block_count_from_manifest(prev_convert_dir: Path | None) -> int | None:
     """
-    Load the total_block_count recorded by convert for gen N-1.
+    Load the prev_block_count recorded by gen N-1's convert step.
+
+    prev_block_count is the number of BEGIN_CFG blocks in train.cfg
+    BEFORE gen N-1's convert appended its new structures — i.e. the
+    count that gen N-1's fit actually trained on.
+
+    This is the correct baseline for verifying gen N's training set:
+        current_blocks - prev_block_count == n_selected_by_gen_N-1
+
+    Using total_block_count (post-convert) would give delta=0 because
+    current_train_cfg and the accumulating train.cfg are the same file.
 
     Returns None if the manifest does not exist (old runs / first gen).
-    This is the only safe way to get the pre-fit block count when
-    prev_train_cfg and current_train_cfg are the same accumulating file
-    -- recounting from disk would give the same number twice.
     """
     if prev_convert_dir is None:
         return None
@@ -36,7 +43,7 @@ def _prev_block_count_from_manifest(prev_convert_dir: Path | None) -> int | None
         return None
     try:
         d = json.loads(manifest.read_text(encoding="utf-8"))
-        val = d.get("total_block_count")
+        val = d.get("prev_block_count")
         return int(val) if val is not None else None
     except Exception:
         return None
@@ -52,27 +59,32 @@ def check_training_cfg_count(
     prev_convert_dir: Path | None = None,
 ) -> None:
     """
-    Verify that the training set grew by the expected number of blocks.
+    Verify that train.cfg grew by exactly the number of selected blocks.
 
     The pipeline accumulates all generations into a single train.cfg, so
-    prev_train_cfg and current_train_cfg often point at the same file.
-    Recounting from disk would always give delta=0.  Instead we read
-    the block count that was recorded *at convert time* from the
-    convert_manifest.json written by ConvertResult.save_manifest().
+    prev_train_cfg and current_train_cfg point at the same file.
+    Recounting from disk always gives delta=0.
+
+    Instead, read prev_block_count from gen N-1's convert_manifest.json —
+    that is the block count at the moment BEFORE gen N-1's convert ran,
+    i.e. the count gen N-1 fit actually trained on.  The invariant is:
+
+        current_blocks - prev_block_count  ==  n_selected (gen N-1)
 
     Parameters
     ----------
-    current_train_cfg   Path to this generation's train.cfg (read live).
-    prev_train_cfg      Path to the previous generation's merged train.cfg.
-                        Used only for the fallback disk-recount path and
-                        the diagnostic message.
-    prev_selected_cfg   Path to gen N-1's selected.cfg.  Informational.
+    current_train_cfg   Path to train.cfg (read live from disk).
+    prev_train_cfg      Path recorded as merged_cfg by gen N-1 — used
+                        only for the diagnostic message and disk-recount
+                        fallback.
+    prev_selected_cfg   Path to gen N-1's selected.cfg (informational).
     generation          Current generation number.
     strict              Raise TrainingSetMismatch on mismatch if True.
-    prev_convert_dir    Directory that holds gen N-1's convert_manifest.json
-                        (i.e. datasets/converted_cfg/gen_13/).  When supplied
-                        the manifest's total_block_count is used as the
-                        authoritative prev baseline instead of a disk recount.
+    prev_convert_dir    Directory containing gen N-1's
+                        convert_manifest.json (e.g.
+                        datasets/converted_cfg/gen_13/).  Required for
+                        the manifest-based baseline; falls back to disk
+                        recount if absent.
     """
     if not current_train_cfg.exists():
         raise FileNotFoundError(f"train.cfg not found: {current_train_cfg}")
@@ -87,11 +99,12 @@ def check_training_cfg_count(
         )
         return
 
-    # Preferred: read the count that was recorded at convert-time
+    # Preferred: read prev_block_count stamped at convert-time
+    # (= what gen N-1 fit trained on, BEFORE the append)
     n_prev_train = _prev_block_count_from_manifest(prev_convert_dir)
 
     if n_prev_train is None:
-        # Fallback: recount from disk (only correct when files differ)
+        # Fallback: disk recount — only accurate when the files differ
         if prev_train_cfg is None or not Path(prev_train_cfg).exists():
             info(
                 f"  [check] gen_{generation:02d} train.cfg: "
@@ -116,7 +129,7 @@ def check_training_cfg_count(
     if n_selected is not None and delta == n_selected:
         info(
             f"  [check] ✓ gen_{generation:02d} train.cfg: "
-            f"{n_prev_train} (prev) + {n_selected} (selected) = {n_current} cfg(s)"
+            f"{n_prev_train} (prev fit) + {n_selected} (selected) = {n_current} cfg(s)"
         )
         return
 
@@ -126,18 +139,18 @@ def check_training_cfg_count(
             f"  [check] gen_{generation:02d} train.cfg grew by {delta} "
             f"(expected {sel_str} from selected.cfg) — "
             f"proceeding but counts do not match exactly.\n"
-            f"  current: {n_current}  prev: {n_prev_train}  "
+            f"  current: {n_current}  prev fit: {n_prev_train}  "
             f"train.cfg: {current_train_cfg}"
         )
         return
 
-    # delta <= 0: the file did not grow — convert never appended
+    # delta <= 0: file did not grow — convert never appended
     sel_str  = str(n_selected) if n_selected is not None else "unknown"
     expected = n_prev_train + (n_selected or 0)
     msg = (
         f"Training set did not grow for gen_{generation:02d}:\n"
-        f"  prev train : {n_prev_train} blocks  "
-        f"(from convert_manifest of gen_{generation - 1:02d})\n"
+        f"  prev fit   : {n_prev_train} blocks  "
+        f"(prev_block_count from gen_{generation - 1:02d} convert_manifest)\n"
         f"  selected   : {sel_str} blocks\n"
         f"  expected   : {expected}\n"
         f"  actual     : {n_current}  (delta {delta:+d})\n"
