@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import logging
 import time
 import subprocess
 from pathlib import Path
 from mlip_pipeline.utils.shell import run_command
+
+logger = logging.getLogger(__name__)
 
 # Only these files are synced to Dardel — outputs stay local until sync-back
 VASP_INPUT_FILES = {"POSCAR", "INCAR", "KPOINTS", "POTCAR", "job.sh"}
 
 # rsync exit codes that are non-fatal (partial transfer warnings)
 _RSYNC_OK = {0, 23, 24}
+
+# ---------------------------------------------------------------------------
+# Retry schedule for sync_outputs_from_dardel
+# ---------------------------------------------------------------------------
+# First four explicit waits (seconds), then hourly until the 24-h deadline.
+_RETRY_DELAYS   = [60, 300, 900, 1800]   # 1 min, 5 min, 15 min, 30 min
+_RETRY_INTERVAL = 3_600                   # 1 h between subsequent attempts
+_RETRY_DEADLINE = 24 * 3_600             # stop retrying after 24 h of total wait
+
+
+class SyncRetryExhausted(RuntimeError):
+    """Raised when rsync sync-back keeps failing for 24 h straight."""
 
 
 def _socket_path(user: str, host: str) -> str:
@@ -145,9 +160,27 @@ def sync_outputs_from_dardel(
     remote_label_dir: str,
     socket: str | None = None,
 ) -> None:
-    """Rsync OUTCAR/vasprun.xml/OSZICAR back from Dardel."""
+    """
+    Rsync OUTCAR/vasprun.xml/OSZICAR back from Dardel, with automatic retry.
+
+    Retry schedule (cumulative wait before giving up at 24 h):
+        attempt 1 → wait  1 min
+        attempt 2 → wait  5 min
+        attempt 3 → wait 15 min
+        attempt 4 → wait 30 min
+        attempt 5+ → wait  1 h  (repeated until 24 h total elapsed)
+
+    Raises
+    ------
+    SyncRetryExhausted
+        If rsync keeps failing for 24 h of cumulative waiting.
+    """
+    # When the socket is externally managed (e.g. from submit_label_jobs) the
+    # master connection may have dropped. Re-open it fresh for the sync-back so
+    # rsync always has a live multiplexed channel.
+    owned_socket = socket is None
     s = socket or _socket_path(user, host)
-    print(f"=== Syncing outputs from {host} ===")
+
     cmd = _rsync_via_socket(
         s,
         f"{user}@{host}:{remote_label_dir}/",
@@ -161,11 +194,49 @@ def sync_outputs_from_dardel(
             "--exclude=*",
         ],
     )
-    exit_code = run_command(cmd)
-    if exit_code not in _RSYNC_OK:
-        raise RuntimeError(
-            f"rsync sync-back failed (exit {exit_code}) — SSH connection lost or remote path missing."
+
+    print(f"=== Syncing outputs from {host} ===")
+
+    total_waited = 0
+    attempt = 0
+
+    while True:
+        # Re-open a fresh master before every attempt so a dropped connection
+        # from the watch_queue phase does not permanently block sync-back.
+        _open_master(user, host, s)
+        try:
+            exit_code = run_command(cmd)
+        finally:
+            _close_master(user, host, s)
+
+        if exit_code in _RSYNC_OK:
+            return  # success
+
+        attempt += 1
+
+        # Determine wait for this attempt (follow the schedule, then hourly)
+        if attempt <= len(_RETRY_DELAYS):
+            wait = _RETRY_DELAYS[attempt - 1]
+        else:
+            wait = _RETRY_INTERVAL
+
+        if total_waited + wait >= _RETRY_DEADLINE:
+            raise SyncRetryExhausted(
+                f"rsync sync-back failed (exit {exit_code}) — SSH connection lost or "
+                f"remote path missing. Gave up after "
+                f"{total_waited // 3600:.1f} h of retries ({attempt} attempt(s))."
+            )
+
+        wait_min = wait / 60
+        msg = (
+            f"rsync sync-back failed (exit {exit_code}), attempt {attempt}. "
+            f"Retrying in {wait_min:.0f} min "
+            f"(total waited so far: {total_waited // 60:.0f} min)."
         )
+        logger.warning(msg)
+        print(f"WARNING  {msg}")
+        time.sleep(wait)
+        total_waited += wait
 
 
 def submit_label_jobs(label_result, config: dict) -> None:
@@ -173,8 +244,8 @@ def submit_label_jobs(label_result, config: dict) -> None:
     Full HPC labelling workflow:
       open master → sync inputs → submit → watch queue → sync back → close master
 
-    The master socket stays open for the entire duration so sync-back
-    never needs to re-authenticate.
+    sync_outputs_from_dardel manages its own socket lifecycle internally so
+    that a dropped master from watch_queue never blocks the sync-back.
     """
     label_cfg        = config["label"]
     dardel_cfg       = label_cfg["dardel"]
@@ -201,9 +272,12 @@ def submit_label_jobs(label_result, config: dict) -> None:
         print("\n=== Watching queue ===")
         watch_queue(user, host, poll_interval=poll, socket=socket)
 
-        print("\n=== Syncing outputs back ===")
-        sync_outputs_from_dardel(local_label_dir, user, host, remote_label_dir, socket=socket)
-        print("Done.")
-
     finally:
+        # Always close the watch-phase master before sync-back,
+        # which opens its own fresh connection per attempt.
         _close_master(user, host, socket)
+
+    # sync_outputs_from_dardel opens/closes its own master on every attempt
+    print("\n=== Syncing outputs back ===")
+    sync_outputs_from_dardel(local_label_dir, user, host, remote_label_dir)
+    print("Done.")
