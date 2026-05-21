@@ -3,12 +3,6 @@ from __future__ import annotations
 """
 loop/runner.py — unified generation loop runner.
 
-Combines:
-  - replicate-tier scheduling, convergence reports, force/skip/only flags,
-    stop_on_failure, _ask_relabel, label_prepared guard  (from old runner.py)
-  - SyncRetryExhausted soft-failure, evaluate step, _config_for_gen helper
-    (from old loop.py)
-
 Public API (used by cli.py):
     run_loop(base_config_path, start_gen, end_gen, *, force, skip_steps,
              only_steps, stop_on_failure) -> list[GenerationState]
@@ -39,7 +33,7 @@ _RELABEL_TIMEOUT = 120  # seconds before auto-confirming re-label
 
 def _ask_relabel(label_dir: Path, timeout: int = _RELABEL_TIMEOUT) -> bool:
     prompt = (
-        f"\n[label_hpc retry] The previous VASP submission failed.\n"
+        f"\n[label_hpc] The label directory already exists.\n"
         f"  Label dir : {label_dir}\n"
         f"  Wipe it and re-prepare label task dirs before re-submitting?\n"
         f"  [Y/n] (auto-yes in {timeout}s): "
@@ -114,7 +108,6 @@ def run_single_generation(
     resolved = project_paths(config)
     paths    = gen_paths(config, resolved)
 
-    gen_tag = f"gen_{str(generation).zfill(2)}"
     gen_dir = paths["gen_dir"]
     ensure_dir(gen_dir)
 
@@ -311,34 +304,81 @@ def run_single_generation(
             # ── label_hpc ─────────────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
-                from mlip_pipeline.io.dardel import submit_label_jobs, SyncRetryExhausted
+                from mlip_pipeline.io.dardel import (
+                    submit_label_jobs,
+                    sync_outputs_from_dardel,
+                    SyncRetryExhausted,
+                )
 
+                # Prepare task dirs if not done yet
                 if not state.label_prepared:
                     run_labeling(config, paths)
                     state.label_prepared = True
                     state.save()
 
                 label_result = LabelResult.load_manifest(label_dir)
-                try:
-                    submit_label_jobs(label_result, config)
-                except SyncRetryExhausted as exc:
-                    # dardel.py already retried for 24 h — soft-fail this
-                    # generation so the loop can continue to the next one.
-                    if "label" in state.completed_steps:
-                        state.completed_steps.remove("label")
-                    state.label_prepared = False
-                    warn(
-                        "label_hpc failed — 'label' step has been reset so task "
-                        "dirs will be re-prepared on next run."
-                    )
-                    state.mark_failed(exc)
-                    error(
-                        f"Generation {generation:02d} failed at 'label_hpc': "
-                        f"rsync sync-back failed (exit 255) — SSH connection "
-                        f"lost or remote path missing."
-                    )
-                    raise  # caught by run_loop; respects stop_on_failure
+                outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
 
+                if state.jobs_submitted and outcars:
+                    # ───────────────────────────────────────────────────────
+                    # Jobs completed and OUTCARs are present locally.
+                    # The only thing that failed last time was the rsync
+                    # sync-back. Skip straight to trying it again.
+                    # ───────────────────────────────────────────────────────
+                    info(
+                        f"  label_hpc: jobs already submitted and "
+                        f"{len(outcars)} OUTCAR(s) found locally — "
+                        "skipping sync-inputs / submit / watch, "
+                        "retrying sync-back only."
+                    )
+                    dardel_cfg       = config["label"]["dardel"]
+                    user             = dardel_cfg["user"]
+                    host             = dardel_cfg.get("host", "dardel.pdc.kth.se")
+                    remote_root      = dardel_cfg["remote_root"]
+                    runs_root        = Path(config.get("runs_root", "runs"))
+                    label_subdir     = config["label"]["output_subdir"]
+                    remote_label_dir = f"{remote_root}/{runs_root}/{label_subdir}"
+                    sync_outputs_from_dardel(
+                        label_result.label_root, user, host, remote_label_dir
+                    )
+
+                elif state.jobs_submitted and not outcars:
+                    # ───────────────────────────────────────────────────────
+                    # Jobs were submitted but no OUTCARs arrived — the
+                    # VASP runs themselves likely failed. Wipe and restart.
+                    # ───────────────────────────────────────────────────────
+                    warn(
+                        f"  label_hpc: jobs_submitted=True but no OUTCARs found "
+                        f"in {label_result.label_root} — VASP jobs likely failed. "
+                        "Resetting and re-preparing label dirs."
+                    )
+                    state.jobs_submitted  = False
+                    state.label_prepared  = False
+                    state.save()
+                    if label_dir.exists():
+                        if _ask_relabel(label_dir):
+                            warn(f"  Wiping {label_dir}.")
+                            shutil.rmtree(label_dir)
+                        else:
+                            info("  Keeping existing label dir.")
+                    # Re-prepare and run the full HPC flow
+                    run_labeling(config, paths)
+                    state.label_prepared = True
+                    state.save()
+                    label_result = LabelResult.load_manifest(label_dir)
+                    submit_label_jobs(label_result, config)
+                    state.jobs_submitted = True
+                    state.save()
+
+                else:
+                    # ───────────────────────────────────────────────────────
+                    # Normal first-time run.
+                    # ───────────────────────────────────────────────────────
+                    submit_label_jobs(label_result, config)
+                    state.jobs_submitted = True
+                    state.save()
+
+                # Final OUTCAR check (covers all three paths above)
                 outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
                 if not outcars:
                     raise RuntimeError(
@@ -368,12 +408,10 @@ def run_single_generation(
 
     except Exception as exc:
         if state.current_step == "label_hpc":
-            if "label" in state.completed_steps:
-                state.completed_steps.remove("label")
-            state.label_prepared = False
+            # label_prepared stays True — task dirs are still valid.
+            # jobs_submitted is already correctly set before any raise.
             warn(
-                "label_hpc failed — 'label' step has been reset so task dirs "
-                "will be re-prepared on next run."
+                "label_hpc failed — state preserved for smart resume on next run."
             )
         state.mark_failed(exc)
         error(f"Generation {generation:02d} failed at '{state.current_step}': {exc}")

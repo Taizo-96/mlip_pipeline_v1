@@ -8,7 +8,7 @@ from typing import Optional
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-# ── VASP scaling ───────────────────────────────────────────────────────────────
+# ── VASP scaling ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class VaspParallelConfig:
@@ -58,7 +58,7 @@ class ScalingPolicy:
         factor = max(1, self.get_config(n_atoms).kpar)
         return [max(1, round(k / factor)) for k in base]
 
-# ── Step results ───────────────────────────────────────────────────────────────
+# ── Step results ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class PrepareTrainResult:
@@ -256,7 +256,7 @@ class EvaluationResult:
     completed_at: str = field(default_factory=_now)
 
 
-# ── Generation state (automation) ─────────────────────────────────────────────────
+# ── Generation state (automation) ──────────────────────────────────────────────
 
 STEPS = ("fit", "explore", "select", "label", "label_hpc", "label_local", "convert")
 
@@ -275,6 +275,7 @@ class GenerationState:
     replicate_tier: int = 0
     converged_replicate_tier: int = 0
     label_prepared: bool = False
+    jobs_submitted: bool = False   # True once SLURM jobs have been submitted
 
     @property
     def _state_path(self) -> Path:
@@ -295,6 +296,7 @@ class GenerationState:
             "replicate_tier":           self.replicate_tier,
             "converged_replicate_tier": self.converged_replicate_tier,
             "label_prepared":           self.label_prepared,
+            "jobs_submitted":           self.jobs_submitted,
         })
 
     @classmethod
