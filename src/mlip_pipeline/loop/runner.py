@@ -172,6 +172,7 @@ def run_single_generation(
     ]
 
     label_dir = resolved["runs_root"] / config["label"]["output_subdir"]
+    manifest_path = label_dir / "label_manifest.json"
 
     # ── Step loop ────────────────────────────────────────────────────────
     try:
@@ -180,11 +181,23 @@ def run_single_generation(
                 info(f"  step '{step}' already done — skipping.")
                 continue
 
-            # label_prepared guard: skip re-preparing task dirs on resume
+            # label_prepared guard: skip re-preparing task dirs on resume,
+            # but only when the manifest is actually present on disk.
+            # If the manifest is missing (e.g. after reset-steps wiped it),
+            # fall through to run_labeling() so it is regenerated.
             if step == "label" and state.label_prepared:
-                info("  step 'label' already prepared (task dirs on disk) — skipping.")
-                state.mark_step_done("label")
-                continue
+                if manifest_path.exists():
+                    info("  step 'label' already prepared (task dirs on disk) — skipping.")
+                    state.mark_step_done("label")
+                    continue
+                else:
+                    warn(
+                        "  step 'label': label_prepared=True but manifest is missing "
+                        f"({manifest_path}) — re-running run_labeling() to regenerate it."
+                    )
+                    # Clear the flag so the full prepare path runs below
+                    state.label_prepared = False
+                    state.save()
 
             # ask before wiping an existing label dir
             if step == "label" and label_dir.exists() and any(label_dir.iterdir()):

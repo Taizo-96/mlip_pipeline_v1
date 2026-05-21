@@ -177,6 +177,11 @@ def evaluate(config: Annotated[str, typer.Option(..., help="Path to config yaml"
 
 # --- STATE MANAGEMENT ---
 
+# Steps that touch the label directory — resetting any of them must also
+# clear label_prepared so the manifest is regenerated on the next run.
+_LABEL_ADJACENT_STEPS = {"label", "label_local", "label_hpc", "convert"}
+
+
 @app.command("reset-steps")
 def reset_steps(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
@@ -186,6 +191,10 @@ def reset_steps(
     """
     Remove one or more steps from a generation's completed_steps so the loop
     will re-run them on the next invocation.
+
+    If any of the reset steps are label-related (label, label_local, label_hpc,
+    convert), label_prepared is also cleared so that label_manifest.json is
+    regenerated rather than assumed to exist.
 
     Example:
         mlip-pipeline reset-steps --config configs/Pb_loop.yaml --gen 8 --steps label,label_local,convert
@@ -217,6 +226,12 @@ def reset_steps(
             state["status"] = "running"
         state["error"] = None
         state["completed_at"] = None
+
+        # Resetting any label-adjacent step must also clear label_prepared so
+        # run_labeling() is called again and label_manifest.json is regenerated.
+        if _LABEL_ADJACENT_STEPS.intersection(requested):
+            state["label_prepared"] = False
+
         state_file.write_text(json.dumps(state, indent=2))
         removed = [s for s in before if s in requested]
         typer.echo(f"Reset step(s) {removed} for {gen_tag}.")
