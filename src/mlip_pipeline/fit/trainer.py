@@ -28,17 +28,17 @@ def resolve_train_cfg(fit_cfg: dict, config: dict, resolved_paths: dict) -> Path
 
 
 def train_potential(config: dict, resolved_paths: dict) -> FitResult:
-    fit_cfg      = config["fit"]
-    mlp_command  = fit_cfg.get("mlp_command", "mlp")
-    mpi_prefix   = fit_cfg.get("mpi_prefix")
+    fit_cfg       = config["fit"]
+    mlp_command   = fit_cfg.get("mlp_command", "mlp")
+    mpi_prefix    = fit_cfg.get("mpi_prefix")
     init_template = resolve_template_path(fit_cfg)
-    train_cfg    = resolve_train_cfg(fit_cfg, config, resolved_paths)
-    trained_name = fit_cfg.get(
+    train_cfg     = resolve_train_cfg(fit_cfg, config, resolved_paths)
+    trained_name  = fit_cfg.get(
         "trained_potential_name",
         f"pb{fit_cfg.get('mtp_level', 'xx')}.almtp",
     )
-    extra_args   = fit_cfg.get("extra_args", [])
-    run_dir      = ensure_dir(
+    extra_args = fit_cfg.get("extra_args", [])
+    run_dir    = ensure_dir(
         resolved_paths["runs_root"] / fit_cfg.get("output_subdir", "fit")
     )
 
@@ -81,20 +81,29 @@ def train_potential(config: dict, resolved_paths: dict) -> FitResult:
         1 for line in train_cfg.open(encoding="utf-8") if line.strip() == "BEGIN_CFG"
     )
 
+    result = FitResult(
+        run_dir=run_dir,
+        model_path=model_path,
+        log_path=log_path,
+        train_cfg=train_cfg,
+        n_train_cfgs=n_cfgs,
+    )
+    result.save_manifest()
+
+    # Keep metadata.json for extra fields not in the dataclass manifest
     write_json(
         run_dir / "metadata.json",
         {
-            "stage":          "fit",
-            "timestamp":      datetime.utcnow().isoformat() + "Z",
-            "mlp_command":    mlp_command,
-            "mpi_prefix":     mpi_prefix,
-            "init_template":  str(init_template),
-            "train_cfg":      str(train_cfg),
-            "n_train_cfgs":   n_cfgs,
-            "run_dir":        str(run_dir),
-            "result_model":   str(model_path),
-            "command":        command,
+            "stage":         "fit",
+            "timestamp":     datetime.utcnow().isoformat() + "Z",
+            "mlp_command":   mlp_command,
+            "mpi_prefix":    mpi_prefix,
+            "init_template": str(init_template),
+            "train_cfg":     str(train_cfg),
+            "n_train_cfgs":  n_cfgs,
+            "run_dir":       str(run_dir),
+            "result_model":  str(model_path),
+            "command":       command,
         },
     )
-    return FitResult(run_dir=run_dir, model_path=model_path, log_path=log_path,
-                     train_cfg=train_cfg)
+    return result

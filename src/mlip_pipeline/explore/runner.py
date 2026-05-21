@@ -24,6 +24,7 @@ def run_exploration_runs(
     lammps_command = explore_cfg.get("lammps_command", "lmp")
     mpi_prefix     = explore_cfg.get("mpi_prefix", "")
     replicate      = list(explore_cfg.get("replicate", [1, 1, 1]))
+    candidate_filename = explore_cfg.get("candidate_filename", "preselected.cfg")
 
     input_files = sorted(explore_root.rglob("in.mlip.pb"))
     if not input_files:
@@ -31,6 +32,7 @@ def run_exploration_runs(
 
     run_records: list[dict] = []
     failed_run_dirs: list[Path] = []
+    preselected_cfgs: list[Path] = []
     n_ok   = 0
     n_fail = 0
 
@@ -44,11 +46,19 @@ def run_exploration_runs(
         return_code = run_command(command, cwd=input_file.parent, log_file=log_path)
 
         status = "ok" if return_code == 0 else "failed"
+
+        # Collect the candidate cfg path for this run (may not exist if run failed
+        # or if potential did not extrapolate — that is normal).
+        candidate = input_file.parent / candidate_filename
+        if candidate.exists():
+            preselected_cfgs.append(candidate)
+
         run_records.append({
-            "run_dir":   str(input_file.parent.relative_to(explore_root)),
-            "status":    status,
-            "exit_code": return_code,
-            "log":       str(log_path.relative_to(explore_root)),
+            "run_dir":        str(input_file.parent.relative_to(explore_root)),
+            "status":         status,
+            "exit_code":      return_code,
+            "log":            str(log_path.relative_to(explore_root)),
+            "has_candidates": candidate.exists(),
         })
 
         if return_code != 0:
@@ -72,8 +82,12 @@ def run_exploration_runs(
         n_failed=n_fail,
         replicate=replicate,
         run_records=run_records,
+        preselected_cfgs=preselected_cfgs,
         failed_runs=failed_run_dirs,
     )
     result.save_manifest()
-    info(f"Explore manifest written → {explore_root / 'explore_manifest.json'}")
+    info(
+        f"Explore manifest written → {explore_root / 'explore_manifest.json'} "
+        f"({len(preselected_cfgs)} candidate file(s) from {n_ok}/{len(input_files)} runs)"
+    )
     return result

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from mlip_pipeline.models import SelectionResult
+from mlip_pipeline.models import ExploreResult, SelectionResult
 from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists
 from mlip_pipeline.utils.shell import run_command
 from mlip_pipeline.utils.logging import warn, info
@@ -19,6 +18,7 @@ def run_selection(
 
     explore_root = runs_root / select_cfg["input_subdir"]
     select_root  = ensure_dir(runs_root / select_cfg["output_subdir"])
+    manifest_path = select_root / "selection_manifest.json"
 
     candidate_filename         = select_cfg.get("candidate_filename", "preselected.cfg")
     merged_candidates_filename = select_cfg.get("merged_candidates_filename", "candidates_merged.cfg")
@@ -26,7 +26,6 @@ def run_selection(
     mlip_command               = select_cfg.get("mlip_command", "mlp")
     mpi_np                     = select_cfg.get("mpi_np", None)
     mpi_command                = select_cfg.get("mpi_command", "mpirun")
-    write_manifest             = bool(select_cfg.get("write_manifest", True))
 
     training_cfg = Path(select_cfg["training_cfg"])
     if not training_cfg.is_absolute():
@@ -34,39 +33,54 @@ def run_selection(
     if not training_cfg.exists():
         raise FileNotFoundError(f"Training cfg not found: {training_cfg}")
 
-    # ── Check for candidates ───────────────────────────────────────────────
-    candidate_paths = sorted(explore_root.rglob(candidate_filename))
+    # ── Resolve candidate paths from explore manifest, fall back to disk scan ──
+    explore_manifest = explore_root / "explore_manifest.json"
+    if explore_manifest.exists():
+        explore_result = ExploreResult.load_manifest(explore_root)
+        candidate_paths = [
+            p for p in explore_result.preselected_cfgs if p.exists()
+        ]
+        if explore_result.n_failed:
+            warn(
+                f"select: {explore_result.n_failed} explore run(s) failed — "
+                f"their candidates are excluded. "
+                f"Failed dirs: {[str(p) for p in explore_result.failed_runs]}"
+            )
+        info(
+            f"select: loaded {len(candidate_paths)} candidate file(s) "
+            f"from explore_manifest.json "
+            f"({explore_result.n_ok}/{explore_result.n_runs} runs ok)"
+        )
+    else:
+        # Fallback for runs that pre-date the manifest
+        warn(
+            f"select: explore_manifest.json not found under {explore_root} — "
+            "falling back to disk scan for candidate files."
+        )
+        candidate_paths = sorted(explore_root.rglob(candidate_filename))
 
-    # No candidates = potential did not extrapolate on any run.
-    # This is a convergence signal, not an error. Return empty result so
-    # the loop can skip label+convert for this generation.
+    # ── No candidates = converged ────────────────────────────────────────────
     if not candidate_paths:
         warn(
             f"No {candidate_filename!r} files found under {explore_root}. "
             "The potential did not extrapolate — generation is likely converged. "
             "Skipping select / label / convert."
         )
-        manifest_path = select_root / "selection_manifest.json"
-        if write_manifest:
-            manifest_path.write_text(json.dumps({
-                "strategy": "mlip_select_add",
-                "converged": True,
-                "selected_count": 0,
-                "note": "No extrapolative structures found during explore.",
-            }, indent=2))
-        return SelectionResult(
+        result = SelectionResult(
             select_root=select_root,
             manifest_path=manifest_path,
             selected_cfg_paths=[],
             selected_count=0,
+            converged=True,
         )
+        result.save_manifest()
+        return result
 
-    # ── Normal path ───────────────────────────────────────────────────────
+    # ── Normal path ───────────────────────────────────────────────────────────
     info(f"Found {len(candidate_paths)} candidate file(s) — running mlp select_add.")
 
     merged_candidates_path = select_root / merged_candidates_filename
     selected_cfg_path      = select_root / selected_filename
-    manifest_path          = select_root / "selection_manifest.json"
 
     model_name = fit_result.model_path.name
     model_path = select_root / model_name
@@ -102,28 +116,22 @@ def run_selection(
         out_path.write_text(block.strip() + "\n")
         selected_cfg_paths.append(out_path)
 
-    if write_manifest:
-        manifest_path.write_text(json.dumps({
-            "strategy": "mlip_select_add",
-            "converged": False,
-            "model_path": str(model_path),
-            "training_cfg": str(training_cfg),
-            "merged_candidates_path": str(merged_candidates_path),
-            "selected_cfg_path": str(selected_cfg_path),
-            "selected_count": len(selected_cfg_paths),
-            "candidate_sources": build_source_manifest(candidate_paths),
-            "selected_block_files": [str(p) for p in selected_cfg_paths],
-            "mpi_np": mpi_np,
-        }, indent=2))
-    else:
-        manifest_path.touch()
+    candidate_sources = [
+        {"source_cfg": str(p), "temperature_dir": p.parent.name}
+        for p in candidate_paths
+    ]
 
-    return SelectionResult(
+    result = SelectionResult(
         select_root=select_root,
         manifest_path=manifest_path,
         selected_cfg_paths=selected_cfg_paths,
         selected_count=len(selected_cfg_paths),
+        model_path=model_path,
+        candidate_sources=candidate_sources,
+        converged=False,
     )
+    result.save_manifest()
+    return result
 
 
 def merge_cfg_files(input_paths: list[Path], output_path: Path) -> None:

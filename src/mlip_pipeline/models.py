@@ -68,22 +68,25 @@ class PrepareTrainResult:
     manifest_path: Optional[Path] = None
     completed_at: str = field(default_factory=_now)
 
+
 @dataclass
 class FitResult:
     run_dir: Path
     model_path: Path
     log_path: Optional[Path] = None
     train_cfg: Optional[Path] = None
+    n_train_cfgs: int = 0
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.run_dir / "fit_manifest.json", {
-            "step": "fit",
-            "model_path": str(self.model_path),
-            "log_path": str(self.log_path) if self.log_path else None,
-            "train_cfg": str(self.train_cfg) if self.train_cfg else None,
-            "completed_at": self.completed_at,
+            "step":          "fit",
+            "model_path":    str(self.model_path),
+            "log_path":      str(self.log_path) if self.log_path else None,
+            "train_cfg":     str(self.train_cfg) if self.train_cfg else None,
+            "n_train_cfgs":  self.n_train_cfgs,
+            "completed_at":  self.completed_at,
         })
 
     @classmethod
@@ -94,6 +97,7 @@ class FitResult:
             model_path=Path(d["model_path"]),
             log_path=Path(d["log_path"]) if d.get("log_path") else None,
             train_cfg=Path(d["train_cfg"]) if d.get("train_cfg") else None,
+            n_train_cfgs=d.get("n_train_cfgs", 0),
             completed_at=d.get("completed_at", ""),
         )
 
@@ -148,15 +152,21 @@ class SelectionResult:
     manifest_path: Path
     selected_cfg_paths: list[Path] = field(default_factory=list)
     selected_count: int = 0
+    model_path: Optional[Path] = None
+    candidate_sources: list[dict] = field(default_factory=list)
+    converged: bool = False
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
-        return write_json(self.select_root / "selection_manifest.json", {
-            "step": "select",
-            "selected_count": self.selected_count,
-            "selected_block_files": [str(p) for p in self.selected_cfg_paths],
-            "completed_at": self.completed_at,
+        return write_json(self.manifest_path, {
+            "step":                  "select",
+            "converged":             self.converged,
+            "selected_count":        self.selected_count,
+            "model_path":            str(self.model_path) if self.model_path else None,
+            "candidate_sources":     self.candidate_sources,
+            "selected_block_files":  [str(p) for p in self.selected_cfg_paths],
+            "completed_at":          self.completed_at,
         })
 
     @classmethod
@@ -167,6 +177,9 @@ class SelectionResult:
             manifest_path=select_root / "selection_manifest.json",
             selected_cfg_paths=[Path(p) for p in d.get("selected_block_files", [])],
             selected_count=d.get("selected_count", 0),
+            model_path=Path(d["model_path"]) if d.get("model_path") else None,
+            candidate_sources=d.get("candidate_sources", []),
+            converged=d.get("converged", False),
             completed_at=d.get("completed_at", ""),
         )
 
@@ -177,15 +190,19 @@ class LabelResult:
     task_dirs: list[Path]
     task_count: int
     manifest_path: Optional[Path] = None
+    type_map: list[str] = field(default_factory=list)
+    template_dir: Optional[Path] = None
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         manifest_path = self.label_root / "label_manifest.json"
         write_json(manifest_path, {
-            "step": "label",
-            "task_count": self.task_count,
-            "task_dirs": [str(t) for t in self.task_dirs],
+            "step":         "label",
+            "task_count":   self.task_count,
+            "task_dirs":    [str(t) for t in self.task_dirs],
+            "type_map":     self.type_map,
+            "template_dir": str(self.template_dir) if self.template_dir else None,
             "completed_at": self.completed_at,
         })
         self.manifest_path = manifest_path
@@ -199,6 +216,9 @@ class LabelResult:
             task_dirs=[Path(t) for t in d["task_dirs"]],
             task_count=d["task_count"],
             manifest_path=label_root / "label_manifest.json",
+            type_map=d.get("type_map", []),
+            template_dir=Path(d["template_dir"]) if d.get("template_dir") else None,
+            completed_at=d.get("completed_at", ""),
         )
 
     @classmethod
@@ -221,14 +241,14 @@ class ConvertResult:
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.run_dir / "convert_manifest.json", {
-            "step": "convert",
-            "merged_cfg": str(self.merged_cfg),
-            "n_new_cfgs": self.n_new_cfgs,
-            "n_total_cfgs": self.n_total_cfgs,
-            "prev_block_count": self.prev_block_count,
-            "new_block_count": self.new_block_count,
+            "step":              "convert",
+            "merged_cfg":        str(self.merged_cfg),
+            "n_new_cfgs":        self.n_new_cfgs,
+            "n_total_cfgs":      self.n_total_cfgs,
+            "prev_block_count":  self.prev_block_count,
+            "new_block_count":   self.new_block_count,
             "total_block_count": self.total_block_count,
-            "completed_at": self.completed_at,
+            "completed_at":      self.completed_at,
         })
 
     @classmethod
