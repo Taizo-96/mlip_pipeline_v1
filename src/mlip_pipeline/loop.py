@@ -9,11 +9,13 @@ each step in order. Supports --local mode which replaces the
 Dardel HPC step with a local VASP run.
 """
 
+import logging
 import traceback
 from pathlib import Path
 
 from mlip_pipeline.models import GenerationState, LabelResult
 
+logger = logging.getLogger(__name__)
 
 # Steps executed in --local mode (no Dardel)
 LOCAL_STEPS = ["fit", "explore", "select", "label", "label_local", "convert", "evaluate"]
@@ -43,7 +45,7 @@ def run_loop(
     from mlip_pipeline.select.runner import run_selection
     from mlip_pipeline.label.runner import run_labeling
     from mlip_pipeline.label.local_runner import run_vasp_local
-    from mlip_pipeline.io.dardel import submit_label_jobs
+    from mlip_pipeline.io.dardel import submit_label_jobs, SyncRetryExhausted
     from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
     from mlip_pipeline.evaluate.runner import run_evaluation
     from mlip_pipeline.models import FitResult
@@ -61,9 +63,9 @@ def run_loop(
         gen_dir = runs_root / tag
         gen_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n{'─'*60}")
+        print(f"\n{'\u2500'*60}")
         print(f"\u25b6  Generation {gen:02d} \u00b7 {tag}")
-        print(f"{'─'*60}")
+        print(f"{'\u2500'*60}")
 
         # Load or initialise state
         state_file = gen_dir / "state.json"
@@ -122,58 +124,76 @@ def run_loop(
                     continue
 
                 _ts = __import__('datetime').datetime.now().strftime('%H:%M:%S')
-                print(f"\n{'─'*60}")
+                print(f"\n{'\u2500'*60}")
                 print(f"\u25b6  {step.upper()}")
-                print(f"{'─'*60}")
+                print(f"{'\u2500'*60}")
 
                 state.mark_step_start(step)
 
-                # ── fit ────────────────────────────────────────────────
+                # \u2500\u2500 fit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 if step == "fit":
                     result = train_potential(gen_cfg, resolved_paths)
                     state.model_path = str(result.model_path)
 
-                # ── explore ────────────────────────────────────────────
+                # \u2500\u2500 explore \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "explore":
                     fit_result = _build_fit_result()
                     explore_root = create_exploration_runs(gen_cfg, resolved_paths, fit_result)
                     run_exploration_runs(gen_cfg, resolved_paths, explore_root)
 
-                # ── select ─────────────────────────────────────────────
+                # \u2500\u2500 select \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "select":
                     fit_result = _build_fit_result()
                     run_selection(gen_cfg, resolved_paths, fit_result)
 
-                # ── label (create VASP input dirs) ─────────────────────
+                # \u2500\u2500 label (create VASP input dirs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "label":
                     run_labeling(gen_cfg, resolved_paths)
 
-                # ── label_local (run VASP locally) ──────────────────────
+                # \u2500\u2500 label_local (run VASP locally) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "label_local":
                     label_result = _build_label_result()
                     run_vasp_local(label_result, gen_cfg)
 
-                # ── label_hpc (submit to Dardel + sync back) ───────────
+                # \u2500\u2500 label_hpc (submit to Dardel + sync back) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "label_hpc":
                     label_result = _build_label_result()
-                    submit_label_jobs(label_result, gen_cfg)
+                    try:
+                        submit_label_jobs(label_result, gen_cfg)
+                    except SyncRetryExhausted as exc:
+                        # dardel.py already retried for 24 h — treat as a
+                        # generation failure but keep the loop going.
+                        state.mark_failed(exc)
+                        msg = f"rsync sync-back failed after 24 h of retries: {exc}"
+                        logger.error("Generation %02d failed at 'label_hpc': %s", gen, exc)
+                        print(f"\nERROR Generation {gen:02d} failed at 'label_hpc': {msg}")
+                        failures.append(gen)
+                        print("ERROR Stopping. Re-run with same args to resume.")
+                        break
 
-                # ── convert ────────────────────────────────────────────
+                # \u2500\u2500 convert \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "convert":
                     label_root = runs_root / tag / "label"
                     label_result = LabelResult.load_manifest(label_root)
                     result = convert_outcars_to_cfg(label_result, gen_cfg, resolved_paths)
                     state.merged_cfg = str(result.merged_cfg)
 
-                # ── evaluate ───────────────────────────────────────────
+                # \u2500\u2500 evaluate \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 elif step == "evaluate":
                     fit_result = _build_fit_result()
                     run_evaluation(gen_cfg, resolved_paths, fit_result)
 
                 state.mark_step_done(step)
 
-            state.mark_done()
-            print(f"\n\u2713 Generation {gen:02d} complete.")
+            else:
+                # for-loop completed without a break (no label_hpc failure)
+                state.mark_done()
+                print(f"\n\u2713 Generation {gen:02d} complete.")
+                continue
+
+            # Reached here only if the inner for-loop broke (label_hpc failure)
+            # failures list already updated above; continue to next generation.
+            continue
 
         except Exception as exc:  # noqa: BLE001
             state.mark_failed(exc)
