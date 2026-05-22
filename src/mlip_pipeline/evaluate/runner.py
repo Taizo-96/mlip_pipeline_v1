@@ -131,10 +131,12 @@ def run_evaluation(
         print("  [gamma]   WARNING: no preselected/selected cfg found")
 
     print(f"\nEvaluation complete — {len(plot_paths)} plot(s) in {eval_dir}/")
-    return EvaluationResult(
+    result = EvaluationResult(
         rmse_energy=metrics.get("rmse_e", float("nan")),
         rmse_forces=metrics.get("rmse_f", float("nan")),
         rmse_stress=metrics.get("rmse_s", float("nan")),
         eval_dir=eval_dir,
         plot_paths={p.stem: p for p in plot_paths},
     )
+    result.save_manifest()  # Fix #2: write eval_manifest.json to disk
+    return result
