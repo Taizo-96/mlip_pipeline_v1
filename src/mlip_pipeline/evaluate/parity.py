@@ -11,6 +11,9 @@ def run_calculate_efs(
     model_path: Path,
     input_cfg: Path,
     output_cfg: Path,
+    *,
+    mpi_command: str | None = None,
+    mpi_np: int | None = None,
 ) -> None:
     """
     mlp calculate_efs takes exactly 2 positional args:
@@ -18,18 +21,33 @@ def run_calculate_efs(
     It overwrites configs.cfg in-place, adding MTP-predicted EFS alongside
     the existing DFT values.
 
-    Strategy: copy input_cfg → output_cfg first, then run on the copy.
+    Strategy: copy input_cfg -> output_cfg first, then run on the copy.
     That way input_cfg (DFT reference) is untouched and output_cfg holds
     the MTP-predicted version for parity comparison.
+
+    MPI: if mpi_command is provided (e.g. "mpirun" or "srun"), the call
+    is wrapped as::
+
+        <mpi_command> [-n <mpi_np>] mlp calculate_efs model cfg
+
+    mpi_np is optional; omit it to let the MPI launcher use its default
+    process count (e.g. all available cores, or the SLURM allocation).
     """
     shutil.copy2(input_cfg, output_cfg)
 
-    cmd = [
+    cmd: list[str] = []
+    if mpi_command:
+        cmd.append(mpi_command)
+        if mpi_np is not None:
+            cmd.extend(["-n", str(mpi_np)])
+
+    cmd.extend([
         mlp_command,
         "calculate_efs",
         str(model_path),
         str(output_cfg),       # overwritten in-place by mlp
-    ]
+    ])
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
