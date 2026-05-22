@@ -179,6 +179,17 @@ def run_single_generation(
 
     else:
         state = GenerationState.init(str(generation), gen_dir)
+        # Inherit the replicate tier reached by the previous generation so that
+        # a new generation always starts exploring at least as large a cell as
+        # the one that converged last time (e.g. if gen 17 escalated to tier 2
+        # before finding 0 candidates, gen 18 starts at tier 2, not tier 0).
+        if prev_state is not None and prev_state.converged_replicate_tier > 0:
+            state.replicate_tier = prev_state.converged_replicate_tier
+            state.save()
+            info(
+                f"Generation {generation:02d}: inheriting replicate_tier="
+                f"{state.replicate_tier} from gen_{int(prev_state.generation):02d}."
+            )
 
     schedule = _replicate_schedule(config)
     config["explore"]["replicate"] = schedule[state.replicate_tier]
