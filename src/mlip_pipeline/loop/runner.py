@@ -274,13 +274,17 @@ def run_single_generation(
                 fit_result = _resolve_fit_result(config, paths, state)
                 sel_result = run_selection(config, resolved, fit_result)
 
-                # Auto-escalate replicate tier if no candidates found
-                while sel_result.selected_count == 0 and not sel_result.converged:
+                # Auto-escalate replicate tier whenever selected_count == 0,
+                # regardless of sel_result.converged. Both "no preselected.cfg
+                # files found" (converged=True) and "mlp select_add returned 0
+                # structures" (converged=False) should trigger tier escalation —
+                # the potential may simply need a larger simulation cell.
+                while sel_result.selected_count == 0:
                     next_tier = state.replicate_tier + 1
                     if next_tier >= len(schedule):
-                        # All tiers exhausted — potential is converged for this
-                        # generation. Mark immediately and break out of the step
-                        # loop so no label / convert / evaluate work is wasted.
+                        # All tiers exhausted — potential is genuinely converged.
+                        # Break out of the step loop; no label/convert/evaluate
+                        # work should be wasted on this generation.
                         warn(
                             f"Generation {generation:02d}: 0 candidates at all "
                             f"{len(schedule)} replicate tier(s) — "
@@ -309,7 +313,7 @@ def run_single_generation(
                     run_exploration_runs(config, resolved, explore_dir)
                     sel_result  = run_selection(config, resolved, fit_result)
 
-                # Break the step for-loop; mark_done below will set status="converged"
+                # Break the step for-loop; converged path handled below
                 if _generation_converged:
                     break
 
@@ -504,7 +508,7 @@ def run_single_generation(
 
 
 # ---------------------------------------------------------------------------
-# Module-level helper so run_loop can reference _now() without importing
+# Module-level _now() helper
 # ---------------------------------------------------------------------------
 from datetime import datetime as _datetime  # noqa: E402
 def _now() -> str:
