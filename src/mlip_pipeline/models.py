@@ -300,7 +300,8 @@ class EvaluationResult:
 
 # ── Generation state (automation) ──────────────────────────────────────────────
 
-STEPS = ("fit", "explore", "select", "label", "label_hpc", "label_local", "convert")
+# Fix #1: added "evaluate" to STEPS after "convert"
+STEPS = ("fit", "explore", "select", "label", "label_hpc", "label_local", "convert", "evaluate")
 
 @dataclass
 class GenerationState:
@@ -318,6 +319,10 @@ class GenerationState:
     converged_replicate_tier: int = 0
     label_prepared: bool = False
     jobs_submitted: bool = False   # True once SLURM jobs have been submitted
+    # Fix #3: evaluation state fields
+    evaluation_done: bool = False
+    evaluation_failed: bool = False
+    evaluation_manifest: Optional[str] = None  # path to eval_manifest.json
 
     @property
     def _state_path(self) -> Path:
@@ -339,6 +344,9 @@ class GenerationState:
             "converged_replicate_tier": self.converged_replicate_tier,
             "label_prepared":           self.label_prepared,
             "jobs_submitted":           self.jobs_submitted,
+            "evaluation_done":          self.evaluation_done,
+            "evaluation_failed":        self.evaluation_failed,
+            "evaluation_manifest":      self.evaluation_manifest,
         })
 
     @classmethod
