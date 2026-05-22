@@ -92,6 +92,43 @@ def _prev_convert_dir(resolved: dict, config: dict, generation: int) -> Path | N
     return candidate if candidate.exists() else None
 
 
+def _resolve_fit_result(config: dict, paths: dict, state: GenerationState) -> FitResult:
+    """
+    Build a FitResult for the evaluate step using the best available source:
+      1. state.model_path  (set when fit ran inside the loop runner)
+      2. fit_manifest.json (written by train_potential)
+      3. config fallback   (construct from fit.output_subdir + trained_potential_name)
+
+    Raises RuntimeError if none of the above yields an existing model file.
+    """
+    fit_dir = paths.get("fit_dir") or (paths["runs_root"] / config["fit"]["output_subdir"])
+
+    # Source 1: state.model_path
+    if state.model_path:
+        mp = Path(state.model_path)
+        if mp.exists():
+            return FitResult(run_dir=fit_dir, model_path=mp)
+
+    # Source 2: fit_manifest.json
+    manifest = fit_dir / "fit_manifest.json"
+    if manifest.exists():
+        return FitResult.load_manifest(fit_dir)
+
+    # Source 3: config fallback — construct path from config keys
+    potential_name = config.get("fit", {}).get("trained_potential_name", "Pb.mtp")
+    mp = fit_dir / potential_name
+    if mp.exists():
+        return FitResult(run_dir=fit_dir, model_path=mp)
+
+    raise RuntimeError(
+        f"Cannot locate trained model for generation {state.generation}.\n"
+        f"  Checked: state.model_path={state.model_path!r}\n"
+        f"           fit_manifest: {manifest}\n"
+        f"           config fallback: {mp}\n"
+        "Ensure the 'fit' step completed successfully for this generation."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Single-generation runner
 # ---------------------------------------------------------------------------
@@ -117,7 +154,7 @@ def run_single_generation(
     if not snapshot.exists():
         snapshot.write_text(yaml.dump(config, default_flow_style=False))
 
-    # ── Load or initialise generation state ─────────────────────────────
+    # ── Load or initialise generation state ──────────────────────────────────────
     state_file = gen_dir / "state.json"
     if state_file.exists():
         state = GenerationState.load(gen_dir)
@@ -172,7 +209,7 @@ def run_single_generation(
             step_header(f"Generation {generation:02d} — {step}")
             state.mark_step_start(step)
 
-            # ── fit ───────────────────────────────────────────────────────
+            # ── fit ─────────────────────────────────────────────────
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential, resolve_train_cfg
                 from mlip_pipeline.checks import check_training_cfg_count
@@ -200,30 +237,20 @@ def run_single_generation(
                 result = train_potential(config, resolved)
                 state.model_path = str(result.model_path)
 
-            # ── explore ───────────────────────────────────────────────────
+            # ── explore ──────────────────────────────────────────────
             elif step == "explore":
                 from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
                 from mlip_pipeline.explore.runner import run_exploration_runs
 
-                fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
-                fit_result = (
-                    FitResult(run_dir=fit_dir, model_path=Path(state.model_path))
-                    if state.model_path
-                    else FitResult.load_manifest(fit_dir)
-                )
+                fit_result = _resolve_fit_result(config, paths, state)
                 explore_dir = create_exploration_runs(config, resolved, fit_result)
                 run_exploration_runs(config, resolved, explore_dir)
 
-            # ── select ────────────────────────────────────────────────────
+            # ── select ──────────────────────────────────────────────
             elif step == "select":
                 from mlip_pipeline.select.runner import run_selection
 
-                fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
-                fit_result = (
-                    FitResult(run_dir=fit_dir, model_path=Path(state.model_path))
-                    if state.model_path
-                    else FitResult.load_manifest(fit_dir)
-                )
+                fit_result = _resolve_fit_result(config, paths, state)
                 sel_result = run_selection(config, resolved, fit_result)
 
                 # Auto-escalate replicate tier if no candidates found
@@ -259,20 +286,20 @@ def run_single_generation(
                     run_exploration_runs(config, resolved, explore_dir)
                     sel_result  = run_selection(config, resolved, fit_result)
 
-            # ── label (prepare VASP input dirs) ───────────────────────────
+            # ── label (prepare VASP input dirs) ───────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
                 state.label_prepared = True
                 state.save()
 
-            # ── label_local ───────────────────────────────────────────────
+            # ── label_local ─────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc ─────────────────────────────────────────────────
+            # ── label_hpc ───────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import (
@@ -291,11 +318,6 @@ def run_single_generation(
                 outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
 
                 if state.jobs_submitted and outcars:
-                    # ───────────────────────────────────────────────────────
-                    # Jobs completed and OUTCARs are present locally.
-                    # The only thing that failed last time was the rsync
-                    # sync-back. Skip straight to trying it again.
-                    # ───────────────────────────────────────────────────────
                     info(
                         f"  label_hpc: jobs already submitted and "
                         f"{len(outcars)} OUTCAR(s) found locally — "
@@ -315,10 +337,6 @@ def run_single_generation(
                     )
 
                 elif state.jobs_submitted and not outcars:
-                    # ───────────────────────────────────────────────────────
-                    # Jobs were submitted but no OUTCARs arrived — the
-                    # VASP runs themselves likely failed. Wipe and restart.
-                    # ───────────────────────────────────────────────────────
                     warn(
                         f"  label_hpc: jobs_submitted=True but no OUTCARs found "
                         f"in {label_result.label_root} — VASP jobs likely failed. "
@@ -342,9 +360,6 @@ def run_single_generation(
                     state.save()
 
                 else:
-                    # ───────────────────────────────────────────────────────
-                    # Normal first-time run.
-                    # ───────────────────────────────────────────────────────
                     submit_label_jobs(label_result, config)
                     state.jobs_submitted = True
                     state.save()
@@ -353,16 +368,16 @@ def run_single_generation(
                 # jobs are submitted, making use of the idle local machine
                 # while VASP runs on Dardel. The thread is non-blocking.
                 if state.jobs_submitted and not state.evaluation_done:
-                    fit_dir_bg = paths.get("fit_dir", paths["runs_root"] / "fit")
-                    fit_result_bg = (
-                        FitResult(run_dir=fit_dir_bg, model_path=Path(state.model_path))
-                        if state.model_path
-                        else None
-                    )
-                    if fit_result_bg is not None and fit_result_bg.model_path.exists():
-                        _config_snap  = copy.deepcopy(config)
+                    try:
+                        fit_result_bg = _resolve_fit_result(config, paths, state)
+                    except RuntimeError as _e:
+                        fit_result_bg = None
+                        warn(f"  label_hpc: skipping background eval — {_e}")
+
+                    if fit_result_bg is not None:
+                        _config_snap   = copy.deepcopy(config)
                         _resolved_snap = copy.deepcopy(resolved)
-                        _state_ref    = state
+                        _state_ref     = state
 
                         def _bg_eval(
                             cfg=_config_snap,
@@ -407,22 +422,17 @@ def run_single_generation(
                         "VASP jobs likely failed — check job.sh env_block and vasp_cmd."
                     )
 
-            # ── convert ───────────────────────────────────────────────────
+            # ── convert ────────────────────────────────────────────
             elif step == "convert":
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
                 label_result   = LabelResult.load_manifest(label_dir)
                 convert_result = convert_outcars_to_cfg(label_result, config, resolved)
                 state.merged_cfg = str(convert_result.merged_cfg)
 
-            # ── evaluate ──────────────────────────────────────────────────
+            # ── evaluate ──────────────────────────────────────────
             elif step == "evaluate":
                 from mlip_pipeline.evaluate.runner import run_evaluation
-                fit_dir = paths.get("fit_dir", paths["runs_root"] / "fit")
-                fit_result = (
-                    FitResult(run_dir=fit_dir, model_path=Path(state.model_path))
-                    if state.model_path
-                    else FitResult.load_manifest(fit_dir)
-                )
+                fit_result = _resolve_fit_result(config, paths, state)
                 eval_result = run_evaluation(config, resolved, fit_result)
                 state.evaluation_done     = True
                 state.evaluation_failed   = False
@@ -433,10 +443,6 @@ def run_single_generation(
 
     except Exception as exc:
         if state.current_step == "label_hpc":
-            # Distinguish a sync-back timeout (SyncRetryExhausted) from any
-            # other failure.  In both cases label_prepared and jobs_submitted
-            # are already set correctly — preserve them so a re-run resumes
-            # at the right point without re-preparing task dirs.
             if isinstance(exc, SyncRetryExhausted):
                 warn(
                     "label_hpc: sync-back retry deadline reached — "
