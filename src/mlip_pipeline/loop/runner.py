@@ -183,8 +183,6 @@ def run_single_generation(
 
             # label_prepared guard: skip re-preparing task dirs on resume,
             # but only when the manifest is actually present on disk.
-            # If the manifest is missing (e.g. after reset-steps wiped it),
-            # fall through to run_labeling() so it is regenerated.
             if step == "label" and state.label_prepared:
                 if manifest_path.exists():
                     info("  step 'label' already prepared (task dirs on disk) — skipping.")
@@ -195,7 +193,6 @@ def run_single_generation(
                         "  step 'label': label_prepared=True but manifest is missing "
                         f"({manifest_path}) — re-running run_labeling() to regenerate it."
                     )
-                    # Clear the flag so the full prepare path runs below
                     state.label_prepared = False
                     state.save()
 
@@ -352,7 +349,8 @@ def run_single_generation(
                     label_subdir     = config["label"]["output_subdir"]
                     remote_label_dir = f"{remote_root}/{runs_root}/{label_subdir}"
                     sync_outputs_from_dardel(
-                        label_result.label_root, user, host, remote_label_dir
+                        label_result.label_root, user, host, remote_label_dir,
+                        dardel_cfg=dardel_cfg,
                     )
 
                 elif state.jobs_submitted and not outcars:
@@ -374,7 +372,6 @@ def run_single_generation(
                             shutil.rmtree(label_dir)
                         else:
                             info("  Keeping existing label dir.")
-                    # Re-prepare and run the full HPC flow
                     run_labeling(config, paths)
                     state.label_prepared = True
                     state.save()
@@ -421,11 +418,19 @@ def run_single_generation(
 
     except Exception as exc:
         if state.current_step == "label_hpc":
-            # label_prepared stays True — task dirs are still valid.
-            # jobs_submitted is already correctly set before any raise.
-            warn(
-                "label_hpc failed — state preserved for smart resume on next run."
-            )
+            # Distinguish a sync-back timeout (SyncRetryExhausted) from any
+            # other failure.  In both cases label_prepared and jobs_submitted
+            # are already set correctly — preserve them so a re-run resumes
+            # at the right point without re-preparing task dirs.
+            if isinstance(exc, SyncRetryExhausted):
+                warn(
+                    "label_hpc: sync-back retry deadline reached — "
+                    "label_prepared and jobs_submitted preserved for smart resume."
+                )
+            else:
+                warn(
+                    "label_hpc failed — state preserved for smart resume on next run."
+                )
         state.mark_failed(exc)
         error(f"Generation {generation:02d} failed at '{state.current_step}': {exc}")
         raise
@@ -458,7 +463,6 @@ def run_loop(
     for gen in range(start_gen, end_gen + 1):
         info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
-        # Carry the previous generation's state for tier inheritance
         prev_state: GenerationState | None = states[-1] if states else None
         if prev_state is None and gen > 1:
             prev_gen_dir = resolved_paths_for(base_config, gen - 1)
@@ -468,7 +472,6 @@ def run_loop(
                 except Exception:
                     warn(f"  Could not load state for gen_{gen - 1:02d} — skipping integrity check.")
 
-        # Thread the accumulated training set forward
         if states and states[-1].merged_cfg:
             base_config = copy.deepcopy(base_config)
             base_config.setdefault("training", {})["origin_cfg"] = states[-1].merged_cfg

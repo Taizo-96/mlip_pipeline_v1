@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -22,15 +24,36 @@ _RSYNC_OK = {0, 23, 24}
 _TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"}
 
 # ---------------------------------------------------------------------------
-# Retry schedule for sync_outputs_from_dardel
+# Default retry schedule for sync_outputs_from_dardel.
+# These values are used when the config does not override them via
+#   label.dardel.sync_retry_delays      (list[int], seconds)
+#   label.dardel.sync_retry_interval    (int, seconds)
+#   label.dardel.sync_retry_deadline    (int, seconds)
 # ---------------------------------------------------------------------------
-_RETRY_DELAYS   = [60, 300, 900, 1800]   # 1 min, 5 min, 15 min, 30 min
-_RETRY_INTERVAL = 3_600                   # 1 h between subsequent attempts
-_RETRY_DEADLINE = 24 * 3_600             # stop retrying after 24 h of total wait
+_DEFAULT_RETRY_DELAYS   = [60, 300, 900, 1800]   # 1 min, 5 min, 15 min, 30 min
+_DEFAULT_RETRY_INTERVAL = 3_600                   # 1 h between subsequent attempts
+_DEFAULT_RETRY_DEADLINE = 24 * 3_600             # stop retrying after 24 h of total wait
+
+
+def _retry_settings(dardel_cfg: dict) -> tuple[list[int], int, int]:
+    """
+    Read retry settings from the dardel sub-config, falling back to defaults.
+
+    Returns
+    -------
+    (delays, interval, deadline)
+        delays   – explicit per-attempt wait list (seconds)
+        interval – wait between attempts once the list is exhausted (seconds)
+        deadline – give up after this many cumulative seconds of waiting
+    """
+    delays   = list(dardel_cfg.get("sync_retry_delays",   _DEFAULT_RETRY_DELAYS))
+    interval = int(dardel_cfg.get("sync_retry_interval", _DEFAULT_RETRY_INTERVAL))
+    deadline = int(dardel_cfg.get("sync_retry_deadline", _DEFAULT_RETRY_DEADLINE))
+    return delays, interval, deadline
 
 
 class SyncRetryExhausted(RuntimeError):
-    """Raised when rsync sync-back keeps failing for 24 h straight."""
+    """Raised when rsync sync-back keeps failing for the configured deadline."""
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +141,21 @@ def _socket_path(user: str, host: str) -> str:
 
 
 def _open_master(user: str, host: str, socket: str) -> None:
-    """Open a persistent SSH ControlMaster socket."""
+    """
+    Open a persistent SSH ControlMaster socket.
+
+    If a stale socket file already exists at *socket* it is removed first so
+    that a dropped connection from a previous attempt does not silently block
+    the new master from starting.
+    """
+    # Remove any leftover socket from a previous (dead) master.
+    if os.path.exists(socket):
+        try:
+            os.remove(socket)
+            logger.debug("_open_master: removed stale socket %s", socket)
+        except OSError as exc:
+            logger.warning("_open_master: could not remove stale socket %s: %s", socket, exc)
+
     master_cmd = [
         "ssh", "-MNf",
         "-o", "ControlMaster=yes",
@@ -177,8 +214,8 @@ def _check_jobs_via_sacct(
     Returns
     -------
     (all_done, state_map)
-        all_done  – True when every job_id is in a terminal Slurm state.
-        state_map – {job_id: state_string} for all returned rows.
+        all_done  - True when every job_id is in a terminal Slurm state.
+        state_map - {job_id: state_string} for all returned rows.
 
     Notes
     -----
@@ -191,8 +228,6 @@ def _check_jobs_via_sacct(
     jobs and job-array elements are covered uniformly.
     """
     id_arg = ",".join(job_ids)
-    # --parsable2 uses | as delimiter, --noheader omits the header row.
-    # State can be "RUNNING", "PENDING", "COMPLETED", "FAILED", etc.
     remote_cmd = (
         f"sacct -j {id_arg} --format=JobID,State --noheader --parsable2"
     )
@@ -214,10 +249,7 @@ def _check_jobs_via_sacct(
         if len(parts) < 2:
             continue
         raw_jid, state = parts[0], parts[1].strip()
-        # Normalise array elements (e.g. "12345_1" → "12345") and
-        # batch/extern suffixes ("12345.batch" → "12345").
         base_jid = re.split(r"[._]", raw_jid)[0]
-        # Keep the "worst" state per job (FAILED > RUNNING > PENDING)
         existing = state_map.get(base_jid, "")
         if state in _TERMINAL_STATES or existing not in _TERMINAL_STATES:
             state_map[base_jid] = state
@@ -273,7 +305,6 @@ def submit_jobs_on_dardel(
     that the watcher can be restarted independently.
     """
     s = socket or _socket_path(user, host)
-    # Capture each "Submitted batch job <ID>" line so we can scope the watcher.
     remote_cmd = (
         f"find {remote_label_dir} -name job.sh | sort | while read job; do "
         f"sbatch --chdir=$(dirname $(realpath $job)) $job; done"
@@ -339,8 +370,8 @@ def watch_queue(
     Returns
     -------
     (finished_cleanly, state_map)
-        finished_cleanly – True when all jobs reached a terminal state.
-        state_map        – {job_id: final_state} dict (empty on KeyboardInterrupt
+        finished_cleanly - True when all jobs reached a terminal state.
+        state_map        - {job_id: final_state} dict (empty on KeyboardInterrupt
                            or when no job_ids were provided).
     """
     s = socket or _socket_path(user, host)
@@ -374,12 +405,10 @@ def watch_queue(
                     else:
                         print(f"All {len(job_ids)} job(s) COMPLETED.")
                     return True, state_map
-                # Print a compact status summary
                 from collections import Counter
                 counts = Counter(state_map.values())
                 print("  jobs: " + "  ".join(f"{st}={n}" for st, n in sorted(counts.items())))
             else:
-                # Legacy fallback: squeue -u user
                 check_cmd = _ssh_via_socket(user, host, s, f"squeue -u {user} -h")
                 result = subprocess.run(check_cmd, text=True, capture_output=True)
                 if not result.stdout.strip():
@@ -403,22 +432,36 @@ def sync_outputs_from_dardel(
     host: str,
     remote_label_dir: str,
     socket: str | None = None,
+    dardel_cfg: dict | None = None,
 ) -> None:
     """
     Rsync OUTCAR/vasprun.xml/OSZICAR back from Dardel, with automatic retry.
 
-    Retry schedule (cumulative wait before giving up at 24 h):
-        attempt 1 → wait  1 min
-        attempt 2 → wait  5 min
-        attempt 3 → wait 15 min
-        attempt 4 → wait 30 min
-        attempt 5+ → wait  1 h  (repeated until 24 h total elapsed)
+    Retry schedule is read from *dardel_cfg* (label.dardel sub-dict) with
+    these optional keys (all in seconds):
+
+        sync_retry_delays   : list[int]  – per-attempt waits before going hourly
+                                           default: [60, 300, 900, 1800]
+        sync_retry_interval : int        – interval once the list is exhausted
+                                           default: 3600  (1 h)
+        sync_retry_deadline : int        – give up after this total wait
+                                           default: 86400 (24 h)
+
+    Example YAML::
+
+        label:
+          dardel:
+            sync_retry_delays: [60, 300, 900, 1800]
+            sync_retry_interval: 3600
+            sync_retry_deadline: 86400
 
     Raises
     ------
     SyncRetryExhausted
-        If rsync keeps failing for 24 h of cumulative waiting.
+        If rsync keeps failing until the deadline is reached.
     """
+    retry_delays, retry_interval, retry_deadline = _retry_settings(dardel_cfg or {})
+
     s = socket or _socket_path(user, host)
 
     cmd = _rsync_via_socket(
@@ -441,6 +484,8 @@ def sync_outputs_from_dardel(
     attempt = 0
 
     while True:
+        # Re-open a fresh master before every attempt; _open_master() removes
+        # any stale socket first so a dropped connection never silently blocks.
         _open_master(user, host, s)
         try:
             exit_code = run_command(cmd)
@@ -452,12 +497,12 @@ def sync_outputs_from_dardel(
 
         attempt += 1
 
-        if attempt <= len(_RETRY_DELAYS):
-            wait = _RETRY_DELAYS[attempt - 1]
+        if attempt <= len(retry_delays):
+            wait = retry_delays[attempt - 1]
         else:
-            wait = _RETRY_INTERVAL
+            wait = retry_interval
 
-        if total_waited + wait >= _RETRY_DEADLINE:
+        if total_waited + wait >= retry_deadline:
             raise SyncRetryExhausted(
                 f"rsync sync-back failed (exit {exit_code}) — SSH connection lost or "
                 f"remote path missing. Gave up after "
@@ -465,8 +510,9 @@ def sync_outputs_from_dardel(
             )
 
         wait_min = wait / 60
+        now = datetime.now().strftime("%H:%M:%S")
         msg = (
-            f"rsync sync-back failed (exit {exit_code}), attempt {attempt}. "
+            f"[{now}] rsync sync-back failed (exit {exit_code}), attempt {attempt}. "
             f"Retrying in {wait_min:.0f} min "
             f"(total waited so far: {total_waited // 60:.0f} min)."
         )
@@ -483,7 +529,7 @@ def submit_label_jobs(
 ) -> tuple[bool, dict[str, str]]:
     """
     Full HPC labelling workflow:
-      open master → sync inputs → submit (persist job IDs) → watch queue → sync back
+      open master -> sync inputs -> submit (persist job IDs) -> watch queue -> sync back
 
     Parameters
     ----------
@@ -526,8 +572,6 @@ def submit_label_jobs(
             socket=socket,
         )
 
-        # Fire the optional callback (e.g. start evaluation) now that jobs
-        # are queued and the local machine is otherwise idle.
         if on_submitted is not None:
             try:
                 on_submitted()
@@ -546,6 +590,9 @@ def submit_label_jobs(
         _close_master(user, host, socket)
 
     print("\n=== Syncing outputs back ===")
-    sync_outputs_from_dardel(local_label_dir, user, host, remote_label_dir)
+    sync_outputs_from_dardel(
+        local_label_dir, user, host, remote_label_dir,
+        dardel_cfg=dardel_cfg,
+    )
     print("Done.")
     return finished, state_map
