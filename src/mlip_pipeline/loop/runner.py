@@ -166,7 +166,7 @@ def run_single_generation(
                 state.completed_steps = [
                     s for s in state.completed_steps if s not in steps_to_force
                 ]
-                if state.status == "completed":
+                if state.status in ("completed", "converged"):
                     state.status = "running"
                     state.completed_at = None
                 state.error = None
@@ -177,12 +177,18 @@ def run_single_generation(
             success(f"Generation {generation:02d} already completed — skipping.")
             return state
 
+        if state.status == "converged":
+            success(
+                f"Generation {generation:02d} already converged (0 candidates at all "
+                "replicate tiers) — skipping."
+            )
+            return state
+
     else:
         state = GenerationState.init(str(generation), gen_dir)
         # Inherit the replicate tier reached by the previous generation so that
         # a new generation always starts exploring at least as large a cell as
-        # the one that converged last time (e.g. if gen 17 escalated to tier 2
-        # before finding 0 candidates, gen 18 starts at tier 2, not tier 0).
+        # the one that converged last time.
         if prev_state is not None and prev_state.converged_replicate_tier > 0:
             state.replicate_tier = prev_state.converged_replicate_tier
             state.save()
@@ -214,6 +220,10 @@ def run_single_generation(
 
     # Used in the except block to distinguish label_hpc failures
     SyncRetryExhausted: type = Exception  # placeholder; overridden inside label_hpc
+
+    # Flag set inside the select block when all tiers are exhausted; causes the
+    # step for-loop to break immediately after select completes.
+    _generation_converged = False
 
     try:
         for step in active:
@@ -265,16 +275,18 @@ def run_single_generation(
                 sel_result = run_selection(config, resolved, fit_result)
 
                 # Auto-escalate replicate tier if no candidates found
-                while sel_result.selected_count == 0:
+                while sel_result.selected_count == 0 and not sel_result.converged:
                     next_tier = state.replicate_tier + 1
                     if next_tier >= len(schedule):
+                        # All tiers exhausted — potential is converged for this
+                        # generation. Mark immediately and break out of the step
+                        # loop so no label / convert / evaluate work is wasted.
                         warn(
-                            f"Generation {generation:02d}: no candidates at any "
-                            "replicate tier — marking as converged."
+                            f"Generation {generation:02d}: 0 candidates at all "
+                            f"{len(schedule)} replicate tier(s) — "
+                            "potential is converged. Stopping loop."
                         )
-                        for s in _LABEL_STEPS:
-                            if s in active and not state.is_step_done(s):
-                                state.mark_step_done(s)
+                        _generation_converged = True
                         break
 
                     next_rep    = schedule[next_tier]
@@ -296,6 +308,10 @@ def run_single_generation(
                     explore_dir = create_exploration_runs(config, resolved, fit_result)
                     run_exploration_runs(config, resolved, explore_dir)
                     sel_result  = run_selection(config, resolved, fit_result)
+
+                # Break the step for-loop; mark_done below will set status="converged"
+                if _generation_converged:
+                    break
 
             # ── label (prepare VASP input dirs) ───────────────────────
             elif step == "label":
@@ -468,11 +484,31 @@ def run_single_generation(
             state.mark_failed(exc)
         raise
 
+    # ── Converged: potential found no new structures at any cell size ────────────
+    if _generation_converged:
+        state.converged_replicate_tier = state.replicate_tier
+        state.status = "converged"
+        state.current_step = None
+        state.completed_at = _now()
+        state.save()
+        report_path = state.save_convergence_report(schedule)
+        info(f"Generation {generation:02d}: convergence report → {report_path}")
+        success(f"Generation {generation:02d} converged — loop will stop.")
+        return state
+
     state.mark_done()
     report_path = state.save_convergence_report(schedule)
     info(f"Generation {generation:02d}: convergence report → {report_path}")
     success(f"Generation {generation:02d} complete.")
     return state
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper so run_loop can reference _now() without importing
+# ---------------------------------------------------------------------------
+from datetime import datetime as _datetime  # noqa: E402
+def _now() -> str:
+    return _datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
 # ---------------------------------------------------------------------------
@@ -526,14 +562,23 @@ def run_loop(
                 error("Stopping. Re-run with same args to resume.")
                 break
             warn("stop_on_failure=False — continuing to next generation.")
+            continue
+
+        # Stop the loop cleanly when the potential is converged
+        if state.status == "converged":
+            success(
+                f"Potential converged at generation {gen:02d} — "
+                "no new structures found at any replicate tier. Loop complete."
+            )
+            break
 
     if failed:
         warn(f"Loop complete with {len(failed)} failure(s): {failed}")
     else:
-        success(f"All generations {start_gen}\u2013{end_gen} complete.")
+        success(f"Loop finished (last gen processed: {gen:02d}).")
 
     # Feature #10: Auto-generate loop summary plots if ≥2 generations completed.
-    completed_states = [s for s in states if s.status == "completed"]
+    completed_states = [s for s in states if s.status in ("completed", "converged")]
     if len(completed_states) >= 2:
         try:
             from mlip_pipeline.evaluate.loop_plots import collect_loop_records, plot_loop_summary
