@@ -14,6 +14,7 @@ import copy
 import select as _select
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 import yaml
@@ -138,78 +139,38 @@ def run_single_generation(
         if state.status == "completed":
             success(f"Generation {generation:02d} already completed — skipping.")
             return state
-        if state.status == "failed":
-            state.status = "running"
-            state.error = None
-            state.save()
+
     else:
-        state = GenerationState.init(str(generation).zfill(2), gen_dir)
+        state = GenerationState.init(str(generation), gen_dir)
 
-    # ── Replicate-tier inheritance from previous generation ──────────────
     schedule = _replicate_schedule(config)
-    if state.replicate_tier == 0 and prev_state is not None:
-        inherited_tier = min(
-            prev_state.converged_replicate_tier, len(schedule) - 1
-        )
-        if inherited_tier > 0:
-            info(
-                f"Generation {generation:02d}: inheriting replicate tier "
-                f"{inherited_tier} ({schedule[inherited_tier]}) "
-                f"from gen_{prev_state.generation}."
-            )
-            state.replicate_tier = inherited_tier
-            state.save()
+    config["explore"]["replicate"] = schedule[state.replicate_tier]
 
-    tier = min(state.replicate_tier, len(schedule) - 1)
-    config["explore"]["replicate"] = schedule[tier]
-
-    step_header(f"Generation {generation:02d}", str(generation).zfill(2))
-
+    # Build the set of steps to run this invocation
+    skip_set  = set(skip_steps or [])
     active = [
         s for s in STEPS
-        if (only_steps is None or s in only_steps)
-        and s not in (skip_steps or [])
+        if not state.is_step_done(s)
+        and s not in skip_set
+        and (only_steps is None or s in only_steps)
     ]
+    if not active:
+        info(f"Generation {generation:02d}: all requested steps already done.")
+        state.mark_done()
+        report_path = state.save_convergence_report(schedule)
+        info(f"Generation {generation:02d}: convergence report → {report_path}")
+        success(f"Generation {generation:02d} complete.")
+        return state
 
-    label_dir = resolved["runs_root"] / config["label"]["output_subdir"]
-    manifest_path = label_dir / "label_manifest.json"
+    label_dir = paths.get("label_dir", paths["runs_root"] / config["label"]["output_subdir"])
 
-    # ── Step loop ────────────────────────────────────────────────────────
+    # Used in the except block to distinguish label_hpc failures
+    SyncRetryExhausted: type = Exception  # placeholder; overridden inside label_hpc
+
     try:
         for step in active:
-            if state.is_step_done(step):
-                info(f"  step '{step}' already done — skipping.")
-                continue
-
-            # label_prepared guard: skip re-preparing task dirs on resume,
-            # but only when the manifest is actually present on disk.
-            if step == "label" and state.label_prepared:
-                if manifest_path.exists():
-                    info("  step 'label' already prepared (task dirs on disk) — skipping.")
-                    state.mark_step_done("label")
-                    continue
-                else:
-                    warn(
-                        "  step 'label': label_prepared=True but manifest is missing "
-                        f"({manifest_path}) — re-running run_labeling() to regenerate it."
-                    )
-                    state.label_prepared = False
-                    state.save()
-
-            # ask before wiping an existing label dir
-            if step == "label" and label_dir.exists() and any(label_dir.iterdir()):
-                if _ask_relabel(label_dir):
-                    warn(f"  Wiping {label_dir} before re-labelling.")
-                    shutil.rmtree(label_dir)
-                else:
-                    info("  Keeping existing label dir — jumping straight to submission.")
-                    state.label_prepared = True
-                    state.mark_step_done("label")
-                    state.save()
-                    continue
-
+            step_header(f"Generation {generation:02d} — {step}")
             state.mark_step_start(step)
-            step_header(step.upper())
 
             # ── fit ───────────────────────────────────────────────────────
             if step == "fit":
@@ -388,6 +349,56 @@ def run_single_generation(
                     state.jobs_submitted = True
                     state.save()
 
+                # Feature #7: Start background evaluation immediately after
+                # jobs are submitted, making use of the idle local machine
+                # while VASP runs on Dardel. The thread is non-blocking.
+                if state.jobs_submitted and not state.evaluation_done:
+                    fit_dir_bg = paths.get("fit_dir", paths["runs_root"] / "fit")
+                    fit_result_bg = (
+                        FitResult(run_dir=fit_dir_bg, model_path=Path(state.model_path))
+                        if state.model_path
+                        else None
+                    )
+                    if fit_result_bg is not None and fit_result_bg.model_path.exists():
+                        _config_snap  = copy.deepcopy(config)
+                        _resolved_snap = copy.deepcopy(resolved)
+                        _state_ref    = state
+
+                        def _bg_eval(
+                            cfg=_config_snap,
+                            res=_resolved_snap,
+                            fr=fit_result_bg,
+                            st=_state_ref,
+                        ):
+                            info(f"  [bg-eval gen {st.generation}] Starting background evaluation...")
+                            try:
+                                from mlip_pipeline.evaluate.runner import run_evaluation
+                                eval_result = run_evaluation(cfg, res, fr)
+                                st.evaluation_done     = True
+                                st.evaluation_failed   = False
+                                st.evaluation_manifest = str(eval_result.eval_dir / "eval_manifest.json")
+                                st.save()
+                                info(
+                                    f"  [bg-eval gen {st.generation}] Done — "
+                                    f"{len(eval_result.plot_paths)} plot(s)."
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                warn(f"  [bg-eval gen {st.generation}] FAILED: {exc}")
+                                st.evaluation_done   = False
+                                st.evaluation_failed = True
+                                st.save()
+
+                        bg_thread = threading.Thread(
+                            target=_bg_eval,
+                            daemon=True,
+                            name=f"bg-eval-gen{generation:02d}",
+                        )
+                        bg_thread.start()
+                        info(
+                            f"  label_hpc: background evaluation thread started "
+                            f"(thread={bg_thread.name})."
+                        )
+
                 # Final OUTCAR check (covers all three paths above)
                 outcars = list(label_result.label_root.glob("task.*/OUTCAR"))
                 if not outcars:
@@ -412,7 +423,11 @@ def run_single_generation(
                     if state.model_path
                     else FitResult.load_manifest(fit_dir)
                 )
-                run_evaluation(config, resolved, fit_result)
+                eval_result = run_evaluation(config, resolved, fit_result)
+                state.evaluation_done     = True
+                state.evaluation_failed   = False
+                state.evaluation_manifest = str(eval_result.eval_dir / "eval_manifest.json")
+                state.save()
 
             state.mark_step_done(step)
 
@@ -431,8 +446,9 @@ def run_single_generation(
                 warn(
                     "label_hpc failed — state preserved for smart resume on next run."
                 )
-        state.mark_failed(exc)
-        error(f"Generation {generation:02d} failed at '{state.current_step}': {exc}")
+            state.mark_failed(exc)
+        else:
+            state.mark_failed(exc)
         raise
 
     state.mark_done()
@@ -497,7 +513,30 @@ def run_loop(
     if failed:
         warn(f"Loop complete with {len(failed)} failure(s): {failed}")
     else:
-        success(f"All generations {start_gen}–{end_gen} complete.")
+        success(f"All generations {start_gen}\u2013{end_gen} complete.")
+
+    # Feature #10: Auto-generate loop summary plots if ≥2 generations completed.
+    completed_states = [s for s in states if s.status == "completed"]
+    if len(completed_states) >= 2:
+        try:
+            from mlip_pipeline.evaluate.loop_plots import collect_loop_records, plot_loop_summary
+            from mlip_pipeline.config import project_paths as _project_paths
+
+            _cfg      = _config_for_gen(base_config, start_gen)
+            _resolved = _project_paths(_cfg)
+            runs_root = _resolved["runs_root"]
+
+            generations = [int(s.generation) for s in completed_states]
+            records     = collect_loop_records(runs_root, generations)
+            if records:
+                output_dir = runs_root / "loop_summary"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                plot_paths = plot_loop_summary(records, output_dir)
+                info(f"Loop summary plots written to {output_dir}:")
+                for p in plot_paths:
+                    info(f"  {p}")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Loop summary plotting failed (non-fatal): {exc}")
 
     return states
 

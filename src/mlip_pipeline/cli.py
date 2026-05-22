@@ -241,8 +241,27 @@ def convert_cfg(config: Annotated[str, typer.Option(..., help="Path to config ya
 
 
 @app.command("evaluate")
-def evaluate(config: Annotated[str, typer.Option(..., help="Path to config yaml")]):
-    cfg, paths = get_paths(config)
+def evaluate(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    gen: Annotated[int, typer.Option("--gen", help="Generation number (uses gen-scoped paths when provided)")] = None,
+):
+    """
+    Run evaluation for a fit result.
+
+    When --gen is provided, paths are scoped to that generation directory
+    (gen_NN/fit, gen_NN/eval), enabling clean per-generation evaluation
+    without manually editing the config.
+
+    When --gen is omitted, the flat config output_subdir is used, which
+    is appropriate for standalone (non-loop) fitting runs.
+    """
+    if gen is not None:
+        from mlip_pipeline.loop.runner import _config_for_gen
+        base_cfg = load_yaml(config)
+        cfg = _config_for_gen(base_cfg, gen)
+        paths = project_paths(cfg)
+    else:
+        cfg, paths = get_paths(config)
     fit_result = build_fit_result(cfg, paths)
     result = run_evaluation(cfg, paths, fit_result)
     for p in result.plot_paths.values():
@@ -267,6 +286,9 @@ def reset_steps(
     If any of the reset steps are label-related (label, label_local, label_hpc,
     convert), label_prepared is also cleared so that label_manifest.json is
     regenerated rather than assumed to exist.
+
+    If "evaluate" is in the reset list, evaluation_done, evaluation_failed,
+    and evaluation_manifest are also cleared.
 
     Example:
         mlip-pipeline reset-steps --config configs/Pb_loop.yaml --gen 8 --steps label,label_local,convert
@@ -300,6 +322,12 @@ def reset_steps(
 
         if _LABEL_ADJACENT_STEPS.intersection(requested):
             state["label_prepared"] = False
+
+        # Fix #6: clear evaluation state when "evaluate" is reset
+        if "evaluate" in requested:
+            state["evaluation_done"] = False
+            state["evaluation_failed"] = False
+            state["evaluation_manifest"] = None
 
         state_file.write_text(json.dumps(state, indent=2))
         removed = [s for s in before if s in requested]
@@ -364,6 +392,49 @@ def run_gen(
     skip_steps = [s.strip() for s in skip.split(",") if s.strip()]
     only_steps = [s.strip() for s in only.split(",") if s.strip()] or None
     run_single_generation(base, gen, force=force, skip_steps=skip_steps, only_steps=only_steps)
+
+
+@app.command("plot-loop")
+def plot_loop(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    start_gen: Annotated[int, typer.Option("--start-gen", help="First generation to include")] = 1,
+    end_gen: Annotated[int, typer.Option("--end-gen", help="Last generation to include (inclusive)")] = None,
+):
+    """
+    Collect per-generation evaluation records and produce loop-summary plots.
+
+    Plots are written to <runs_root>/loop_summary/ and each output path is
+    printed to stdout.
+
+    Example:
+        mlip-pipeline plot-loop --config configs/Pb_loop.yaml --start-gen 1 --end-gen 8
+    """
+    from mlip_pipeline.evaluate.loop_plots import collect_loop_records, plot_loop_summary
+
+    cfg, paths = get_paths(config)
+    runs_root = paths["runs_root"]
+
+    # Determine generation range
+    if end_gen is None:
+        # Auto-detect: find all gen_NN dirs
+        gen_dirs = sorted(runs_root.glob("gen_*"))
+        if not gen_dirs:
+            typer.echo("No generation directories found.", err=True)
+            raise typer.Exit(1)
+        end_gen = int(gen_dirs[-1].name.split("_")[1])
+
+    generations = list(range(start_gen, end_gen + 1))
+    records = collect_loop_records(runs_root, generations)
+
+    if not records:
+        typer.echo("No records collected — ensure generations have completed state.json files.", err=True)
+        raise typer.Exit(1)
+
+    output_dir = runs_root / "loop_summary"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_paths = plot_loop_summary(records, output_dir)
+    for p in plot_paths:
+        typer.echo(str(p))
 
 
 main = app
