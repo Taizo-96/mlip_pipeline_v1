@@ -288,10 +288,14 @@ def reset_steps(
     regenerated rather than assumed to exist.
 
     If "evaluate" is in the reset list, evaluation_done, evaluation_failed,
-    and evaluation_manifest are also cleared.
+    and evaluation_manifest are also cleared.  Importantly, the generation
+    status is always reopened to "running" when "evaluate" is requested even
+    if "evaluate" was never in completed_steps — this handles generations that
+    completed before the evaluate step existed.
 
     Example:
         mlip-pipeline reset-steps --config configs/Pb_loop.yaml --gen 8 --steps label,label_local,convert
+        mlip-pipeline reset-steps --config configs/Pb_loop.yaml --gen 5 --steps evaluate
     """
     valid = set(STEPS)
     requested = [s.strip() for s in steps.split(",") if s.strip()]
@@ -314,24 +318,38 @@ def reset_steps(
     before = list(state.get("completed_steps", []))
     state["completed_steps"] = [s for s in before if s not in requested]
 
-    if state["completed_steps"] != before:
+    removed = [s for s in before if s in requested]
+    dirty = bool(removed)
+
+    # Always reopen status when evaluate is requested, even if it was never
+    # recorded in completed_steps (covers generations that predate the step).
+    if "evaluate" in requested:
+        state["evaluation_done"] = False
+        state["evaluation_failed"] = False
+        state["evaluation_manifest"] = None
         if state.get("status") == "completed":
             state["status"] = "running"
-        state["error"] = None
-        state["completed_at"] = None
+            state["error"] = None
+            state["completed_at"] = None
+        dirty = True
+
+    if dirty:
+        # Reopen status for any other removed steps too
+        if removed and "evaluate" not in requested and state.get("status") == "completed":
+            state["status"] = "running"
+            state["error"] = None
+            state["completed_at"] = None
 
         if _LABEL_ADJACENT_STEPS.intersection(requested):
             state["label_prepared"] = False
 
-        # Fix #6: clear evaluation state when "evaluate" is reset
-        if "evaluate" in requested:
-            state["evaluation_done"] = False
-            state["evaluation_failed"] = False
-            state["evaluation_manifest"] = None
-
         state_file.write_text(json.dumps(state, indent=2))
-        removed = [s for s in before if s in requested]
-        typer.echo(f"Reset step(s) {removed} for {gen_tag}.")
+        msg_parts = []
+        if removed:
+            msg_parts.append(f"Removed step(s) {removed} from completed_steps.")
+        if "evaluate" in requested:
+            msg_parts.append("Cleared evaluation_done/failed/manifest and reopened status.")
+        typer.echo(f"{gen_tag}: " + " ".join(msg_parts))
     else:
         typer.echo(f"None of {requested} were in completed_steps for {gen_tag} — no changes made.")
 
