@@ -232,7 +232,6 @@ class ConvertResult:
     run_dir: Path
     n_new_cfgs: int
     n_total_cfgs: int
-    # block-count fields — default 0 so old manifests still load cleanly
     prev_block_count: int = 0
     new_block_count: int = 0
     total_block_count: int = 0
@@ -274,6 +273,29 @@ class EvaluationResult:
     eval_dir: Path
     plot_paths: dict = field(default_factory=dict)
     completed_at: str = field(default_factory=_now)
+
+    def save_manifest(self) -> Path:
+        from mlip_pipeline.utils.fs import write_json
+        return write_json(self.eval_dir / "eval_manifest.json", {
+            "step":         "evaluate",
+            "rmse_energy":  self.rmse_energy,
+            "rmse_forces":  self.rmse_forces,
+            "rmse_stress":  self.rmse_stress,
+            "plot_paths":   {k: str(v) for k, v in self.plot_paths.items()},
+            "completed_at": self.completed_at,
+        })
+
+    @classmethod
+    def load_manifest(cls, eval_dir: Path) -> "EvaluationResult":
+        d = json.loads((eval_dir / "eval_manifest.json").read_text())
+        return cls(
+            rmse_energy=d.get("rmse_energy", float("nan")),
+            rmse_forces=d.get("rmse_forces", float("nan")),
+            rmse_stress=d.get("rmse_stress", float("nan")),
+            eval_dir=eval_dir,
+            plot_paths={k: Path(v) for k, v in d.get("plot_paths", {}).items()},
+            completed_at=d.get("completed_at", ""),
+        )
 
 
 # ── Generation state (automation) ──────────────────────────────────────────────

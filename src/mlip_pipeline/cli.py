@@ -17,6 +17,7 @@ from mlip_pipeline.select.runner import run_selection
 from mlip_pipeline.label.runner import run_labeling
 from mlip_pipeline.label.local_runner import run_vasp_local
 from mlip_pipeline.io.dardel import (
+    HpcJobState,
     submit_label_jobs,
     sync_inputs_to_dardel,
     submit_jobs_on_dardel,
@@ -44,6 +45,12 @@ def get_paths(config_path: str) -> tuple[dict, dict]:
     config = load_yaml(config_path)
     resolved_paths = project_paths(config)
     return config, resolved_paths
+
+
+def _remote_dir(cfg: dict, paths: dict) -> str:
+    """Compute the canonical remote label directory from config."""
+    d_cfg = cfg["label"]["dardel"]
+    return f"{d_cfg['remote_root']}/{paths['runs_root'].name}/{cfg['label']['output_subdir']}"
 
 
 # --- PIPELINE STEP COMMANDS ---
@@ -121,30 +128,93 @@ def sync_to_remote(config: Annotated[str, typer.Option(..., help="Path to config
     cfg, paths = get_paths(config)
     label_root = paths["runs_root"] / cfg["label"]["output_subdir"]
     label_result = LabelResult.load_from_dir(label_root)
-
     d_cfg = cfg["label"]["dardel"]
-    remote_dir = f"{d_cfg['remote_root']}/{paths['runs_root'].name}/{cfg['label']['output_subdir']}"
     sync_inputs_to_dardel(
         label_result.label_root,
         d_cfg["user"],
         d_cfg.get("host", "dardel.pdc.kth.se"),
-        remote_dir,
+        _remote_dir(cfg, paths),
     )
 
 
 @app.command("submit-remote")
 def submit_remote(config: Annotated[str, typer.Option(..., help="Path to config yaml")]):
+    """
+    Submit VASP jobs on Dardel and persist the resulting Slurm job IDs to
+    slurm_job_ids.json inside the label directory so that watch-remote can
+    be re-attached independently.
+    """
     cfg, paths = get_paths(config)
+    label_root = paths["runs_root"] / cfg["label"]["output_subdir"]
     d_cfg = cfg["label"]["dardel"]
-    remote_dir = f"{d_cfg['remote_root']}/{paths['runs_root'].name}/{cfg['label']['output_subdir']}"
-    submit_jobs_on_dardel(d_cfg["user"], d_cfg.get("host", "dardel.pdc.kth.se"), remote_dir)
+    job_ids = submit_jobs_on_dardel(
+        d_cfg["user"],
+        d_cfg.get("host", "dardel.pdc.kth.se"),
+        _remote_dir(cfg, paths),
+        local_label_dir=label_root,
+    )
+    print(f"Submitted {len(job_ids)} job(s). IDs saved to {label_root}/slurm_job_ids.json")
 
 
 @app.command("watch-remote")
-def watch_remote(config: Annotated[str, typer.Option(..., help="Path to config yaml")]):
+def watch_remote(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    evaluate: Annotated[bool, typer.Option("--evaluate/--no-evaluate",
+        help="Run evaluation locally while waiting for HPC jobs")] = True,
+):
+    """
+    Watch the Dardel queue for jobs submitted by submit-remote.
+
+    Loads job IDs from slurm_job_ids.json (written by submit-remote) so the
+    watcher is scoped to this pipeline run and can be re-attached after a
+    crash or disconnect.  Uses sacct for terminal-state detection.
+
+    When --evaluate is set (default) the evaluation step runs in a background
+    thread immediately after job IDs are confirmed, making use of the idle
+    local machine while VASP runs on Dardel.
+    """
     cfg, paths = get_paths(config)
+    label_root = paths["runs_root"] / cfg["label"]["output_subdir"]
     d_cfg = cfg["label"]["dardel"]
-    watch_queue(d_cfg["user"], d_cfg.get("host", "dardel.pdc.kth.se"), poll_interval=d_cfg.get("poll_interval", 60))
+    user = d_cfg["user"]
+    host = d_cfg.get("host", "dardel.pdc.kth.se")
+    poll = d_cfg.get("poll_interval", 60)
+
+    # Load persisted job IDs if available; fall back gracefully to unscoped watch.
+    job_ids: list[str] | None = None
+    if HpcJobState.exists(label_root):
+        try:
+            hpc_state = HpcJobState.load(label_root)
+            job_ids = hpc_state.job_ids
+            print(f"Resuming watch for {len(job_ids)} job(s) from {hpc_state.path}")
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"WARNING: could not load slurm_job_ids.json ({exc}) — falling back to user-scoped squeue", err=True)
+    else:
+        typer.echo("WARNING: slurm_job_ids.json not found — falling back to user-scoped squeue. "
+                   "Run submit-remote to persist job IDs next time.", err=True)
+
+    # Optionally run evaluation in a background thread while we wait.
+    eval_thread = None
+    if evaluate:
+        import threading
+        fit_result = build_fit_result(cfg, paths)
+        def _run_eval():
+            print("\n[evaluate]  Starting evaluation in background...")
+            try:
+                result = run_evaluation(cfg, paths, fit_result)
+                print(f"[evaluate]  Done — {len(result.plot_paths)} plot(s) in {result.eval_dir}/")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[evaluate]  WARNING: evaluation failed: {exc}")
+        eval_thread = threading.Thread(target=_run_eval, daemon=True, name="evaluate")
+        eval_thread.start()
+
+    watch_queue(user, host, poll_interval=poll, job_ids=job_ids)
+
+    if eval_thread is not None:
+        print("[evaluate]  Waiting for evaluation thread to finish...")
+        eval_thread.join(timeout=600)
+        if eval_thread.is_alive():
+            print("[evaluate]  WARNING: evaluation thread still running after 10 min — not waiting further.")
 
 
 @app.command("sync-from-remote")
@@ -153,8 +223,12 @@ def sync_from_remote(config: Annotated[str, typer.Option(..., help="Path to conf
     label_root = paths["runs_root"] / cfg["label"]["output_subdir"]
     label_result = LabelResult.load_from_dir(label_root)
     d_cfg = cfg["label"]["dardel"]
-    remote_dir = f"{d_cfg['remote_root']}/{paths['runs_root'].name}/{cfg['label']['output_subdir']}"
-    sync_outputs_from_dardel(label_result.label_root, d_cfg["user"], d_cfg.get("host", "dardel.pdc.kth.se"), remote_dir)
+    sync_outputs_from_dardel(
+        label_result.label_root,
+        d_cfg["user"],
+        d_cfg.get("host", "dardel.pdc.kth.se"),
+        _remote_dir(cfg, paths),
+    )
 
 
 @app.command("convert-cfg")
@@ -177,8 +251,6 @@ def evaluate(config: Annotated[str, typer.Option(..., help="Path to config yaml"
 
 # --- STATE MANAGEMENT ---
 
-# Steps that touch the label directory — resetting any of them must also
-# clear label_prepared so the manifest is regenerated on the next run.
 _LABEL_ADJACENT_STEPS = {"label", "label_local", "label_hpc", "convert"}
 
 
@@ -220,15 +292,12 @@ def reset_steps(
     before = list(state.get("completed_steps", []))
     state["completed_steps"] = [s for s in before if s not in requested]
 
-    # If we reset any steps, the generation is no longer "completed"
     if state["completed_steps"] != before:
         if state.get("status") == "completed":
             state["status"] = "running"
         state["error"] = None
         state["completed_at"] = None
 
-        # Resetting any label-adjacent step must also clear label_prepared so
-        # run_labeling() is called again and label_manifest.json is regenerated.
         if _LABEL_ADJACENT_STEPS.intersection(requested):
             state["label_prepared"] = False
 
