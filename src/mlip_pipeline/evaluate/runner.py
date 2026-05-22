@@ -39,9 +39,11 @@ def run_evaluation(
     resolved_paths: dict,
     fit_result: FitResult,
 ) -> EvaluationResult:
-    fit_cfg   = config["fit"]
-    mlp_cmd   = fit_cfg.get("mlp_command", "mlp")
-    eval_dir  = ensure_dir(fit_result.run_dir / "eval")
+    fit_cfg     = config["fit"]
+    mlp_cmd     = fit_cfg.get("mlp_command", "mlp")
+    mpi_command = fit_cfg.get("mpi_command")        # e.g. "mpirun" or "srun"
+    mpi_np      = fit_cfg.get("mpi_np")             # e.g. 8  (None → let launcher decide)
+    eval_dir    = ensure_dir(fit_result.run_dir / "eval")
     plot_paths: list[Path] = []
     metrics: dict = {}
 
@@ -68,8 +70,18 @@ def run_evaluation(
     predicted_cfg = eval_dir / "predicted_train.cfg"
 
     if train_cfg.exists() and fit_result.model_path.exists():
+        if mpi_command:
+            _np_str = f" -n {mpi_np}" if mpi_np is not None else ""
+            print(f"  [parity]  using MPI: {mpi_command}{_np_str} {mlp_cmd} calculate_efs ...")
         try:
-            run_calculate_efs(mlp_cmd, fit_result.model_path, train_cfg, predicted_cfg)
+            run_calculate_efs(
+                mlp_cmd,
+                fit_result.model_path,
+                train_cfg,
+                predicted_cfg,
+                mpi_command=mpi_command,
+                mpi_np=mpi_np,
+            )
             ref_records  = parse_cfg_efs(train_cfg)
             pred_records = parse_cfg_efs(predicted_cfg)
             parity       = build_parity_data(ref_records, pred_records)
