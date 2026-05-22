@@ -45,9 +45,13 @@ def run_evaluation(
     plot_paths: list[Path] = []
     metrics: dict = {}
 
+    # Resolve log_path: use the value stored on fit_result, or fall back to
+    # run_dir/train.log (present for all generations even without a manifest).
+    log_path: Path | None = fit_result.log_path or (fit_result.run_dir / "train.log")
+
     # ── 1. Loss summary from train.log ────────────────────────────────────────
-    if fit_result.log_path.exists():
-        metrics = parse_train_log(fit_result.log_path)
+    if log_path is not None and log_path.exists():
+        metrics = parse_train_log(log_path)
         if metrics:
             metrics_csv = write_metrics_csv(metrics, eval_dir / "metrics.csv")
             p = plots.plot_summary_metrics(metrics, eval_dir / "loss_summary.png")
@@ -57,7 +61,7 @@ def run_evaluation(
         else:
             print("  [loss]    WARNING: no RMSE summary found in train.log")
     else:
-        print(f"  [loss]    WARNING: train.log not found at {fit_result.log_path}")
+        print(f"  [loss]    WARNING: train.log not found at {log_path}")
 
     # ── 2. Parity plots via calculate_efs ────────────────────────────────────
     train_cfg     = _resolve_train_cfg(config, resolved_paths)
