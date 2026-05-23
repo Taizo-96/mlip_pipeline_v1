@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import typer
+from typing import List, Optional
 from typing_extensions import Annotated
 from pathlib import Path
 
@@ -180,7 +181,6 @@ def watch_remote(
     host = d_cfg.get("host", "dardel.pdc.kth.se")
     poll = d_cfg.get("poll_interval", 60)
 
-    # Load persisted job IDs if available; fall back gracefully to unscoped watch.
     job_ids: list[str] | None = None
     if HpcJobState.exists(label_root):
         try:
@@ -193,7 +193,6 @@ def watch_remote(
         typer.echo("WARNING: slurm_job_ids.json not found — falling back to user-scoped squeue. "
                    "Run submit-remote to persist job IDs next time.", err=True)
 
-    # Optionally run evaluation in a background thread while we wait.
     eval_thread = None
     if evaluate:
         import threading
@@ -243,7 +242,7 @@ def convert_cfg(config: Annotated[str, typer.Option(..., help="Path to config ya
 @app.command("evaluate")
 def evaluate(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
-    gen: Annotated[int, typer.Option("--gen", help="Generation number (uses gen-scoped paths when provided)")] = None,
+    gen: Annotated[Optional[int], typer.Option("--gen", help="Generation number (uses gen-scoped paths when provided)")] = None,
 ):
     """
     Run evaluation for a fit result.
@@ -266,6 +265,133 @@ def evaluate(
     result = run_evaluation(cfg, paths, fit_result)
     for p in result.plot_paths.values():
         print(p)
+
+
+@app.command("regenerate-eval")
+def regenerate_eval(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    gens: Annotated[str, typer.Option(
+        "--gens",
+        help=(
+            "Comma-separated generation numbers to re-evaluate, or 'all' to "
+            "process every gen_NN directory found under runs_root."
+        ),
+    )] = "all",
+    update_state: Annotated[bool, typer.Option(
+        "--update-state/--no-update-state",
+        help="Update state.json evaluation fields after writing the manifest (default: true).",
+    )] = True,
+):
+    """
+    Re-run the evaluate step and write eval_manifest.json for one or more
+    generations.
+
+    Use this to recover eval_manifest.json for generations that were run
+    before the manifest was introduced (e.g. gen_00 from an earlier pipeline
+    version), so that loop-summary plots include their RMSE data.
+
+    The command re-runs calculate_efs + parity plots + gamma histogram, then
+    writes eval_manifest.json.  It does NOT re-run fit or any other step.
+    Existing plot files are overwritten; everything else is untouched.
+
+    Examples
+    --------
+    # Recover just gen 0:
+        mlip-pipeline regenerate-eval --config configs/Pb_loop.yaml --gens 0
+
+    # Recover gens 0, 3 and 7:
+        mlip-pipeline regenerate-eval --config configs/Pb_loop.yaml --gens 0,3,7
+
+    # Re-evaluate every generation found on disk:
+        mlip-pipeline regenerate-eval --config configs/Pb_loop.yaml --gens all
+    """
+    from mlip_pipeline.loop.runner import _config_for_gen
+    from mlip_pipeline.models import GenerationState
+
+    base_cfg = load_yaml(config)
+    # resolve runs_root from gen 0 config (generation-independent path)
+    _cfg0  = _config_for_gen(base_cfg, 0)
+    _paths0 = project_paths(_cfg0)
+    runs_root = _paths0["runs_root"]
+
+    # Determine which generations to process
+    if gens.strip().lower() == "all":
+        gen_dirs = sorted(runs_root.glob("gen_*"))
+        if not gen_dirs:
+            typer.echo("No gen_NN directories found — nothing to do.", err=True)
+            raise typer.Exit(1)
+        gen_list = [int(d.name.split("_")[1]) for d in gen_dirs]
+    else:
+        try:
+            gen_list = [int(g.strip()) for g in gens.split(",") if g.strip()]
+        except ValueError:
+            typer.echo(
+                f"Invalid --gens value: {gens!r}. "
+                "Expected comma-separated integers or 'all'.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    if not gen_list:
+        typer.echo("No generations to process.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Re-evaluating generation(s): {gen_list}")
+
+    n_ok = 0
+    n_fail = 0
+    for gen_num in gen_list:
+        gen_tag = f"gen_{gen_num:02d}"
+        gen_dir = runs_root / gen_tag
+
+        if not gen_dir.exists():
+            typer.echo(f"  {gen_tag}: directory not found — skipping.", err=True)
+            n_fail += 1
+            continue
+
+        try:
+            cfg   = _config_for_gen(base_cfg, gen_num)
+            paths = project_paths(cfg)
+            fit_result = build_fit_result(cfg, paths)
+
+            if not fit_result.model_path.exists():
+                typer.echo(
+                    f"  {gen_tag}: model not found at {fit_result.model_path} — skipping.",
+                    err=True,
+                )
+                n_fail += 1
+                continue
+
+            typer.echo(f"  {gen_tag}: running evaluate ...")
+            result = run_evaluation(cfg, paths, fit_result)
+            typer.echo(
+                f"  {gen_tag}: wrote {result.eval_dir / 'eval_manifest.json'} "
+                f"({len(result.plot_paths)} plot(s))"
+            )
+
+            # Optionally sync the result back into state.json so the loop
+            # runner and plot-loop command both see it immediately.
+            if update_state:
+                state_file = gen_dir / "state.json"
+                if state_file.exists():
+                    state_data = json.loads(state_file.read_text())
+                    state_data["evaluation_done"]     = True
+                    state_data["evaluation_failed"]   = False
+                    state_data["evaluation_manifest"] = str(
+                        result.eval_dir / "eval_manifest.json"
+                    )
+                    state_file.write_text(json.dumps(state_data, indent=2))
+                    typer.echo(f"  {gen_tag}: updated state.json evaluation fields.")
+
+            n_ok += 1
+
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"  {gen_tag}: FAILED — {exc}", err=True)
+            n_fail += 1
+
+    typer.echo(f"\nDone: {n_ok} succeeded, {n_fail} failed.")
+    if n_fail:
+        raise typer.Exit(1)
 
 
 # --- STATE MANAGEMENT ---
@@ -321,8 +447,6 @@ def reset_steps(
     removed = [s for s in before if s in requested]
     dirty = bool(removed)
 
-    # Always reopen status when evaluate is requested, even if it was never
-    # recorded in completed_steps (covers generations that predate the step).
     if "evaluate" in requested:
         state["evaluation_done"] = False
         state["evaluation_failed"] = False
@@ -334,7 +458,6 @@ def reset_steps(
         dirty = True
 
     if dirty:
-        # Reopen status for any other removed steps too
         if removed and "evaluate" not in requested and state.get("status") == "completed":
             state["status"] = "running"
             state["error"] = None
@@ -416,7 +539,7 @@ def run_gen(
 def plot_loop(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
     start_gen: Annotated[int, typer.Option("--start-gen", help="First generation to include")] = 0,
-    end_gen: Annotated[int, typer.Option("--end-gen", help="Last generation to include (inclusive)")] = None,
+    end_gen: Annotated[Optional[int], typer.Option("--end-gen", help="Last generation to include (inclusive)")] = None,
 ):
     """
     Collect per-generation evaluation records and produce loop-summary plots.
@@ -432,9 +555,7 @@ def plot_loop(
     cfg, paths = get_paths(config)
     runs_root = paths["runs_root"]
 
-    # Determine generation range
     if end_gen is None:
-        # Auto-detect: find all gen_NN dirs
         gen_dirs = sorted(runs_root.glob("gen_*"))
         if not gen_dirs:
             typer.echo("No generation directories found.", err=True)
