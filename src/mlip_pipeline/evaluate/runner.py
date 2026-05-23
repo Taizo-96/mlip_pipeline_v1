@@ -105,17 +105,21 @@ def run_evaluation(
     train_cfg     = _resolve_train_cfg(config, resolved_paths)
     predicted_cfg = eval_dir / "predicted_train.cfg"
 
+    # Use resolve_model_path() so legacy lower-cased .almtp files are found
+    # even when fit_manifest.json stored a differently-cased name.
+    model_path = fit_result.resolve_model_path()
+
     ref_records:  list = []
     pred_records: list = []
 
-    if train_cfg.exists() and fit_result.model_path.exists():
+    if train_cfg.exists() and model_path.exists():
         if mpi_command:
             _np_str = f" -n {mpi_np}" if mpi_np is not None else ""
             print(f"  [parity]  using MPI: {mpi_command}{_np_str} {mlp_cmd} calculate_efs ...")
         try:
             run_calculate_efs(
                 mlp_cmd,
-                fit_result.model_path,
+                model_path,
                 train_cfg,
                 predicted_cfg,
                 mpi_command=mpi_command,
@@ -129,8 +133,8 @@ def run_evaluation(
         missing = []
         if not train_cfg.exists():
             missing.append(f"train_cfg ({train_cfg})")
-        if not fit_result.model_path.exists():
-            missing.append(f"model ({fit_result.model_path})")
+        if not model_path.exists():
+            missing.append(f"model ({model_path})")
         print(f"  [parity]  WARNING: missing {', '.join(missing)}, skipping parity")
 
     # -- 3. Gamma data -- collect with provenance and persist -------------

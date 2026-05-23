@@ -83,6 +83,43 @@ class FitResult:
     command: list = field(default_factory=list)
     completed_at: str = field(default_factory=_now)
 
+    def resolve_model_path(self) -> Path:
+        """Return the actual model path on disk.
+
+        The stored ``model_path`` may have wrong capitalisation (e.g.
+        ``Pb16.almtp`` vs the actual ``pb16.almtp``) because legacy
+        ``metadata.json`` files recorded whatever name the old trainer
+        used.  This method:
+
+        1. Returns ``self.model_path`` immediately if it exists.
+        2. Falls back to a case-insensitive glob of ``*.almtp`` in the
+           same directory, preferring the file whose lowercase name
+           matches the stored name's lowercase form.
+        3. If no match, returns ``self.model_path`` unchanged (caller
+           should handle the missing-file case).
+        """
+        if self.model_path.exists():
+            return self.model_path
+
+        parent = self.model_path.parent
+        if not parent.exists():
+            # Try run_dir as the parent directory
+            parent = self.run_dir
+
+        stored_lower = self.model_path.name.lower()
+        candidates = list(parent.glob("*.almtp"))
+
+        # Prefer exact case-insensitive match on the stored filename
+        for c in candidates:
+            if c.name.lower() == stored_lower:
+                return c
+
+        # Accept any .almtp in the directory as a last resort
+        if candidates:
+            return sorted(candidates)[0]
+
+        return self.model_path  # not found — return as-is
+
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.run_dir / "fit_manifest.json", {
@@ -493,19 +530,9 @@ class LoopResult:
     n_gens_completed: int
     n_gens_failed: int
     failed_gens: list[int] = field(default_factory=list)
-    # Per-generation summary rows — one dict per processed generation.
-    # Each row contains the fields returned by collect_loop_records():
-    #   gen, status, n_train_cfgs, n_selected,
-    #   rmse_energy, rmse_forces, rmse_stress,
-    #   mean_gamma, max_gamma,
-    #   replicate_tier, converged_replicate_tier, completed_at
     generations: list[dict] = field(default_factory=list)
     started_at: str = ""
     completed_at: str = field(default_factory=_now)
-
-    # ------------------------------------------------------------------
-    # Factory — build from the list[GenerationState] returned by run_loop
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_states(
@@ -530,8 +557,6 @@ class LoopResult:
             s for s in states if s.status in ("completed", "converged")
         ]
 
-        # Reuse the existing per-gen record collector so there is a single
-        # source of truth for what each row contains.
         gen_rows = collect_loop_records(runs_root, processed_gens)
 
         return cls(
@@ -547,15 +572,10 @@ class LoopResult:
             started_at=started_at,
         )
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
     def save(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
 
         def _clean(v):
-            """Convert NaN/inf to None so the JSON is always valid."""
             import math
             if isinstance(v, float) and not math.isfinite(v):
                 return None
