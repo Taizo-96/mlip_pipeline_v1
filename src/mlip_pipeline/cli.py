@@ -28,7 +28,6 @@ from mlip_pipeline.io.dardel import (
 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
 from mlip_pipeline.evaluate.runner import run_evaluation, replot_evaluation
 
-# Initialize Typer App cleanly
 app = typer.Typer(
     help="MLIP Pipeline Command Line Interface",
     pretty_exceptions_show_locals=False
@@ -49,12 +48,44 @@ def get_paths(config_path: str) -> tuple[dict, dict]:
 
 
 def _remote_dir(cfg: dict, paths: dict) -> str:
-    """Compute the canonical remote label directory from config."""
     d_cfg = cfg["label"]["dardel"]
     return f"{d_cfg['remote_root']}/{paths['runs_root'].name}/{cfg['label']['output_subdir']}"
 
 
-# --- PIPELINE STEP COMMANDS ---
+def _resolve_gens(runs_root: Path, gens_str: str, require_cache: bool = False) -> list[int]:
+    """Parse --gens value into a sorted list of generation numbers.
+
+    'all'              → every gen_NN directory (optionally filtered to those
+                         that have a cached predicted_train.cfg when
+                         require_cache=True)
+    '0,3,7'           → explicit list
+    """
+    if gens_str.strip().lower() == "all":
+        gen_dirs = sorted(runs_root.glob("gen_*"))
+        if require_cache:
+            gen_dirs = [
+                d for d in gen_dirs
+                if (d / "fit" / "eval" / "predicted_train.cfg").exists()
+            ]
+        if not gen_dirs:
+            return []
+        return [int(d.name.split("_")[1]) for d in gen_dirs]
+    try:
+        return sorted({int(g.strip()) for g in gens_str.split(",") if g.strip()})
+    except ValueError:
+        raise typer.BadParameter(f"Invalid --gens value: {gens_str!r}. Use comma-separated integers or 'all'.")
+
+
+def _runs_root_from_config(config_path: str) -> Path:
+    from mlip_pipeline.loop.runner import _config_for_gen
+    base_cfg = load_yaml(config_path)
+    cfg0 = _config_for_gen(base_cfg, 0)
+    return project_paths(cfg0)["runs_root"]
+
+
+# ---------------------------------------------------------------------------
+# PIPELINE STEP COMMANDS
+# ---------------------------------------------------------------------------
 
 @app.command("download-structures")
 def download_structures(config: Annotated[str, typer.Option(..., help="Path to config yaml")]):
@@ -179,7 +210,7 @@ def watch_remote(
             hpc_state = HpcJobState.load(label_root)
             job_ids = hpc_state.job_ids
             print(f"Resuming watch for {len(job_ids)} job(s) from {hpc_state.path}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             typer.echo(f"WARNING: could not load slurm_job_ids.json ({exc}) — falling back to user-scoped squeue", err=True)
     else:
         typer.echo("WARNING: slurm_job_ids.json not found — falling back to user-scoped squeue. "
@@ -194,7 +225,7 @@ def watch_remote(
             try:
                 result = run_evaluation(cfg, paths, fit_result)
                 print(f"[evaluate]  Done — {len(result.plot_paths)} plot(s) in {result.eval_dir}/")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 print(f"[evaluate]  WARNING: evaluation failed: {exc}")
         eval_thread = threading.Thread(target=_run_eval, daemon=True, name="evaluate")
         eval_thread.start()
@@ -231,32 +262,145 @@ def convert_cfg(config: Annotated[str, typer.Option(..., help="Path to config ya
     print(merged)
 
 
+# ---------------------------------------------------------------------------
+# EVALUATION COMMANDS
+#
+# Two commands, clear separation of concerns:
+#
+#   evaluate   — run mlp calculate_efs (expensive MTP inference) + plot.
+#                Skips inference if predicted_train.cfg already exists,
+#                unless --force is given.
+#                Accepts --gen N (single gen) or --gens 0,3,all (multi).
+#
+#   plot-eval  — regenerate plots only from an existing predicted_train.cfg.
+#                Fast; never re-runs calculate_efs.
+#                Accepts --gens 0,3,all.
+# ---------------------------------------------------------------------------
+
 @app.command("evaluate")
 def evaluate(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
-    gen: Annotated[Optional[int], typer.Option("--gen", help="Generation number (uses gen-scoped paths when provided)")] = None,
+    gen: Annotated[Optional[int], typer.Option(
+        "--gen",
+        help="Single generation number. Mutually exclusive with --gens.",
+    )] = None,
+    gens: Annotated[str, typer.Option(
+        "--gens",
+        help="Comma-separated generation numbers or 'all'. Mutually exclusive with --gen.",
+    )] = "",
+    force: Annotated[bool, typer.Option(
+        "--force",
+        help="Re-run mlp calculate_efs even when predicted_train.cfg already exists.",
+    )] = False,
+    update_state: Annotated[bool, typer.Option(
+        "--update-state/--no-update-state",
+        help="Update state.json evaluation fields after completion (default: true).",
+    )] = True,
 ):
     """
-    Run the full evaluation for a fit result (calls mlp calculate_efs).
+    Run evaluation (mlp calculate_efs + plots) for one or more generations.
 
-    When --gen is provided, paths are scoped to that generation directory.
-    To redo plots without re-running calculate_efs, use 'replot-eval' instead.
+    By default, calculate_efs is skipped when predicted_train.cfg already
+    exists — pass --force to always re-run inference.
+
+    Examples
+    --------
+    # Single gen (current-loop style):
+        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gen 5
+
+    # All gens (replaces old regenerate-eval):
+        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens all
+
+    # Force-rerun even if cache exists:
+        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens all --force
+
+    # Subset:
+        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens 0,3,7
     """
+    if gen is not None and gens:
+        raise typer.BadParameter("--gen and --gens are mutually exclusive.")
+
+    from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
+    from mlip_pipeline.models import GenerationState
+
+    base_cfg = load_yaml(config)
+
+    # Build generation list
     if gen is not None:
-        from mlip_pipeline.loop.runner import _config_for_gen
-        base_cfg = load_yaml(config)
-        cfg = _config_for_gen(base_cfg, gen)
-        paths = project_paths(cfg)
+        gen_list = [gen]
+    elif gens:
+        runs_root = _runs_root_from_config(config)
+        gen_list = _resolve_gens(runs_root, gens)
     else:
+        # No --gen or --gens: behave like old single-gen `evaluate` using
+        # non-loop paths (backward compat for non-loop workflows).
         cfg, paths = get_paths(config)
-    fit_result = build_fit_result(cfg, paths)
-    result = run_evaluation(cfg, paths, fit_result)
-    for p in result.plot_paths.values():
-        print(p)
+        fit_result = build_fit_result(cfg, paths)
+        if force:
+            predicted = paths["runs_root"] / cfg["fit"]["output_subdir"] / "eval" / "predicted_train.cfg"
+            predicted.unlink(missing_ok=True)
+        result = run_evaluation(cfg, paths, fit_result)
+        for p in result.plot_paths.values():
+            print(p)
+        return
+
+    if not gen_list:
+        typer.echo("No generations found to evaluate.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Evaluating generation(s): {gen_list}{' [--force: cache cleared]' if force else ''}")
+
+    n_ok = n_fail = 0
+    for gen_num in gen_list:
+        gen_tag = f"gen_{gen_num:02d}"
+        cfg = _config_for_gen(base_cfg, gen_num)
+        paths = project_paths(cfg)
+        paths = {**paths, **gen_paths(cfg, paths)}
+        gen_dir = paths["runs_root"] / gen_tag
+
+        if not gen_dir.exists():
+            typer.echo(f"  {gen_tag}: directory not found — skipping.", err=True)
+            n_fail += 1
+            continue
+
+        try:
+            state_file = gen_dir / "state.json"
+            state = GenerationState.load(gen_dir) if state_file.exists() else GenerationState.init(str(gen_num), gen_dir)
+
+            try:
+                fit_result = _resolve_fit_result(cfg, paths, state)
+            except RuntimeError as e:
+                typer.echo(f"  {gen_tag}: {e} — skipping.", err=True)
+                n_fail += 1
+                continue
+
+            if force:
+                predicted = gen_dir / "fit" / "eval" / "predicted_train.cfg"
+                predicted.unlink(missing_ok=True)
+
+            typer.echo(f"  {gen_tag}: running evaluate (model={fit_result.model_path}) ...")
+            result = run_evaluation(cfg, paths, fit_result)
+            typer.echo(f"  {gen_tag}: {len(result.plot_paths)} plot(s) → {result.eval_dir}/")
+
+            if update_state and state_file.exists():
+                state_data = json.loads(state_file.read_text())
+                state_data["evaluation_done"]     = True
+                state_data["evaluation_failed"]   = False
+                state_data["evaluation_manifest"] = str(result.eval_dir / "eval_manifest.json")
+                state_file.write_text(json.dumps(state_data, indent=2))
+
+            n_ok += 1
+        except Exception as exc:
+            typer.echo(f"  {gen_tag}: FAILED — {exc}", err=True)
+            n_fail += 1
+
+    typer.echo(f"\nDone: {n_ok} succeeded, {n_fail} failed.")
+    if n_fail:
+        raise typer.Exit(1)
 
 
-@app.command("replot-eval")
-def replot_eval(
+@app.command("plot-eval")
+def plot_eval(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
     gens: Annotated[str, typer.Option(
         "--gens",
@@ -273,58 +417,38 @@ def replot_eval(
     """
     Regenerate evaluation plots from cached data WITHOUT re-running mlp calculate_efs.
 
-    Use this to:
-      - Quickly redo plots after changing plot styles in plots.py
-      - Add new plot types (just add them to _make_plots_and_manifest and rerun this)
-      - Fix a broken or missing PNG without paying the MTP inference cost
+    Use this after changing plot styles, adding new plot types, or fixing a
+    missing PNG — without paying the MTP inference cost.
 
-    Requires that 'evaluate' (or 'regenerate-eval') has been run at least once
-    so that predicted_train.cfg exists in gen_NN/fit/eval/.
+    Requires that 'evaluate' has been run at least once so that
+    predicted_train.cfg exists in gen_NN/fit/eval/.
 
     Examples
     --------
-    # Replot a single generation:
-        mlip-pipeline replot-eval --config configs/Pb_loop.yaml --gens 5
+    # Replot all gens that have cached data:
+        mlip-pipeline plot-eval --config configs/Pb_loop.yaml
 
-    # Replot several:
-        mlip-pipeline replot-eval --config configs/Pb_loop.yaml --gens 0,3,7
-
-    # Replot everything that has cached data:
-        mlip-pipeline replot-eval --config configs/Pb_loop.yaml --gens all
+    # Replot a subset:
+        mlip-pipeline plot-eval --config configs/Pb_loop.yaml --gens 0,3,7
     """
     from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
     from mlip_pipeline.models import GenerationState
 
     base_cfg = load_yaml(config)
-    _cfg0    = _config_for_gen(base_cfg, 0)
-    _paths0  = project_paths(_cfg0)
-    runs_root = _paths0["runs_root"]
+    runs_root = _runs_root_from_config(config)
+    gen_list = _resolve_gens(runs_root, gens, require_cache=True)
 
-    if gens.strip().lower() == "all":
-        # Only include gens that actually have a cached predicted_train.cfg
-        gen_dirs = sorted(runs_root.glob("gen_*"))
-        gen_list = [
-            int(d.name.split("_")[1]) for d in gen_dirs
-            if (d / "fit" / "eval" / "predicted_train.cfg").exists()
-        ]
-        if not gen_list:
-            typer.echo(
-                "No gen_NN/fit/eval/predicted_train.cfg files found.\n"
-                "Run 'evaluate' or 'regenerate-eval' first.",
-                err=True,
-            )
-            raise typer.Exit(1)
-    else:
-        try:
-            gen_list = [int(g.strip()) for g in gens.split(",") if g.strip()]
-        except ValueError:
-            typer.echo(f"Invalid --gens value: {gens!r}.", err=True)
-            raise typer.Exit(1)
+    if not gen_list:
+        typer.echo(
+            "No gen_NN/fit/eval/predicted_train.cfg files found.\n"
+            "Run 'evaluate' first.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     typer.echo(f"Replotting generation(s): {gen_list}")
 
-    n_ok = 0
-    n_fail = 0
+    n_ok = n_fail = 0
     for gen_num in gen_list:
         gen_tag = f"gen_{gen_num:02d}"
         gen_dir = runs_root / gen_tag
@@ -341,16 +465,12 @@ def replot_eval(
 
             state_file = gen_dir / "state.json"
             state = GenerationState.load(gen_dir) if state_file.exists() else GenerationState.init(str(gen_num), gen_dir)
-            if not state_file.exists():
-                state_file.unlink(missing_ok=True)
 
             fit_result = _resolve_fit_result(cfg, paths, state)
 
             typer.echo(f"  {gen_tag}: replotting from cache ...")
             result = replot_evaluation(cfg, paths, fit_result)
-            typer.echo(
-                f"  {gen_tag}: wrote {len(result.plot_paths)} plot(s) to {result.eval_dir}/"
-            )
+            typer.echo(f"  {gen_tag}: {len(result.plot_paths)} plot(s) → {result.eval_dir}/")
 
             if update_state and state_file.exists():
                 state_data = json.loads(state_file.read_text())
@@ -358,11 +478,10 @@ def replot_eval(
                 state_file.write_text(json.dumps(state_data, indent=2))
 
             n_ok += 1
-
         except FileNotFoundError as exc:
             typer.echo(f"  {gen_tag}: {exc} — skipping.", err=True)
             n_fail += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             typer.echo(f"  {gen_tag}: FAILED — {exc}", err=True)
             n_fail += 1
 
@@ -371,113 +490,9 @@ def replot_eval(
         raise typer.Exit(1)
 
 
-@app.command("regenerate-eval")
-def regenerate_eval(
-    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
-    gens: Annotated[str, typer.Option(
-        "--gens",
-        help=(
-            "Comma-separated generation numbers to re-evaluate, or 'all' to "
-            "process every gen_NN directory found under runs_root."
-        ),
-    )] = "all",
-    update_state: Annotated[bool, typer.Option(
-        "--update-state/--no-update-state",
-        help="Update state.json evaluation fields after writing the manifest (default: true).",
-    )] = True,
-):
-    """
-    Re-run the full evaluate step (including mlp calculate_efs) and write
-    eval_manifest.json for one or more generations.
-
-    To redo plots only (no MTP inference), use 'replot-eval' instead.
-    """
-    from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
-    from mlip_pipeline.models import GenerationState
-
-    base_cfg = load_yaml(config)
-    _cfg0    = _config_for_gen(base_cfg, 0)
-    _paths0  = project_paths(_cfg0)
-    runs_root = _paths0["runs_root"]
-
-    if gens.strip().lower() == "all":
-        gen_dirs = sorted(runs_root.glob("gen_*"))
-        if not gen_dirs:
-            typer.echo("No gen_NN directories found — nothing to do.", err=True)
-            raise typer.Exit(1)
-        gen_list = [int(d.name.split("_")[1]) for d in gen_dirs]
-    else:
-        try:
-            gen_list = [int(g.strip()) for g in gens.split(",") if g.strip()]
-        except ValueError:
-            typer.echo(f"Invalid --gens value: {gens!r}.", err=True)
-            raise typer.Exit(1)
-
-    if not gen_list:
-        typer.echo("No generations to process.", err=True)
-        raise typer.Exit(1)
-
-    typer.echo(f"Re-evaluating generation(s): {gen_list}")
-
-    n_ok = 0
-    n_fail = 0
-    for gen_num in gen_list:
-        gen_tag = f"gen_{gen_num:02d}"
-        gen_dir = runs_root / gen_tag
-
-        if not gen_dir.exists():
-            typer.echo(f"  {gen_tag}: directory not found — skipping.", err=True)
-            n_fail += 1
-            continue
-
-        try:
-            cfg   = _config_for_gen(base_cfg, gen_num)
-            paths = project_paths(cfg)
-            paths = {**paths, **gen_paths(cfg, paths)}
-
-            state_file = gen_dir / "state.json"
-            if state_file.exists():
-                state = GenerationState.load(gen_dir)
-            else:
-                state = GenerationState.init(str(gen_num), gen_dir)
-                state_file.unlink(missing_ok=True)
-
-            try:
-                fit_result = _resolve_fit_result(cfg, paths, state)
-            except RuntimeError as e:
-                typer.echo(f"  {gen_tag}: {e} — skipping.", err=True)
-                n_fail += 1
-                continue
-
-            typer.echo(f"  {gen_tag}: running evaluate (model={fit_result.model_path}) ...")
-            result = run_evaluation(cfg, paths, fit_result)
-            typer.echo(
-                f"  {gen_tag}: wrote {result.eval_dir / 'eval_manifest.json'} "
-                f"({len(result.plot_paths)} plot(s))"
-            )
-
-            if update_state and state_file.exists():
-                state_data = json.loads(state_file.read_text())
-                state_data["evaluation_done"]     = True
-                state_data["evaluation_failed"]   = False
-                state_data["evaluation_manifest"] = str(
-                    result.eval_dir / "eval_manifest.json"
-                )
-                state_file.write_text(json.dumps(state_data, indent=2))
-                typer.echo(f"  {gen_tag}: updated state.json evaluation fields.")
-
-            n_ok += 1
-
-        except Exception as exc:  # noqa: BLE001
-            typer.echo(f"  {gen_tag}: FAILED — {exc}", err=True)
-            n_fail += 1
-
-    typer.echo(f"\nDone: {n_ok} succeeded, {n_fail} failed.")
-    if n_fail:
-        raise typer.Exit(1)
-
-
-# --- STATE MANAGEMENT ---
+# ---------------------------------------------------------------------------
+# STATE MANAGEMENT
+# ---------------------------------------------------------------------------
 
 _LABEL_ADJACENT_STEPS = {"label", "label_local", "label_hpc", "convert"}
 
@@ -563,7 +578,9 @@ def show_state(
     typer.echo(state_file.read_text())
 
 
-# --- ACTIVE LEARNING LOOPS ---
+# ---------------------------------------------------------------------------
+# ACTIVE LEARNING LOOPS
+# ---------------------------------------------------------------------------
 
 @app.command("run-loop")
 def run_loop(
