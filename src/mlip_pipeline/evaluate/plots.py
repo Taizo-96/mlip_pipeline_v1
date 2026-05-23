@@ -21,11 +21,12 @@ _TEAL   = "#01696f"
 _BROWN  = "#964219"
 _PURPLE = "#7a39bb"
 
-# Distinct colours for multi-gen comparison panels (cycles if > 8 gens)
-_GEN_COLORS = [
-    "#01696f", "#964219", "#7a39bb", "#a13544",
-    "#006494", "#437a22", "#da7101", "#d19900",
-]
+# Fixed colour per quantity — same as single-gen parity plots
+_QUANTITY_COLOR = {
+    "energy": _TEAL,
+    "forces": _BROWN,
+    "stress": _PURPLE,
+}
 
 
 def plot_summary_metrics(metrics: dict, dest_dir: Path) -> list[Path]:
@@ -138,11 +139,14 @@ def plot_parity_comparison(
     """
     Produce a side-by-side comparison parity plot for each requested quantity.
 
+    All panels for a given quantity share the same colour as the single-gen
+    parity plots (teal=energy, brown=forces, purple=stress), so the only
+    visual difference between columns is the gen tag and RMSE in the title.
+
     Parameters
     ----------
     gen_parities
         List of (gen_number, parity_dict) pairs in display order.
-        parity_dict must be the output of build_parity_data().
     quantities
         Subset of ['energy', 'forces', 'stress'] to plot.
     dest_dir
@@ -155,11 +159,9 @@ def plot_parity_comparison(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    n = len(gen_parities)
-    if n == 0:
+    if not gen_parities:
         return []
 
-    # Map quantity name → (ref_key, pred_key, label, units)
     _QUANTITY_SPEC = {
         "energy": ("energies_ref", "energies_pred", "energy/atom", "eV"),
         "forces": ("forces_ref",   "forces_pred",   "forces",      "eV/Å"),
@@ -173,8 +175,8 @@ def plot_parity_comparison(
             if qty not in _QUANTITY_SPEC:
                 continue
             ref_key, pred_key, label, units = _QUANTITY_SPEC[qty]
+            color = _QUANTITY_COLOR[qty]  # fixed per quantity, same as single-gen plots
 
-            # Filter to gens that actually have data for this quantity
             valid = [
                 (gn, p) for gn, p in gen_parities
                 if p.get(ref_key) and len(p[ref_key]) > 0
@@ -190,23 +192,16 @@ def plot_parity_comparison(
             )
 
             for col, (gen_num, parity) in enumerate(valid):
-                ax    = axes[0][col]
-                color = _GEN_COLORS[col % len(_GEN_COLORS)]
+                ax      = axes[0][col]
                 gen_tag = f"gen_{gen_num:02d}"
-                _parity_panel(
-                    ax,
-                    parity[ref_key],
-                    parity[pred_key],
-                    label,
-                    units,
-                    color,
-                    gen_tag=gen_tag,
-                )
+                _parity_panel(ax, parity[ref_key], parity[pred_key],
+                              label, units, color, gen_tag=gen_tag)
 
             gen_range = "_".join(f"{gn:02d}" for gn, _ in valid)
             fname = f"parity_compare_{qty}_gens{gen_range}.png"
             fig.suptitle(
-                f"Parity comparison — {label}  ({', '.join(f'gen_{gn:02d}' for gn, _ in valid)})",
+                f"Parity comparison — {label}  "
+                f"({', '.join(f'gen_{gn:02d}' for gn, _ in valid)})",
                 fontsize=12,
                 y=1.01,
             )
