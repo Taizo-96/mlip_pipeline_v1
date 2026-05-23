@@ -80,7 +80,6 @@ def run_evaluation(
     mpi_command = fit_cfg.get("mpi_command")
     mpi_np      = fit_cfg.get("mpi_np")
     eval_dir    = ensure_dir(fit_result.run_dir / "eval")
-    plot_paths: list[Path] = []
     metrics: dict = {}
 
     log_path: Path | None = fit_result.log_path or (fit_result.run_dir / "train.log")
@@ -170,7 +169,7 @@ def replot_evaluation(
             "Run 'evaluate' (or 'regenerate-eval') first to generate it."
         )
 
-    # ── 1. Read cached metrics ─────────────────────────────────────────────
+    # ── 1. Read cached metrics ────────────────────────────────────────────
     metrics: dict = {}
     if metrics_csv.exists():
         import csv
@@ -227,14 +226,14 @@ def _make_plots_and_manifest(
     """
     plot_paths: list[Path] = []
 
-    # ── Loss summary bar chart ────────────────────────────────────────────
+    # ── Per-quantity loss bar charts ──────────────────────────────────────────
     if metrics:
-        p = plots.plot_summary_metrics(metrics, eval_dir / "loss_summary.png")
-        plot_paths.append(p)
+        written = plots.plot_summary_metrics(metrics, eval_dir)
+        plot_paths.extend(written)
         for k, v in metrics.items():
             print(f"  [loss]    {k} = {v:.6g}")
     else:
-        print("  [loss]    WARNING: no metrics available for loss_summary plot")
+        print("  [loss]    WARNING: no metrics available for loss plots")
 
     # ── Parity plots ──────────────────────────────────────────────────────
     if ref_records and pred_records:
