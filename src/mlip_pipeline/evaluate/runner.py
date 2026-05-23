@@ -17,6 +17,40 @@ from mlip_pipeline.evaluate.gamma import (
 from mlip_pipeline.evaluate import plots
 
 
+# ---------------------------------------------------------------------------
+# RMSE helpers
+# ---------------------------------------------------------------------------
+
+def _rmse(ref: list[float], pred: list[float]) -> float:
+    """Root-mean-square error between two equal-length float lists."""
+    if not ref or not pred:
+        return float("nan")
+    n = min(len(ref), len(pred))
+    return math.sqrt(sum((r - p) ** 2 for r, p in zip(ref[:n], pred[:n])) / n)
+
+
+def _parity_rmse(parity: dict) -> tuple[float, float, float]:
+    """
+    Compute (rmse_energy, rmse_forces, rmse_stress) from a parity dict
+    produced by build_parity_data().
+
+    These are computed directly from DFT vs MTP residuals on the full
+    training set -- the authoritative RMSE values for loop-summary plots.
+    """
+    rmse_e = _rmse(parity["energies_ref"], parity["energies_pred"])
+    rmse_f = _rmse(parity["forces_ref"], parity["forces_pred"])
+    rmse_s = (
+        _rmse(parity["stress_ref"], parity["stress_pred"])
+        if parity.get("stress_ref")
+        else float("nan")
+    )
+    return rmse_e, rmse_f, rmse_s
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
 def _resolve_train_cfg(config: dict, resolved_paths: dict) -> Path:
     """Resolve training cfg with the same fallback chain as trainer.py."""
     fit_cfg = config["fit"]
@@ -78,7 +112,7 @@ def run_evaluation(
 
     Persisted to <fit_dir>/eval/:
       predicted_train.cfg   -- MTP predictions (expensive, needed for replot)
-      metrics.csv           -- RMSE scalars with canonical short keys
+      metrics.csv           -- RMSE scalars (parity-derived, canonical)
       gamma_grades.json     -- ALL raw gamma values with source provenance
       eval_manifest.json    -- typed summary + path to gamma_grades.json
     """
@@ -87,16 +121,14 @@ def run_evaluation(
     mpi_command = fit_cfg.get("mpi_command")
     mpi_np      = fit_cfg.get("mpi_np")
     eval_dir    = ensure_dir(fit_result.run_dir / "eval")
-    metrics: dict = {}
 
     log_path: Path | None = fit_result.log_path or (fit_result.run_dir / "train.log")
 
-    # -- 1. Loss summary from train.log -----------------------------------
+    # -- 1. Loss summary from train.log (kept as diagnostic _log values) --
+    log_metrics: dict = {}
     if log_path is not None and log_path.exists():
-        metrics = parse_train_log(log_path)
-        if metrics:
-            write_metrics_csv(metrics, eval_dir / "metrics.csv")
-        else:
+        log_metrics = parse_train_log(log_path)
+        if not log_metrics:
             print("  [loss]    WARNING: no RMSE summary found in train.log")
     else:
         print(f"  [loss]    WARNING: train.log not found at {log_path}")
@@ -105,8 +137,6 @@ def run_evaluation(
     train_cfg     = _resolve_train_cfg(config, resolved_paths)
     predicted_cfg = eval_dir / "predicted_train.cfg"
 
-    # Use resolve_model_path() so legacy lower-cased .almtp files are found
-    # even when fit_manifest.json stored a differently-cased name.
     model_path = fit_result.resolve_model_path()
 
     ref_records:  list = []
@@ -151,7 +181,7 @@ def run_evaluation(
     # -- 4. Plots + manifest ----------------------------------------------
     return _make_plots_and_manifest(
         eval_dir=eval_dir,
-        metrics=metrics,
+        log_metrics=log_metrics,
         ref_records=ref_records,
         pred_records=pred_records,
         grade_records=grade_records,
@@ -179,7 +209,6 @@ def replot_evaluation(
     """
     eval_dir      = fit_result.run_dir / "eval"
     predicted_cfg = eval_dir / "predicted_train.cfg"
-    metrics_csv   = eval_dir / "metrics.csv"
     train_cfg     = _resolve_train_cfg(config, resolved_paths)
 
     if not predicted_cfg.exists():
@@ -188,21 +217,22 @@ def replot_evaluation(
             "Run 'evaluate' first to generate it."
         )
 
-    # -- 1. Read cached metrics (short keys round-trip correctly now) ------
-    metrics: dict = {}
+    # -- 1. Read log metrics for diagnostic reference only ----------------
+    log_metrics: dict = {}
+    metrics_csv = eval_dir / "metrics.csv"
     if metrics_csv.exists():
         import csv
         with metrics_csv.open() as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    metrics[row["metric"]] = float(row["value"])
+                    log_metrics[row["metric"]] = float(row["value"])
                 except (KeyError, ValueError):
                     pass
     else:
         log_path = fit_result.log_path or (fit_result.run_dir / "train.log")
         if log_path and log_path.exists():
-            metrics = parse_train_log(log_path)
+            log_metrics = parse_train_log(log_path)
 
     # -- 2. Parse cached parity data --------------------------------------
     ref_records  = parse_cfg_efs(train_cfg)
@@ -211,7 +241,7 @@ def replot_evaluation(
 
     # -- 3. Gamma: prefer cached json, fall back to live cfg parsing ------
     cached_grades_path = eval_dir / GAMMA_GRADES_FILENAME
-    grade_records      = load_grades_json(cached_grades_path)   # [] if absent
+    grade_records      = load_grades_json(cached_grades_path)
     grades_path: Path | None = cached_grades_path if grade_records else None
 
     if not grade_records:
@@ -226,7 +256,7 @@ def replot_evaluation(
     # -- 4. Plots + manifest ----------------------------------------------
     return _make_plots_and_manifest(
         eval_dir=eval_dir,
-        metrics=metrics,
+        log_metrics=log_metrics,
         ref_records=ref_records,
         pred_records=pred_records,
         grade_records=grade_records,
@@ -241,7 +271,7 @@ def replot_evaluation(
 
 def _make_plots_and_manifest(
     eval_dir: Path,
-    metrics: dict,
+    log_metrics: dict,
     ref_records: list,
     pred_records: list,
     grade_records: list[dict],
@@ -251,8 +281,45 @@ def _make_plots_and_manifest(
     """
     Given already-loaded data, produce all PNG plots, write eval_manifest.json,
     and return an EvaluationResult.
+
+    RMSE values written to metrics.csv and stored in EvaluationResult are
+    computed from parity residuals (DFT vs MTP on the full training set).
+    Log-parsed values are stored alongside with a _log suffix for diagnostics.
     """
     plot_paths: list[Path] = []
+
+    # -- Parity plots + parity-derived RMSE (canonical) -------------------
+    rmse_e = float("nan")
+    rmse_f = float("nan")
+    rmse_s = float("nan")
+
+    if ref_records and pred_records:
+        parity       = build_parity_data(ref_records, pred_records)
+        parity_paths = plots.plot_parity(parity, eval_dir)
+        plot_paths.extend(parity_paths)
+        print(f"  [parity]  {len(ref_records)} configs -> {[p.name for p in parity_paths]}")
+
+        rmse_e, rmse_f, rmse_s = _parity_rmse(parity)
+        print(
+            f"  [rmse]    parity-derived: "
+            f"E={rmse_e:.6g}  F={rmse_f:.6g}  S={rmse_s:.6g}"
+        )
+    else:
+        print("  [parity]  WARNING: no parity data available -- skipping parity plots")
+        # Fall back to log values if parity is unavailable
+        rmse_e = log_metrics.get("rmse_e", float("nan"))
+        rmse_f = log_metrics.get("rmse_f", float("nan"))
+        rmse_s = log_metrics.get("rmse_s", float("nan"))
+
+    # -- Build canonical metrics dict (parity values are primary) ---------
+    metrics: dict = {
+        "rmse_e": rmse_e,
+        "rmse_f": rmse_f,
+        "rmse_s": rmse_s,
+    }
+    # Append log values as diagnostic reference
+    for k, v in log_metrics.items():
+        metrics.setdefault(f"{k}_log", v)
 
     # -- Per-quantity loss bar charts -------------------------------------
     if metrics:
@@ -263,14 +330,8 @@ def _make_plots_and_manifest(
     else:
         print("  [loss]    WARNING: no metrics available for loss plots")
 
-    # -- Parity plots -----------------------------------------------------
-    if ref_records and pred_records:
-        parity       = build_parity_data(ref_records, pred_records)
-        parity_paths = plots.plot_parity(parity, eval_dir)
-        plot_paths.extend(parity_paths)
-        print(f"  [parity]  {len(ref_records)} configs -> {[p.name for p in parity_paths]}")
-    else:
-        print("  [parity]  WARNING: no parity data available -- skipping parity plots")
+    # Write canonical metrics to CSV
+    write_metrics_csv(metrics, eval_dir / "metrics.csv")
 
     # -- Gamma histogram --------------------------------------------------
     mean_gamma       = float("nan")
@@ -310,9 +371,9 @@ def _make_plots_and_manifest(
     print(f"\nEvaluation complete -- {len(plot_paths)} plot(s) in {eval_dir}/")
 
     result = EvaluationResult(
-        rmse_energy=metrics.get("rmse_e", float("nan")),
-        rmse_forces=metrics.get("rmse_f", float("nan")),
-        rmse_stress=metrics.get("rmse_s", float("nan")),
+        rmse_energy=rmse_e,
+        rmse_forces=rmse_f,
+        rmse_stress=rmse_s,
         mean_gamma=mean_gamma,
         max_gamma=max_gamma,
         frac_above_save=frac_above_save,
