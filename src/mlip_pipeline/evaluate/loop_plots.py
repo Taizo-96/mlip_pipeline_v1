@@ -196,8 +196,8 @@ def _plot_selected(records: list[dict], dest: Path) -> Path:
     with plt.rc_context(_STYLE):
         fig, ax = plt.subplots(figsize=(6, 4))
         if gens:
+            # Only the bars are plotted now
             ax.bar(gens, vals, color=_BROWN, alpha=0.8, width=0.6)
-            ax.plot(gens, vals, "-o", color=_BROWN, linewidth=1.4, markersize=5)
         ax.set_xlabel("Generation")
         ax.set_ylabel("Selected structures")
         ax.set_title("New Structures Selected vs Generation")
