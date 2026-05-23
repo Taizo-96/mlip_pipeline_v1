@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
 
 from mlip_pipeline.models import FitResult
 from mlip_pipeline.fit.mlip3 import build_mlip_train_command
-from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists, write_json
+from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists
 from mlip_pipeline.utils.shell import run_command
 
 
@@ -87,23 +86,10 @@ def train_potential(config: dict, resolved_paths: dict) -> FitResult:
         log_path=log_path,
         train_cfg=train_cfg,
         n_train_cfgs=n_cfgs,
+        init_template=init_template,
+        mlp_command=mlp_command,
+        mpi_prefix=mpi_prefix,
+        command=command,
     )
     result.save_manifest()
-
-    # Keep metadata.json for extra fields not in the dataclass manifest
-    write_json(
-        run_dir / "metadata.json",
-        {
-            "stage":         "fit",
-            "timestamp":     datetime.utcnow().isoformat() + "Z",
-            "mlp_command":   mlp_command,
-            "mpi_prefix":    mpi_prefix,
-            "init_template": str(init_template),
-            "train_cfg":     str(train_cfg),
-            "n_train_cfgs":  n_cfgs,
-            "run_dir":       str(run_dir),
-            "result_model":  str(model_path),
-            "command":       command,
-        },
-    )
     return result

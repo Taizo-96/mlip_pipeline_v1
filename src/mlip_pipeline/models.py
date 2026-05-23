@@ -76,16 +76,30 @@ class FitResult:
     log_path: Optional[Path] = None
     train_cfg: Optional[Path] = None
     n_train_cfgs: int = 0
+    # Reproducibility fields (previously only in metadata.json)
+    init_template: Optional[Path] = None
+    mlp_command: str = "mlp"
+    mpi_prefix: Optional[str] = None
+    command: list = field(default_factory=list)
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.run_dir / "fit_manifest.json", {
             "step":          "fit",
+            # ── outputs ──────────────────────────────────────
+            "run_dir":       str(self.run_dir),
             "model_path":    str(self.model_path),
             "log_path":      str(self.log_path) if self.log_path else None,
+            # ── inputs ───────────────────────────────────────
             "train_cfg":     str(self.train_cfg) if self.train_cfg else None,
             "n_train_cfgs":  self.n_train_cfgs,
+            "init_template": str(self.init_template) if self.init_template else None,
+            # ── execution ────────────────────────────────────
+            "mlp_command":   self.mlp_command,
+            "mpi_prefix":    self.mpi_prefix,
+            "command":       self.command,
+            # ── bookkeeping ───────────────────────────────────
             "completed_at":  self.completed_at,
         })
 
@@ -98,6 +112,10 @@ class FitResult:
             log_path=Path(d["log_path"]) if d.get("log_path") else None,
             train_cfg=Path(d["train_cfg"]) if d.get("train_cfg") else None,
             n_train_cfgs=d.get("n_train_cfgs", 0),
+            init_template=Path(d["init_template"]) if d.get("init_template") else None,
+            mlp_command=d.get("mlp_command", "mlp"),
+            mpi_prefix=d.get("mpi_prefix"),
+            command=d.get("command", []),
             completed_at=d.get("completed_at", ""),
         )
 
