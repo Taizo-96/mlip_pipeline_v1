@@ -267,14 +267,18 @@ def convert_cfg(config: Annotated[str, typer.Option(..., help="Path to config ya
 #
 # Two commands, clear separation of concerns:
 #
-#   evaluate   — run mlp calculate_efs (expensive MTP inference) + plot.
-#                Skips inference if predicted_train.cfg already exists,
-#                unless --force is given.
-#                Accepts --gen N (single gen) or --gens 0,3,all (multi).
+#   evaluate      — run mlp calculate_efs (expensive MTP inference) + plot.
+#                   Skips inference if predicted_train.cfg already exists,
+#                   unless --force is given.
+#                   Accepts --gen N (single gen) or --gens 0,3,all (multi).
 #
-#   plot-eval  — regenerate plots only from an existing predicted_train.cfg.
-#                Fast; never re-runs calculate_efs.
-#                Accepts --gens 0,3,all.
+#   plot-eval     — regenerate plots only from an existing predicted_train.cfg.
+#                   Fast; never re-runs calculate_efs.
+#                   Accepts --gens 0,3,all.
+#
+#   compare-parity — side-by-side parity subplots across chosen gens.
+#                   Reads cached predicted_train.cfg; no MTP inference.
+#                   Accepts --gens 0,17 and --quantities energy,forces,stress.
 # ---------------------------------------------------------------------------
 
 @app.command("evaluate")
@@ -488,6 +492,117 @@ def plot_eval(
     typer.echo(f"\nDone: {n_ok} succeeded, {n_fail} failed.")
     if n_fail:
         raise typer.Exit(1)
+
+
+@app.command("compare-parity")
+def compare_parity(
+    config: Annotated[str, typer.Option(..., help="Path to config yaml")],
+    gens: Annotated[str, typer.Option(
+        "--gens",
+        help="Comma-separated generation numbers to compare, e.g. '0,17'. Order is preserved.",
+    )] = "0",
+    quantities: Annotated[str, typer.Option(
+        "--quantities",
+        help="Comma-separated quantities to plot: energy, forces, stress. Default: energy,forces",
+    )] = "energy,forces",
+    output: Annotated[Optional[str], typer.Option(
+        "--output",
+        help="Output directory for PNG files. Defaults to runs_root/loop_summary/compare_parity/",
+    )] = None,
+):
+    """
+    Produce side-by-side parity comparison plots across chosen generations.
+
+    Reads cached predicted_train.cfg files — no MTP inference is run.
+    Each requested quantity gets its own PNG with one subplot per generation.
+
+    Examples
+    --------
+    # Compare gen 0 and gen 17 for energy and forces (default):
+        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17
+
+    # Energy only:
+        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,5,10,17 --quantities energy
+
+    # All three quantities:
+        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17 --quantities energy,forces,stress
+
+    # Custom output directory:
+        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17 --output runs/my_comparisons/
+    """
+    from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
+    from mlip_pipeline.evaluate.parity import parse_cfg_efs, build_parity_data
+    from mlip_pipeline.evaluate.plots import plot_parity_comparison
+    from mlip_pipeline.models import GenerationState
+
+    base_cfg  = load_yaml(config)
+    runs_root = _runs_root_from_config(config)
+
+    # Parse gen list (order preserved, no sorting — user controls display order)
+    try:
+        gen_list = [int(g.strip()) for g in gens.split(",") if g.strip()]
+    except ValueError:
+        raise typer.BadParameter(f"Invalid --gens value: {gens!r}. Use comma-separated integers.")
+
+    if not gen_list:
+        typer.echo("No generations specified.", err=True)
+        raise typer.Exit(1)
+
+    qty_list = [q.strip().lower() for q in quantities.split(",") if q.strip()]
+    valid_qtys = {"energy", "forces", "stress"}
+    unknown_qtys = [q for q in qty_list if q not in valid_qtys]
+    if unknown_qtys:
+        raise typer.BadParameter(
+            f"Unknown quantities: {unknown_qtys}. Valid: energy, forces, stress"
+        )
+
+    dest_dir = Path(output) if output else runs_root / "loop_summary" / "compare_parity"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load parity data for each gen from cache
+    gen_parities: list[tuple[int, dict]] = []
+    for gen_num in gen_list:
+        gen_tag   = f"gen_{gen_num:02d}"
+        gen_dir   = runs_root / gen_tag
+        eval_dir  = gen_dir / "fit" / "eval"
+        pred_cfg  = eval_dir / "predicted_train.cfg"
+
+        if not pred_cfg.exists():
+            typer.echo(
+                f"  {gen_tag}: predicted_train.cfg not found at {pred_cfg} — skipping."
+                " Run 'evaluate' first.",
+                err=True,
+            )
+            continue
+
+        try:
+            cfg   = _config_for_gen(base_cfg, gen_num)
+            paths = project_paths(cfg)
+            paths = {**paths, **gen_paths(cfg, paths)}
+
+            # Resolve train_cfg the same way runner.py does
+            from mlip_pipeline.evaluate.runner import _resolve_train_cfg
+            train_cfg = _resolve_train_cfg(cfg, paths)
+
+            ref_records  = parse_cfg_efs(train_cfg)
+            pred_records = parse_cfg_efs(pred_cfg)
+            parity       = build_parity_data(ref_records, pred_records)
+            gen_parities.append((gen_num, parity))
+            typer.echo(f"  {gen_tag}: {len(ref_records)} configs loaded.")
+        except Exception as exc:
+            typer.echo(f"  {gen_tag}: FAILED to load parity data — {exc}", err=True)
+
+    if not gen_parities:
+        typer.echo("No parity data could be loaded. Aborting.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Generating comparison plots for quantities: {qty_list} ...")
+    written = plot_parity_comparison(gen_parities, qty_list, dest_dir)
+
+    for p in written:
+        typer.echo(str(p))
+
+    typer.echo(f"\n{len(written)} plot(s) written to {dest_dir}/")
 
 
 # ---------------------------------------------------------------------------

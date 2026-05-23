@@ -21,6 +21,12 @@ _TEAL   = "#01696f"
 _BROWN  = "#964219"
 _PURPLE = "#7a39bb"
 
+# Distinct colours for multi-gen comparison panels (cycles if > 8 gens)
+_GEN_COLORS = [
+    "#01696f", "#964219", "#7a39bb", "#a13544",
+    "#006494", "#437a22", "#da7101", "#d19900",
+]
+
 
 def plot_summary_metrics(metrics: dict, dest_dir: Path) -> list[Path]:
     """
@@ -64,7 +70,8 @@ def plot_summary_metrics(metrics: dict, dest_dir: Path) -> list[Path]:
     return written
 
 
-def _parity_panel(ax, ref, pred, label: str, units: str, color: str) -> float:
+def _parity_panel(ax, ref, pred, label: str, units: str, color: str,
+                  gen_tag: str | None = None) -> float:
     ref_arr  = np.array(ref)
     pred_arr = np.array(pred)
     lo = min(ref_arr.min(), pred_arr.min())
@@ -77,7 +84,10 @@ def _parity_panel(ax, ref, pred, label: str, units: str, color: str) -> float:
     rmse = math.sqrt(float(np.mean((pred_arr - ref_arr) ** 2)))
     ax.set_xlabel(f"DFT {label}  ({units})")
     ax.set_ylabel(f"MTP {label}  ({units})")
-    ax.set_title(f"{label}  RMSE = {rmse:.4g} {units}")
+    title = f"{label}  RMSE = {rmse:.4g} {units}"
+    if gen_tag:
+        title = f"{gen_tag}\n{title}"
+    ax.set_title(title)
     ax.legend(fontsize=8)
     return rmse
 
@@ -118,6 +128,95 @@ def plot_parity(parity: dict, dest_dir: Path) -> list[Path]:
             paths.append(p)
 
     return paths
+
+
+def plot_parity_comparison(
+    gen_parities: list[tuple[int, dict]],
+    quantities: list[str],
+    dest_dir: Path,
+) -> list[Path]:
+    """
+    Produce a side-by-side comparison parity plot for each requested quantity.
+
+    Parameters
+    ----------
+    gen_parities
+        List of (gen_number, parity_dict) pairs in display order.
+        parity_dict must be the output of build_parity_data().
+    quantities
+        Subset of ['energy', 'forces', 'stress'] to plot.
+    dest_dir
+        Directory where output PNGs are written.
+
+    Returns
+    -------
+    List of written PNG paths.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    n = len(gen_parities)
+    if n == 0:
+        return []
+
+    # Map quantity name → (ref_key, pred_key, label, units)
+    _QUANTITY_SPEC = {
+        "energy": ("energies_ref", "energies_pred", "energy/atom", "eV"),
+        "forces": ("forces_ref",   "forces_pred",   "forces",      "eV/Å"),
+        "stress": ("stress_ref",   "stress_pred",   "stress",      "GPa"),
+    }
+
+    written: list[Path] = []
+
+    with plt.rc_context(_STYLE):
+        for qty in quantities:
+            if qty not in _QUANTITY_SPEC:
+                continue
+            ref_key, pred_key, label, units = _QUANTITY_SPEC[qty]
+
+            # Filter to gens that actually have data for this quantity
+            valid = [
+                (gn, p) for gn, p in gen_parities
+                if p.get(ref_key) and len(p[ref_key]) > 0
+            ]
+            if not valid:
+                continue
+
+            ncols = len(valid)
+            fig, axes = plt.subplots(
+                1, ncols,
+                figsize=(4.5 * ncols, 4.8),
+                squeeze=False,
+            )
+
+            for col, (gen_num, parity) in enumerate(valid):
+                ax    = axes[0][col]
+                color = _GEN_COLORS[col % len(_GEN_COLORS)]
+                gen_tag = f"gen_{gen_num:02d}"
+                _parity_panel(
+                    ax,
+                    parity[ref_key],
+                    parity[pred_key],
+                    label,
+                    units,
+                    color,
+                    gen_tag=gen_tag,
+                )
+
+            gen_range = "_".join(f"{gn:02d}" for gn, _ in valid)
+            fname = f"parity_compare_{qty}_gens{gen_range}.png"
+            fig.suptitle(
+                f"Parity comparison — {label}  ({', '.join(f'gen_{gn:02d}' for gn, _ in valid)})",
+                fontsize=12,
+                y=1.01,
+            )
+            fig.tight_layout()
+            dest = dest_dir / fname
+            fig.savefig(dest, bbox_inches="tight")
+            plt.close(fig)
+            written.append(dest)
+
+    return written
 
 
 def plot_gamma_histogram(
