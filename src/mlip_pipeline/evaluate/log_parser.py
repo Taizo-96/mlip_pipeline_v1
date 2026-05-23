@@ -22,6 +22,15 @@ _SECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Canonical short keys used everywhere in the codebase.
+# These are the keys stored in metrics.csv and read back by replot_evaluation.
+_KEY_MAP = {
+    "energy":  "rmse_e",
+    "force":   "rmse_f",
+    "stress":  "rmse_s",
+    "virial":  "rmse_s",
+}
+
 
 def parse_train_log(log_path: Path) -> dict:
     """
@@ -31,31 +40,27 @@ def parse_train_log(log_path: Path) -> dict:
     """
     text = log_path.read_text(encoding="utf-8")
 
-    # Take only the last occurrence of each section (final summary)
     results: dict[str, float] = {}
     for m in _SECTION_RE.finditer(text):
         section = m.group(1).lower()
-        value = float(m.group(2))
-        if "energy" in section:
-            results["rmse_e"] = value
-        elif "force" in section:
-            results["rmse_f"] = value
-        elif "stress" in section or "virial" in section:
-            results["rmse_s"] = value
+        value   = float(m.group(2))
+        for fragment, key in _KEY_MAP.items():
+            if fragment in section:
+                results[key] = value
+                break
 
     return results
 
 
 def write_metrics_csv(metrics: dict, dest: Path) -> Path:
+    """
+    Write metrics to CSV using the canonical short keys (rmse_e, rmse_f, rmse_s)
+    so that ``replot_evaluation`` can read them back without any translation.
+    """
     with open(dest, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["metric", "value"])
-        label_map = {
-            "rmse_e": "final_rmse_energy_eV_per_atom",
-            "rmse_f": "final_rmse_forces_eV_per_ang",
-            "rmse_s": "final_rmse_stress_pressure_units",
-        }
-        for key, label in label_map.items():
+        for key in ("rmse_e", "rmse_f", "rmse_s"):
             if key in metrics:
-                w.writerow([label, metrics[key]])
+                w.writerow([key, metrics[key]])
     return dest

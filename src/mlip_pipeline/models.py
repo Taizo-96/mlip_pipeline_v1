@@ -295,21 +295,26 @@ class EvaluationResult:
     max_gamma: float = float("nan")
     frac_above_save: float = float("nan")
     frac_above_break: float = float("nan")
+    # Path to the persisted raw grade records (gamma_grades.json).
+    # None when no gamma data was collected.
+    gamma_grades_path: Optional[Path] = None
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.eval_dir / "eval_manifest.json", {
-            "step":             "evaluate",
-            "rmse_energy":      self.rmse_energy,
-            "rmse_forces":      self.rmse_forces,
-            "rmse_stress":      self.rmse_stress,
-            "mean_gamma":       self.mean_gamma,
-            "max_gamma":        self.max_gamma,
-            "frac_above_save":  self.frac_above_save,
-            "frac_above_break": self.frac_above_break,
-            "plot_paths":       {k: str(v) for k, v in self.plot_paths.items()},
-            "completed_at":     self.completed_at,
+            "step":               "evaluate",
+            "rmse_energy":        self.rmse_energy,
+            "rmse_forces":        self.rmse_forces,
+            "rmse_stress":        self.rmse_stress,
+            "mean_gamma":         self.mean_gamma,
+            "max_gamma":          self.max_gamma,
+            "frac_above_save":    self.frac_above_save,
+            "frac_above_break":   self.frac_above_break,
+            # Store as string so Path serialises cleanly; None when absent.
+            "gamma_grades_path":  str(self.gamma_grades_path) if self.gamma_grades_path else None,
+            "plot_paths":         {k: str(v) for k, v in self.plot_paths.items()},
+            "completed_at":       self.completed_at,
         })
 
     @classmethod
@@ -323,6 +328,7 @@ class EvaluationResult:
             max_gamma=d.get("max_gamma", float("nan")),
             frac_above_save=d.get("frac_above_save", float("nan")),
             frac_above_break=d.get("frac_above_break", float("nan")),
+            gamma_grades_path=Path(d["gamma_grades_path"]) if d.get("gamma_grades_path") else None,
             eval_dir=eval_dir,
             plot_paths={k: Path(v) for k, v in d.get("plot_paths", {}).items()},
             completed_at=d.get("completed_at", ""),
