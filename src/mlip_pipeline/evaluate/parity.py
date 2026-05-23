@@ -60,17 +60,43 @@ def run_calculate_efs(
         raise RuntimeError(f"calculate_efs ran but output not found: {output_cfg}")
 
 
+def _parse_atom_data_block(lines: list[str]) -> list[float]:
+    """
+    Parse one AtomData section (lines after the header, before the next
+    keyword). Returns flat [fx0, fy0, fz0, fx1, ...] list.
+    Columns are: id type x y z fx fy fz [...]
+    """
+    forces: list[float] = []
+    for line in lines:
+        cols = line.split()
+        if len(cols) >= 8:
+            forces.extend([float(cols[5]), float(cols[6]), float(cols[7])])
+    return forces
+
+
 def parse_cfg_efs(cfg_path: Path) -> list[dict]:
     """
     Parse BEGIN_CFG...END_CFG blocks, extracting:
       - energy per atom
       - all force components (fx, fy, fz) per atom
       - stress components if present (PlusStress block)
-    Returns list of dicts, one per config.
+
+    ``mlp calculate_efs`` writes predicted EFS *after* the DFT values inside
+    the same block, so each quantity may appear twice.  We always take the
+    **last** occurrence:
+      - Energy:    last matching line (already handled before this fix)
+      - AtomData:  last AtomData section in the block  <- this fix
+      - PlusStress: last PlusStress section in the block
+
+    For the DFT reference cfg (train.cfg) there is only one occurrence of
+    each, so the behaviour is identical to before.
     """
     text = cfg_path.read_text(encoding="utf-8")
     blocks = re.split(r"(?=BEGIN_CFG)", text)
     records = []
+
+    # Keywords that terminate an AtomData or PlusStress section
+    _TERMINATORS = ("Energy", "PlusStress", "Stress", "Feature", "END_CFG", "AtomData", "BEGIN_CFG")
 
     for block in blocks:
         if "BEGIN_CFG" not in block:
@@ -80,38 +106,46 @@ def parse_cfg_efs(cfg_path: Path) -> list[dict]:
         size_m = re.search(r"Size\s+(\d+)", block)
         natoms = int(size_m.group(1)) if size_m else None
 
-        # energy — take the LAST Energy line in the block so MTP value
-        # (written after DFT) is used when parsing predicted_cfg
+        # energy -- LAST Energy line so MTP value wins in predicted_cfg
         e_matches = list(re.finditer(r"Energy\s+([\d.eE+\-]+)", block))
         energy = float(e_matches[-1].group(1)) if e_matches else None
 
-        # forces from AtomData block: cols are id type x y z fx fy fz ...
-        forces: list[float] = []
-        in_atoms = False
+        # ------------------------------------------------------------------
+        # Forces: collect ALL AtomData sections, keep only the LAST one.
+        # mlp calculate_efs appends a second AtomData section with its
+        # predictions; the first section contains the DFT values.
+        # ------------------------------------------------------------------
+        all_atom_sections: list[list[str]] = []
+        current_section: list[str] | None = None
+
         for line in block.splitlines():
             s = line.strip()
             if s.startswith("AtomData:"):
-                in_atoms = True
+                # Start a new section (may replace a previous one)
+                current_section = []
+                all_atom_sections.append(current_section)
                 continue
-            if in_atoms:
-                if not s or any(
-                    s.startswith(kw)
-                    for kw in ("Energy", "PlusStress", "Stress", "Feature", "END_CFG")
-                ):
-                    in_atoms = False
+            if current_section is not None:
+                if not s or any(s.startswith(kw) for kw in _TERMINATORS):
+                    current_section = None
                     continue
-                cols = s.split()
-                if len(cols) >= 8:
-                    forces.extend([float(cols[5]), float(cols[6]), float(cols[7])])
+                current_section.append(s)
 
-        # stress from PlusStress block (six components on one or more lines)
+        forces: list[float] = []
+        if all_atom_sections:
+            # Last AtomData = MTP predictions (or DFT if only one exists)
+            forces = _parse_atom_data_block(all_atom_sections[-1])
+
+        # ------------------------------------------------------------------
+        # Stress: LAST PlusStress section for the same reason.
+        # ------------------------------------------------------------------
         stress: list[float] | None = None
-        ps_m = re.search(
-            r"PlusStress[^\n]*\n([\s\S]*?)(?=\n\s*(?:Feature|END_CFG))",
+        ps_matches = list(re.finditer(
+            r"PlusStress[^\n]*\n([\s\S]*?)(?=\n\s*(?:Feature|END_CFG|AtomData|Energy|PlusStress))",
             block,
-        )
-        if ps_m:
-            stress_vals = [float(v) for v in ps_m.group(1).split()]
+        ))
+        if ps_matches:
+            stress_vals = [float(v) for v in ps_matches[-1].group(1).split()]
             if len(stress_vals) >= 6:
                 stress = stress_vals[:6]
 
