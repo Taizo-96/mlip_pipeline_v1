@@ -6,7 +6,7 @@ from typing import List, Optional
 from typing_extensions import Annotated
 from pathlib import Path
 
-from mlip_pipeline.config import load_yaml, project_paths
+from mlip_pipeline.config import load_yaml, project_paths, gen_paths
 from mlip_pipeline.data.training_data import prepare_training_cfgs
 from mlip_pipeline.explore.lammps_inputs import create_exploration_runs
 from mlip_pipeline.explore.runner import run_exploration_runs
@@ -294,6 +294,11 @@ def regenerate_eval(
     writes eval_manifest.json.  It does NOT re-run fit or any other step.
     Existing plot files are overwritten; everything else is untouched.
 
+    Model resolution priority (mirrors the loop runner):
+      1. state.json model_path field
+      2. gen_NN/fit/fit_manifest.json
+      3. config fallback  (trained_potential_name)
+
     Examples
     --------
     # Recover just gen 0:
@@ -305,12 +310,12 @@ def regenerate_eval(
     # Re-evaluate every generation found on disk:
         mlip-pipeline regenerate-eval --config configs/Pb_loop.yaml --gens all
     """
-    from mlip_pipeline.loop.runner import _config_for_gen
+    from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
     from mlip_pipeline.models import GenerationState
 
     base_cfg = load_yaml(config)
     # resolve runs_root from gen 0 config (generation-independent path)
-    _cfg0  = _config_for_gen(base_cfg, 0)
+    _cfg0   = _config_for_gen(base_cfg, 0)
     _paths0 = project_paths(_cfg0)
     runs_root = _paths0["runs_root"]
 
@@ -352,17 +357,26 @@ def regenerate_eval(
         try:
             cfg   = _config_for_gen(base_cfg, gen_num)
             paths = project_paths(cfg)
-            fit_result = build_fit_result(cfg, paths)
+            paths = {**paths, **gen_paths(cfg, paths)}
 
-            if not fit_result.model_path.exists():
-                typer.echo(
-                    f"  {gen_tag}: model not found at {fit_result.model_path} — skipping.",
-                    err=True,
-                )
+            # Load state so _resolve_fit_result can use state.model_path
+            state_file = gen_dir / "state.json"
+            if state_file.exists():
+                state = GenerationState.load(gen_dir)
+            else:
+                # No state.json yet — create a minimal stub so _resolve_fit_result works
+                state = GenerationState.init(str(gen_num), gen_dir)
+                state_file.unlink(missing_ok=True)  # don't persist the stub
+
+            # Mirror _resolve_fit_result: state.model_path -> fit_manifest.json -> config fallback
+            try:
+                fit_result = _resolve_fit_result(cfg, paths, state)
+            except RuntimeError as e:
+                typer.echo(f"  {gen_tag}: {e} — skipping.", err=True)
                 n_fail += 1
                 continue
 
-            typer.echo(f"  {gen_tag}: running evaluate ...")
+            typer.echo(f"  {gen_tag}: running evaluate (model={fit_result.model_path}) ...")
             result = run_evaluation(cfg, paths, fit_result)
             typer.echo(
                 f"  {gen_tag}: wrote {result.eval_dir / 'eval_manifest.json'} "
@@ -371,17 +385,15 @@ def regenerate_eval(
 
             # Optionally sync the result back into state.json so the loop
             # runner and plot-loop command both see it immediately.
-            if update_state:
-                state_file = gen_dir / "state.json"
-                if state_file.exists():
-                    state_data = json.loads(state_file.read_text())
-                    state_data["evaluation_done"]     = True
-                    state_data["evaluation_failed"]   = False
-                    state_data["evaluation_manifest"] = str(
-                        result.eval_dir / "eval_manifest.json"
-                    )
-                    state_file.write_text(json.dumps(state_data, indent=2))
-                    typer.echo(f"  {gen_tag}: updated state.json evaluation fields.")
+            if update_state and state_file.exists():
+                state_data = json.loads(state_file.read_text())
+                state_data["evaluation_done"]     = True
+                state_data["evaluation_failed"]   = False
+                state_data["evaluation_manifest"] = str(
+                    result.eval_dir / "eval_manifest.json"
+                )
+                state_file.write_text(json.dumps(state_data, indent=2))
+                typer.echo(f"  {gen_tag}: updated state.json evaluation fields.")
 
             n_ok += 1
 
