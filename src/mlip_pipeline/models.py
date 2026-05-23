@@ -171,7 +171,7 @@ class SelectionResult:
 
     @classmethod
     def load_manifest(cls, select_root: Path) -> "SelectionResult":
-        d = json.loads((select_root / "selection_manifest.json").read_text())
+        d = json.loads((select_root / "selection_manifest.json").read_text())        
         return cls(
             select_root=select_root,
             manifest_path=select_root / "selection_manifest.json",
@@ -272,17 +272,26 @@ class EvaluationResult:
     rmse_stress: float
     eval_dir: Path
     plot_paths: dict = field(default_factory=dict)
+    # Gamma statistics (NaN when no grade data was found)
+    mean_gamma: float = float("nan")
+    max_gamma: float = float("nan")
+    frac_above_save: float = float("nan")
+    frac_above_break: float = float("nan")
     completed_at: str = field(default_factory=_now)
 
     def save_manifest(self) -> Path:
         from mlip_pipeline.utils.fs import write_json
         return write_json(self.eval_dir / "eval_manifest.json", {
-            "step":         "evaluate",
-            "rmse_energy":  self.rmse_energy,
-            "rmse_forces":  self.rmse_forces,
-            "rmse_stress":  self.rmse_stress,
-            "plot_paths":   {k: str(v) for k, v in self.plot_paths.items()},
-            "completed_at": self.completed_at,
+            "step":             "evaluate",
+            "rmse_energy":      self.rmse_energy,
+            "rmse_forces":      self.rmse_forces,
+            "rmse_stress":      self.rmse_stress,
+            "mean_gamma":       self.mean_gamma,
+            "max_gamma":        self.max_gamma,
+            "frac_above_save":  self.frac_above_save,
+            "frac_above_break": self.frac_above_break,
+            "plot_paths":       {k: str(v) for k, v in self.plot_paths.items()},
+            "completed_at":     self.completed_at,
         })
 
     @classmethod
@@ -292,6 +301,10 @@ class EvaluationResult:
             rmse_energy=d.get("rmse_energy", float("nan")),
             rmse_forces=d.get("rmse_forces", float("nan")),
             rmse_stress=d.get("rmse_stress", float("nan")),
+            mean_gamma=d.get("mean_gamma", float("nan")),
+            max_gamma=d.get("max_gamma", float("nan")),
+            frac_above_save=d.get("frac_above_save", float("nan")),
+            frac_above_break=d.get("frac_above_break", float("nan")),
             eval_dir=eval_dir,
             plot_paths={k: Path(v) for k, v in d.get("plot_paths", {}).items()},
             completed_at=d.get("completed_at", ""),
