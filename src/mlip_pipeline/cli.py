@@ -415,7 +415,7 @@ def run_gen(
 @app.command("plot-loop")
 def plot_loop(
     config: Annotated[str, typer.Option(..., help="Path to config yaml")],
-    start_gen: Annotated[int, typer.Option("--start-gen", help="First generation to include")] = 1,
+    start_gen: Annotated[int, typer.Option("--start-gen", help="First generation to include")] = 0,
     end_gen: Annotated[int, typer.Option("--end-gen", help="Last generation to include (inclusive)")] = None,
 ):
     """

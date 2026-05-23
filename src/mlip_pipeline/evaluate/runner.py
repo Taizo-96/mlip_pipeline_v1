@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from mlip_pipeline.models import FitResult, EvaluationResult
@@ -118,6 +119,12 @@ def run_evaluation(
         if sel_path.exists():
             grade_cfgs = [sel_path]
 
+    # Gamma summary statistics for the manifest
+    mean_gamma: float = float("nan")
+    max_gamma: float = float("nan")
+    frac_above_save: float = float("nan")
+    frac_above_break: float = float("nan")
+
     if grade_cfgs:
         all_grades: list[float] = []
         for gc in grade_cfgs:
@@ -125,11 +132,13 @@ def run_evaluation(
 
         if all_grades:
             al_cfg = explore_cfg.get("active_learning", {})
+            thresh_save  = al_cfg.get("threshold_save")
+            thresh_break = al_cfg.get("threshold_break")
             thresholds = {
                 k: v
                 for k, v in {
-                    "save":  al_cfg.get("threshold_save"),
-                    "break": al_cfg.get("threshold_break"),
+                    "save":  thresh_save,
+                    "break": thresh_break,
                 }.items()
                 if v is not None
             }
@@ -137,9 +146,19 @@ def run_evaluation(
                 all_grades, thresholds, eval_dir / "gamma_hist.png"
             )
             plot_paths.append(p)
+
+            # Compute summary stats
+            mean_gamma = float(sum(all_grades)) / len(all_grades)
+            max_gamma  = float(max(all_grades))
+            if thresh_save is not None:
+                frac_above_save = sum(1 for g in all_grades if g > thresh_save) / len(all_grades)
+            if thresh_break is not None:
+                frac_above_break = sum(1 for g in all_grades if g > thresh_break) / len(all_grades)
+
             print(
                 f"  [gamma]   {len(all_grades):,} grades from "
-                f"{len(grade_cfgs)} cfg(s) → {p.name}"
+                f"{len(grade_cfgs)} cfg(s) → {p.name}  "
+                f"(mean={mean_gamma:.3f}, max={max_gamma:.3f})"
             )
         else:
             print("  [gamma]   WARNING: no grade values found in cfg files")
@@ -151,6 +170,10 @@ def run_evaluation(
         rmse_energy=metrics.get("rmse_e", float("nan")),
         rmse_forces=metrics.get("rmse_f", float("nan")),
         rmse_stress=metrics.get("rmse_s", float("nan")),
+        mean_gamma=mean_gamma,
+        max_gamma=max_gamma,
+        frac_above_save=frac_above_save,
+        frac_above_break=frac_above_break,
         eval_dir=eval_dir,
         plot_paths={p.stem: p for p in plot_paths},
     )

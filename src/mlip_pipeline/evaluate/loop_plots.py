@@ -32,6 +32,7 @@ _BROWN  = "#964219"
 _PURPLE = "#7a39bb"
 _GREEN  = "#437a22"
 _BLUE   = "#006494"
+_RED    = "#c0392b"
 
 
 def _load_json(path: Path) -> Optional[dict]:
@@ -51,6 +52,10 @@ def collect_loop_records(runs_root: Path, generations: list[int]) -> list[dict]:
     rmse_energy           float  (from eval_manifest.json; NaN if absent)
     rmse_forces           float
     rmse_stress           float
+    mean_gamma            float  (from eval_manifest.json; NaN if absent)
+    max_gamma             float
+    frac_above_save       float
+    frac_above_break      float
     n_train_cfgs          int    (from fit_manifest.json;  -1 if absent)
     selected_count        int    (from selection_manifest.json; -1 if absent)
     replicate_tier        int    (from state.json; 0 if absent)
@@ -70,19 +75,21 @@ def collect_loop_records(runs_root: Path, generations: list[int]) -> list[dict]:
         state = _load_json(gen_dir / "state.json") or {}
 
         # ── eval_manifest.json ───────────────────────────────────────────
-        eval_manifest_path = None
+        # Priority:
+        #   1. path recorded in state.evaluation_manifest
+        #   2. default location gen_NN/fit/eval/eval_manifest.json
+        # We include the record even for failed generations (status=="failed")
+        # as long as an eval_manifest exists, so that partial results are
+        # visible in the loop plots.
         eval_data: dict = {}
 
-        # Try the path recorded in state first, then fall back to default location.
         recorded = state.get("evaluation_manifest")
         if recorded and Path(recorded).exists():
             eval_data = _load_json(Path(recorded)) or {}
-            eval_manifest_path = recorded
         else:
             default_eval = gen_dir / "fit" / "eval" / "eval_manifest.json"
             if default_eval.exists():
                 eval_data = _load_json(default_eval) or {}
-                eval_manifest_path = str(default_eval)
 
         # ── fit_manifest.json ─────────────────────────────────────────────
         fit_data: dict = {}
@@ -101,6 +108,10 @@ def collect_loop_records(runs_root: Path, generations: list[int]) -> list[dict]:
             "rmse_energy":               eval_data.get("rmse_energy", float("nan")),
             "rmse_forces":               eval_data.get("rmse_forces", float("nan")),
             "rmse_stress":               eval_data.get("rmse_stress", float("nan")),
+            "mean_gamma":                eval_data.get("mean_gamma", float("nan")),
+            "max_gamma":                 eval_data.get("max_gamma", float("nan")),
+            "frac_above_save":           eval_data.get("frac_above_save", float("nan")),
+            "frac_above_break":          eval_data.get("frac_above_break", float("nan")),
             "n_train_cfgs":              fit_data.get("n_train_cfgs", -1),
             "selected_count":            sel_data.get("selected_count", -1),
             "replicate_tier":            state.get("replicate_tier", 0),
@@ -131,6 +142,24 @@ def _valid(records: list[dict], key: str) -> tuple[list[int], list[float]]:
     return gens, vals
 
 
+def _mark_failed(ax: plt.Axes, records: list[dict]) -> None:
+    """Add a red × marker at the x-axis for any failed generation."""
+    failed_gens = [r["generation"] for r in records if r.get("status") == "failed"]
+    if failed_gens:
+        ylim = ax.get_ylim()
+        y_mark = ylim[0]
+        ax.scatter(
+            failed_gens,
+            [y_mark] * len(failed_gens),
+            marker="x",
+            color=_RED,
+            s=60,
+            linewidths=2,
+            zorder=5,
+            label="failed gen",
+        )
+
+
 def _plot_rmse(records: list[dict], dest: Path) -> Path:
     """RMSE energy / forces / stress vs generation (log-y, line + scatter)."""
     series = [
@@ -142,9 +171,9 @@ def _plot_rmse(records: list[dict], dest: Path) -> Path:
         fig, ax = plt.subplots(figsize=(7, 4))
         any_plotted = False
         for key, label, color in series:
-            gens, vals = _valid(records, key)
-            if gens:
-                ax.plot(gens, vals, "-o", color=color, label=label,
+            ggs, vals = _valid(records, key)
+            if ggs:
+                ax.plot(ggs, vals, "-o", color=color, label=label,
                         linewidth=1.6, markersize=5)
                 any_plotted = True
         if any_plotted:
@@ -153,7 +182,9 @@ def _plot_rmse(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("RMSE")
         ax.set_title("Training RMSE vs Generation")
         ax.set_xticks(_gens(records))
-        ax.legend(fontsize=9)
+        _mark_failed(ax, records)
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles, labels, fontsize=9)
         fig.tight_layout()
         fig.savefig(dest)
         plt.close(fig)
@@ -233,6 +264,63 @@ def _plot_replicate_tier(records: list[dict], dest: Path) -> Path:
     return dest
 
 
+def _plot_gamma_evolution(records: list[dict], dest: Path) -> Path:
+    """Mean and max extrapolation grade (gamma) vs generation."""
+    with plt.rc_context(_STYLE):
+        fig, ax = plt.subplots(figsize=(7, 4))
+
+        mean_gens, mean_vals = _valid(records, "mean_gamma")
+        max_gens,  max_vals  = _valid(records, "max_gamma")
+
+        if mean_gens:
+            ax.plot(mean_gens, mean_vals, "-o", color=_TEAL,  linewidth=1.6,
+                    markersize=5, label="mean γ")
+        if max_gens:
+            ax.plot(max_gens, max_vals, "--s", color=_BROWN, linewidth=1.6,
+                    markersize=5, label="max γ")
+
+        # Draw threshold lines if any record has frac_above_save/break data,
+        # which implies a threshold was configured.  We retrieve the threshold
+        # value by back-computing: we can't store it in the manifest directly
+        # without a config, so we instead draw an annotation only when at least
+        # one record has a finite frac_above_save/break value.
+        # (Threshold lines are skipped if no threshold was configured.)
+        has_save  = any(math.isfinite(r.get("frac_above_save",  float("nan"))) for r in records)
+        has_break = any(math.isfinite(r.get("frac_above_break", float("nan"))) for r in records)
+
+        # Secondary axis: fraction above save threshold
+        ax2 = None
+        if has_save:
+            fs_gens, fs_vals = _valid(records, "frac_above_save")
+            if fs_gens:
+                ax2 = ax.twinx()
+                ax2.bar(fs_gens, fs_vals, color=_GREEN, alpha=0.25, width=0.5,
+                        label="frac > γ_save")
+                ax2.set_ylabel("Fraction above save threshold", fontsize=9)
+                ax2.set_ylim(0, max(fs_vals) * 2 + 0.01)
+                ax2.spines["top"].set_visible(False)
+
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Extrapolation grade γ")
+        ax.set_title("Gamma Evolution vs Generation")
+        ax.set_xticks(_gens(records))
+        _mark_failed(ax, records)
+
+        # Combine legends from both axes
+        handles, labels = ax.get_legend_handles_labels()
+        if ax2 is not None:
+            h2, l2 = ax2.get_legend_handles_labels()
+            handles += h2
+            labels  += l2
+        if handles:
+            ax.legend(handles, labels, fontsize=9)
+
+        fig.tight_layout()
+        fig.savefig(dest)
+        plt.close(fig)
+    return dest
+
+
 def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
     """2×2 combined summary panel."""
     with plt.rc_context(_STYLE):
@@ -254,6 +342,7 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("RMSE")
         ax.set_title("RMSE vs Generation")
         ax.set_xticks(_gens(records))
+        _mark_failed(ax, records)
         ax.legend(fontsize=8)
 
         ax = axes[0, 1]
@@ -277,19 +366,19 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax.set_xticks(_gens(records))
 
         ax = axes[1, 1]
-        gens_r  = _gens(records)
-        tiers   = [r.get("replicate_tier", 0) for r in records]
-        ctiers  = [r.get("converged_replicate_tier", 0) for r in records]
-        ax.step(gens_r, tiers,  where="mid", color=_PURPLE, linewidth=1.4, label="attempted")
-        ax.step(gens_r, ctiers, where="mid", color=_GREEN,  linewidth=1.4,
-                linestyle="--", label="converged")
-        ax.scatter(gens_r, tiers,  color=_PURPLE, s=20, zorder=3)
-        ax.scatter(gens_r, ctiers, color=_GREEN,  s=20, zorder=3)
+        mean_gg, mean_vv = _valid(records, "mean_gamma")
+        max_gg,  max_vv  = _valid(records, "max_gamma")
+        if mean_gg:
+            ax.plot(mean_gg, mean_vv, "-o", color=_TEAL,  linewidth=1.4,
+                    markersize=4, label="mean γ")
+        if max_gg:
+            ax.plot(max_gg, max_vv, "--s", color=_BROWN, linewidth=1.4,
+                    markersize=4, label="max γ")
         ax.set_xlabel("Generation")
-        ax.set_ylabel("Replicate tier")
-        ax.set_title("Replicate Tier")
-        ax.set_xticks(gens_r)
-        ax.yaxis.get_major_locator().set_params(integer=True)
+        ax.set_ylabel("Extrapolation grade γ")
+        ax.set_title("Gamma Evolution")
+        ax.set_xticks(_gens(records))
+        _mark_failed(ax, records)
         ax.legend(fontsize=8)
 
         fig.tight_layout()
@@ -308,7 +397,7 @@ def plot_loop_summary(records: list[dict], output_dir: Path) -> list[Path]:
     Returns
     -------
     list[Path]
-        Paths of all PNG files written (always 5 files when records is non-empty).
+        Paths of all PNG files written (always 6 files when records is non-empty).
     """
     if not records:
         return []
@@ -317,10 +406,11 @@ def plot_loop_summary(records: list[dict], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = [
-        _plot_rmse(records,           output_dir / "rmse_vs_generation.png"),
-        _plot_training_size(records,  output_dir / "training_size_vs_generation.png"),
-        _plot_selected(records,       output_dir / "selected_vs_generation.png"),
-        _plot_replicate_tier(records, output_dir / "replicate_tier_vs_generation.png"),
-        _plot_summary_panel(records,  output_dir / "loop_summary_panel.png"),
+        _plot_rmse(records,            output_dir / "rmse_vs_generation.png"),
+        _plot_training_size(records,   output_dir / "training_size_vs_generation.png"),
+        _plot_selected(records,        output_dir / "selected_vs_generation.png"),
+        _plot_replicate_tier(records,  output_dir / "replicate_tier_vs_generation.png"),
+        _plot_gamma_evolution(records, output_dir / "gamma_vs_generation.png"),
+        _plot_summary_panel(records,   output_dir / "loop_summary_panel.png"),
     ]
     return paths
