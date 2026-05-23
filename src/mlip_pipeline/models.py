@@ -439,3 +439,154 @@ class GenerationState:
 
     def is_step_done(self, step: str) -> bool:
         return step in self.completed_steps
+
+
+# ── Loop-level result ───────────────────────────────────────────────────────────────
+
+# Why a new class instead of extending GenerationState?
+#
+# GenerationState is a mutable, per-generation fault-tolerance record — it is
+# written and re-written throughout a generation's lifetime to support crash
+# recovery and step-level resume. LoopResult is a single immutable summary
+# written once when run_loop() exits, covering the whole multi-generation run.
+# Mixing these two concerns into one class would make both harder to understand.
+
+STOP_REASONS = (
+    "completed",   # requested end_gen was reached
+    "converged",   # potential found 0 new structures at all replicate tiers
+    "failed",      # a generation failed and stop_on_failure=True
+    "interrupted", # KeyboardInterrupt or unexpected exception in run_loop
+)
+
+
+@dataclass
+class LoopResult:
+    """Immutable summary of a completed (or interrupted) active-learning loop.
+
+    Written to <runs_root>/loop_manifest.json by run_loop() on exit.
+    Can be reloaded with LoopResult.load(runs_root).
+
+    Fields
+    ------
+    start_gen           First generation that was requested.
+    requested_end_gen   Last generation that was requested (--end-gen).
+    actual_end_gen      Last generation that was actually processed.
+    stop_reason         One of STOP_REASONS.
+    n_gens_completed    Number of generations that reached status=="completed" or "converged".
+    n_gens_failed       Number of generations that reached status=="failed".
+    failed_gens         List of generation indices that failed.
+    generations         Per-generation summary rows (aggregated from step manifests).
+    started_at          ISO-8601 timestamp when run_loop began.
+    completed_at        ISO-8601 timestamp when run_loop exited.
+    """
+    runs_root: Path
+    start_gen: int
+    requested_end_gen: int
+    actual_end_gen: int
+    stop_reason: str
+    n_gens_completed: int
+    n_gens_failed: int
+    failed_gens: list[int] = field(default_factory=list)
+    # Per-generation summary rows — one dict per processed generation.
+    # Each row contains the fields returned by collect_loop_records():
+    #   gen, status, n_train_cfgs, n_selected,
+    #   rmse_energy, rmse_forces, rmse_stress,
+    #   mean_gamma, max_gamma,
+    #   replicate_tier, converged_replicate_tier, completed_at
+    generations: list[dict] = field(default_factory=list)
+    started_at: str = ""
+    completed_at: str = field(default_factory=_now)
+
+    # ------------------------------------------------------------------
+    # Factory — build from the list[GenerationState] returned by run_loop
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_states(
+        cls,
+        runs_root: Path,
+        states: list["GenerationState"],
+        start_gen: int,
+        requested_end_gen: int,
+        stop_reason: str,
+        started_at: str,
+    ) -> "LoopResult":
+        """Build a LoopResult by reading step-manifest files for each state."""
+        from mlip_pipeline.evaluate.loop_plots import collect_loop_records
+
+        processed_gens = [int(s.generation) for s in states]
+        actual_end_gen = max(processed_gens) if processed_gens else start_gen
+
+        failed_gens = [
+            int(s.generation) for s in states if s.status == "failed"
+        ]
+        completed_states = [
+            s for s in states if s.status in ("completed", "converged")
+        ]
+
+        # Reuse the existing per-gen record collector so there is a single
+        # source of truth for what each row contains.
+        gen_rows = collect_loop_records(runs_root, processed_gens)
+
+        return cls(
+            runs_root=runs_root,
+            start_gen=start_gen,
+            requested_end_gen=requested_end_gen,
+            actual_end_gen=actual_end_gen,
+            stop_reason=stop_reason,
+            n_gens_completed=len(completed_states),
+            n_gens_failed=len(failed_gens),
+            failed_gens=failed_gens,
+            generations=gen_rows,
+            started_at=started_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self) -> Path:
+        from mlip_pipeline.utils.fs import write_json
+
+        def _clean(v):
+            """Convert NaN/inf to None so the JSON is always valid."""
+            import math
+            if isinstance(v, float) and not math.isfinite(v):
+                return None
+            if isinstance(v, dict):
+                return {k: _clean(vv) for k, vv in v.items()}
+            if isinstance(v, list):
+                return [_clean(x) for x in v]
+            return v
+
+        path = self.runs_root / "loop_manifest.json"
+        write_json(path, _clean({
+            "start_gen":           self.start_gen,
+            "requested_end_gen":   self.requested_end_gen,
+            "actual_end_gen":      self.actual_end_gen,
+            "stop_reason":         self.stop_reason,
+            "n_gens_completed":    self.n_gens_completed,
+            "n_gens_failed":       self.n_gens_failed,
+            "failed_gens":         self.failed_gens,
+            "generations":         self.generations,
+            "started_at":          self.started_at,
+            "completed_at":        self.completed_at,
+        }))
+        return path
+
+    @classmethod
+    def load(cls, runs_root: Path) -> "LoopResult":
+        d = json.loads((runs_root / "loop_manifest.json").read_text())
+        return cls(
+            runs_root=runs_root,
+            start_gen=d["start_gen"],
+            requested_end_gen=d["requested_end_gen"],
+            actual_end_gen=d["actual_end_gen"],
+            stop_reason=d["stop_reason"],
+            n_gens_completed=d["n_gens_completed"],
+            n_gens_failed=d["n_gens_failed"],
+            failed_gens=d.get("failed_gens", []),
+            generations=d.get("generations", []),
+            started_at=d.get("started_at", ""),
+            completed_at=d.get("completed_at", ""),
+        )

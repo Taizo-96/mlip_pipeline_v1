@@ -20,7 +20,7 @@ from pathlib import Path
 import yaml
 
 from mlip_pipeline.config import build_gen_config, project_paths, gen_paths, load_yaml
-from mlip_pipeline.models import GenerationState, FitResult, LabelResult, STEPS
+from mlip_pipeline.models import GenerationState, FitResult, LabelResult, LoopResult, STEPS
 from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.utils.logging import step_header, info, warn, success, error
 
@@ -154,7 +154,7 @@ def run_single_generation(
     if not snapshot.exists():
         snapshot.write_text(yaml.dump(config, default_flow_style=False))
 
-    # ── Load or initialise generation state ──────────────────────────────────────
+    # ── Load or initialise generation state ────────────────────────────────────────────
     state_file = gen_dir / "state.json"
     if state_file.exists():
         state = GenerationState.load(gen_dir)
@@ -230,7 +230,7 @@ def run_single_generation(
             step_header(f"Generation {generation:02d} — {step}")
             state.mark_step_start(step)
 
-            # ── fit ─────────────────────────────────────────────────
+            # ── fit ───────────────────────────────────────────────
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential, resolve_train_cfg
                 from mlip_pipeline.checks import check_training_cfg_count
@@ -317,20 +317,20 @@ def run_single_generation(
                 if _generation_converged:
                     break
 
-            # ── label (prepare VASP input dirs) ───────────────────────
+            # ── label (prepare VASP input dirs) ───────────────────────────
             elif step == "label":
                 from mlip_pipeline.label.runner import run_labeling
                 run_labeling(config, paths)
                 state.label_prepared = True
                 state.save()
 
-            # ── label_local ─────────────────────────────────────────
+            # ── label_local ─────────────────────────────────────────────
             elif step == "label_local":
                 from mlip_pipeline.label.local_runner import run_vasp_local
                 label_result = LabelResult.load_manifest(label_dir)
                 run_vasp_local(label_result, config)
 
-            # ── label_hpc ───────────────────────────────────────────
+            # ── label_hpc ──────────────────────────────────────────────
             elif step == "label_hpc":
                 from mlip_pipeline.label.runner import run_labeling
                 from mlip_pipeline.io.dardel import (
@@ -453,14 +453,14 @@ def run_single_generation(
                         "VASP jobs likely failed — check job.sh env_block and vasp_cmd."
                     )
 
-            # ── convert ────────────────────────────────────────────
+            # ── convert ──────────────────────────────────────────────
             elif step == "convert":
                 from mlip_pipeline.data.outcar_to_cfg import convert_outcars_to_cfg
                 label_result   = LabelResult.load_manifest(label_dir)
                 convert_result = convert_outcars_to_cfg(label_result, config, resolved)
                 state.merged_cfg = str(convert_result.merged_cfg)
 
-            # ── evaluate ──────────────────────────────────────────
+            # ── evaluate ──────────────────────────────────────────────
             elif step == "evaluate":
                 from mlip_pipeline.evaluate.runner import run_evaluation
                 fit_result = _resolve_fit_result(config, paths, state)
@@ -488,7 +488,7 @@ def run_single_generation(
             state.mark_failed(exc)
         raise
 
-    # ── Converged: potential found no new structures at any cell size ────────────
+    # ── Converged: potential found no new structures at any cell size ─────────────
     if _generation_converged:
         state.converged_replicate_tier = state.replicate_tier
         state.status = "converged"
@@ -532,65 +532,91 @@ def run_loop(
     base_config = load_yaml(base_config_path)
     states: list[GenerationState] = []
     failed: list[int] = []
+    loop_started_at = _now()
 
-    for gen in range(start_gen, end_gen + 1):
-        info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
+    # Resolve runs_root once so LoopResult knows where to write
+    _cfg0     = _config_for_gen(base_config, start_gen)
+    _resolved = project_paths(_cfg0)
+    runs_root = _resolved["runs_root"]
 
-        prev_state: GenerationState | None = states[-1] if states else None
-        if prev_state is None and gen > 1:
-            prev_gen_dir = resolved_paths_for(base_config, gen - 1)
-            if prev_gen_dir and prev_gen_dir.exists():
-                try:
-                    prev_state = GenerationState.load(prev_gen_dir)
-                except Exception:
-                    warn(f"  Could not load state for gen_{gen - 1:02d} — skipping integrity check.")
+    stop_reason = "completed"  # updated below on early exit
 
-        if states and states[-1].merged_cfg:
-            base_config = copy.deepcopy(base_config)
-            base_config.setdefault("training", {})["origin_cfg"] = states[-1].merged_cfg
-            info(f"Using gen_{gen - 1:02d} merged_cfg as training set.")
+    try:
+        for gen in range(start_gen, end_gen + 1):
+            info(f"\n{'='*60}\nStarting generation {gen:02d} / {end_gen:02d}\n{'='*60}")
 
-        try:
-            state = run_single_generation(
-                base_config, gen,
-                force=force,
-                skip_steps=skip_steps,
-                only_steps=only_steps,
-                prev_state=prev_state,
-            )
-            states.append(state)
-        except Exception as exc:
-            error(f"Generation {gen:02d} failed: {exc}")
-            failed.append(gen)
-            if stop_on_failure:
-                error("Stopping. Re-run with same args to resume.")
+            prev_state: GenerationState | None = states[-1] if states else None
+            if prev_state is None and gen > 1:
+                prev_gen_dir = resolved_paths_for(base_config, gen - 1)
+                if prev_gen_dir and prev_gen_dir.exists():
+                    try:
+                        prev_state = GenerationState.load(prev_gen_dir)
+                    except Exception:
+                        warn(f"  Could not load state for gen_{gen - 1:02d} — skipping integrity check.")
+
+            if states and states[-1].merged_cfg:
+                base_config = copy.deepcopy(base_config)
+                base_config.setdefault("training", {})["origin_cfg"] = states[-1].merged_cfg
+                info(f"Using gen_{gen - 1:02d} merged_cfg as training set.")
+
+            try:
+                state = run_single_generation(
+                    base_config, gen,
+                    force=force,
+                    skip_steps=skip_steps,
+                    only_steps=only_steps,
+                    prev_state=prev_state,
+                )
+                states.append(state)
+            except Exception as exc:
+                error(f"Generation {gen:02d} failed: {exc}")
+                failed.append(gen)
+                if stop_on_failure:
+                    stop_reason = "failed"
+                    error("Stopping. Re-run with same args to resume.")
+                    break
+                warn("stop_on_failure=False — continuing to next generation.")
+                continue
+
+            # Stop the loop cleanly when the potential is converged
+            if state.status == "converged":
+                stop_reason = "converged"
+                success(
+                    f"Potential converged at generation {gen:02d} — "
+                    "no new structures found at any replicate tier. Loop complete."
+                )
                 break
-            warn("stop_on_failure=False — continuing to next generation.")
-            continue
 
-        # Stop the loop cleanly when the potential is converged
-        if state.status == "converged":
-            success(
-                f"Potential converged at generation {gen:02d} — "
-                "no new structures found at any replicate tier. Loop complete."
-            )
-            break
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+        warn("run_loop interrupted by user.")
 
     if failed:
         warn(f"Loop complete with {len(failed)} failure(s): {failed}")
     else:
         success(f"Loop finished (last gen processed: {gen:02d}).")
 
+    # ── Write loop_manifest.json ───────────────────────────────────────────
+    if states:
+        try:
+            loop_result = LoopResult.from_states(
+                runs_root=runs_root,
+                states=states,
+                start_gen=start_gen,
+                requested_end_gen=end_gen,
+                stop_reason=stop_reason,
+                started_at=loop_started_at,
+            )
+            manifest_path = loop_result.save()
+            info(f"Loop manifest → {manifest_path}")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Could not write loop_manifest.json (non-fatal): {exc}")
+
     # Feature #10: Auto-generate loop summary plots if ≥2 generations completed.
     completed_states = [s for s in states if s.status in ("completed", "converged")]
     if len(completed_states) >= 2:
         try:
             from mlip_pipeline.evaluate.loop_plots import collect_loop_records, plot_loop_summary
-            from mlip_pipeline.config import project_paths as _project_paths
-
-            _cfg      = _config_for_gen(base_config, start_gen)
-            _resolved = _project_paths(_cfg)
-            runs_root = _resolved["runs_root"]
 
             generations = [int(s.generation) for s in completed_states]
             records     = collect_loop_records(runs_root, generations)
