@@ -10,7 +10,7 @@ from mlip_pipeline.models import LabelResult, ScalingPolicy
 from mlip_pipeline.label.incar_writer import write_incar
 from mlip_pipeline.label.job_writer import write_job_sh
 from mlip_pipeline.select.runner import split_cfg_blocks
-from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists, write_json
+from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists
 
 
 # ---------------------------------------------------------------------------
@@ -134,19 +134,18 @@ def _scale_kpoints_file(src: Path, dest: Path, n_atoms: int, policy: ScalingPoli
         # Explicit list: too complex to auto-scale safely, just copy
         copy_if_exists(src, dest)
 
+
 def _write_vasp_inputs(template_dir: Path, task_dir: Path, n_atoms: int, label_cfg: dict):
     policy = ScalingPolicy(label_cfg.get("scaling_rules", {}))
     sys_cfg = policy.get_config(n_atoms)
 
-    # 1. KPOINTS with scaling
     _scale_kpoints_file(template_dir / "KPOINTS", task_dir / "KPOINTS", n_atoms, policy)
     copy_if_exists(template_dir / "POTCAR", task_dir / "POTCAR")
-
-    # 2. INCAR (merge base tags with the NCORE/KPAR from our policy)
     write_incar(task_dir, label_cfg["incar"], sys_cfg.to_incar_dict())
 
-    # 3. Job Script (Pass the sys_cfg object instead of just a dict)
-    write_job_sh(task_dir, n_atoms, slurm_cfg=label_cfg.get("slurm"), sys_override=sys_cfg)
+    # Fix: slurm is under dardel.slurm, not top-level label.slurm
+    slurm_cfg = label_cfg.get("dardel", {}).get("slurm") or label_cfg.get("slurm")
+    write_job_sh(task_dir, n_atoms, slurm_cfg=slurm_cfg, sys_override=sys_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +165,7 @@ def run_labeling(
       2. Copies KPOINTS + POTCAR from template_dir.
       3. Generates INCAR from config['label']['incar'] + auto parallelization.
       4. Generates job.sh from config['label']['slurm'] + auto parallelization.
-      5. Writes label_manifest.json.
+      5. Writes label_manifest.json via LabelResult.save_manifest().
     """
     label_cfg    = config["label"]
     runs_root    = resolved_paths["runs_root"]
@@ -226,22 +225,16 @@ def run_labeling(
         task_dirs.append(task_dir)
         print(f"  [{i+1:>4d}/{len(cfg_paths)}]  {cfg_path.name}  →  {task_dir.name}/  ({n_atoms} atoms)")
 
-    # ── manifest ──────────────────────────────────────────────────────────────
-    manifest_path = write_json(label_root / "label_manifest.json", {
-        "input_subdir":  str(select_root),
-        "output_subdir": str(label_root),
-        "type_map":      type_map,
-        "template_dir":  str(template_dir),
-        "task_count":    len(task_dirs),
-        "task_dirs":     [str(t) for t in task_dirs],
-    })
-
-    print(f"\nDone. {len(task_dirs)} VASP task(s) written to {label_root}/")
-    print(f"Manifest: {manifest_path}")
-
-    return LabelResult(
+    # ── manifest via dataclass ────────────────────────────────────────────────
+    result = LabelResult(
         label_root=label_root,
         task_dirs=task_dirs,
         task_count=len(task_dirs),
-        manifest_path=manifest_path,
+        type_map=type_map,
+        template_dir=template_dir,
     )
+    result.save_manifest()
+
+    print(f"\nDone. {len(task_dirs)} VASP task(s) written to {label_root}/")
+    print(f"Manifest: {result.manifest_path}")
+    return result

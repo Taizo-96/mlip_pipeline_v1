@@ -1,0 +1,201 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Pb_loop.yaml  –  Single source of truth for the Pb mlip_pipeline
+#
+# Template syntax:  {{ key }}  or  {{ section.key }}
+# The `generation` key is injected automatically by run-loop / run-gen.
+# To run a single generation manually, add:  generation: "07"  at the top.
+# ═══════════════════════════════════════════════════════════════════════════
+
+project_root: "/home/saitto/mlip_pipeline_v1"
+
+paths:
+  data_root:       "/home/saitto/data"
+  runs_root:       "{{ project_root }}/runs"
+  structures_root: "{{ project_root }}/structures"
+  datasets_root:   "{{ project_root }}/datasets"
+
+
+# ── Shared MPI defaults ────────────────────────────────────────────────────────
+# Used by all sections via {{ mpi.prefix }} / {{ mpi.np }}.
+# To override for a specific step only, set mpi_prefix / mpi_np directly
+# in that section with a plain string, e.g.:
+#   fit:
+#     mpi_prefix: "mpirun --oversubscribe -np 64"
+#   select:
+#     mpi_np: 32
+mpi:
+  np:     32
+  prefix: "mpirun -np 32"
+
+
+# ── Binary paths  (machine-specific) ──────────────────────────────────────
+bins:
+  mlp:    "mlp"
+  lammps: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
+  vasp:   "vasp_std"
+
+
+# ── Materials Project ────────────────────────────────────────────────────────
+materials_project:
+  api_key:              "${MP_API_KEY}"
+  material_ids:         ["mp-20483"]
+  conventional_cell:    true
+  output_subdir:        "mp_raw"
+  export_lammps_data:   true
+  lammps_output_subdir: "lammps_data"
+  lammps_atom_style:    "atomic"
+  ff_elements:          ["Pb"]
+
+
+# ── Training set ─────────────────────────────────────────────────────────────
+training:
+  input_glob:    "Pb*"
+  output_subdir: "pb_cfg"
+  merge_name:    "train.cfg"
+
+
+# ── Fit ──────────────────────────────────────────────────────────────────────
+fit:
+  mlp_command:            "{{ bins.mlp }}"
+  mpi_prefix:             "mpirun --oversubscribe -np 64"
+  template_dir:           "{{ project_root }}/MTP_templates"
+  mtp_level:              16
+  trained_potential_name: "Pb{{ mtp_level }}.almtp"
+  train_cfg:              "{{ paths.datasets_root }}/converted_cfg/train.cfg"
+  extra_args:
+    - "--energy-weight=1"
+    - "--force-weight=0.01"
+    - "--stress-weight=0.001"
+    - "--max-iter=1000"
+
+
+# ── Explore ───────────────────────────────────────────────────────────────────
+explore:
+  lammps_command: "{{ bins.lammps }}"
+  mpi_prefix:     "{{ mpi.prefix }}"
+
+  temperatures: [300, 400, 500, 550, 580, 590, 610, 620, 650, 700, 900, 1000, 1100, 1200, 1300, 1400]
+  pressure_bar: [0, 1, 5, 10]
+  ensemble:     "npt"
+  timestep:     0.00001
+  nsteps:       50000
+  dump_every:   50
+  seed_base:    492845
+
+  replicate: [1, 1, 1]
+  replicate_schedule:
+    - [1, 1, 1]
+    - [2, 2, 2]
+    - [3, 3, 3]
+    - [4, 4, 4]
+    - [4, 4, 5]
+    - [4, 5, 5]
+
+
+  tdamp:         2
+  pdamp:         10.0
+  neighbor_skin: 4.0
+  thermo_every:  50
+  nvt_pre_steps: 2000
+
+  dump:
+    attributes: [id, type, x, y, z, fx, fy, fz]
+    sort:   id
+    pbc:    yes
+    unwrap: no
+    time:   yes
+    units:  yes
+
+  active_learning:
+    enabled:               true
+    threshold_save:        1.5
+    threshold_break:       10.0
+    save_extrapolative_to: "preselected.cfg"
+
+  stabilization:
+    neigh_modify:
+      every: 1
+      delay: 0
+      check: "yes"
+    velocity_scale: false
+    momentum_fix:
+      every:   1
+      linear:  [1, 1, 1]
+      rescale: true
+
+
+# ── Select ──────────────────────────────────────────────────────────────────────
+select:
+  mlip_command:               "{{ bins.mlp }}"
+  mpi_np:                     "{{ mpi.np }}"
+  strategy:                   "mlip_select_add"
+  candidate_filename:         "preselected.cfg"
+  merged_candidates_filename: "candidates_merged.cfg"
+  selected_filename:          "selected.cfg"
+  training_cfg:               "{{ paths.datasets_root }}/converted_cfg/train.cfg"
+  write_manifest:             true
+
+
+# ── Label ─────────────────────────────────────────────────────────────────────────
+label:
+  type_map:          "{{ paths.data_root }}/Pb108eq/type_map.raw"
+  template_dir:      "{{ paths.datasets_root }}/vasp_template"
+  selected_filename: "selected.cfg"
+
+  incar:
+    ALGO:   Fast
+    PREC:   Accurate
+    ISTART: 0
+    ICHARG: 2
+    LREAL:  ".False."
+    LWAVE:  ".False."
+    ENCUT:  400
+    NELM:   200
+    EDIFF:  1.0E-05
+    IBRION: -1
+    EDIFFG: -0.01
+    ISIF:   0
+    ISMEAR: 1
+    SIGMA:  0.2
+    NSW:    0
+
+  scaling_rules:
+    1:
+      partition: "shared"
+      nodes: 1
+      ntasks: 32
+      ncore: 1
+      kpar: 16
+    150:
+      partition: "main"
+      nodes: 2
+      ntasks: 256
+      ncore: 32
+      kpar: 2
+
+  dardel:
+    user:          "saitto"
+    host:          "dardel.pdc.kth.se"
+    remote_root:   "/cfs/klemming/projects/supr/faster/saitto/mlip_pipeline_v1"
+    poll_interval: 60
+  slurm:
+    account: "naiss2025-3-54"
+    time: "01:00:00"
+    vasp_cmd: "vasp_std"
+    env_block: |
+      export PATH=/cfs/klemming/home/a/aayushgs/vasp.5.4.4/bin:$PATH
+      module load PrgEnv-intel/8.5.0
+
+  local:
+    source_env: "~/vasp_env.sh"
+    vasp_bin:   "{{ bins.vasp }}"
+    np:         32
+    parallel:   4
+
+
+# ── Convert ──────────────────────────────────────────────────────────────────══
+convert:
+  output_subdir: "converted_cfg"
+  merge_name:    "train.cfg"
+  # run_name is derived automatically from the generation number
+  # origin_cfg is injected automatically by run-loop from previous gen
