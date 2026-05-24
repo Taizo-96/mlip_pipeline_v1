@@ -238,7 +238,7 @@ def _plot_rmse_combined(records: list[dict], dest: Path) -> Path:
         ax1.set_ylabel("Energy RMSE  (eV/atom)", color=_TEAL)
         ax1.tick_params(axis="y", labelcolor=_TEAL)
         ax1.set_xticks(_gens(records))
-        _mark_failed(ax1, records)
+        #_mark_failed(ax1, records)
 
         if f_gens:
             ax2 = ax1.twinx()
@@ -272,7 +272,7 @@ def _plot_rmse_energy(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("RMSE  (eV/atom)")
         ax.set_title("Energy RMSE vs Generation")
         ax.set_xticks(_gens(records))
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
         fig.tight_layout()
         fig.savefig(dest)
         plt.close(fig)
@@ -290,7 +290,7 @@ def _plot_rmse_forces(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("RMSE  (eV/Å)")
         ax.set_title("Forces RMSE vs Generation")
         ax.set_xticks(_gens(records))
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
         fig.tight_layout()
         fig.savefig(dest)
         plt.close(fig)
@@ -308,7 +308,7 @@ def _plot_rmse_stress(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("RMSE  (GPa)")
         ax.set_title("Stress RMSE vs Generation")
         ax.set_xticks(_gens(records))
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
         fig.tight_layout()
         fig.savefig(dest)
         plt.close(fig)
@@ -316,13 +316,7 @@ def _plot_rmse_stress(records: list[dict], dest: Path) -> Path:
 
 
 def _plot_training_size(records: list[dict], dest: Path) -> Path:
-    """Training set growth: cumulative line (left y) + per-gen delta bars (right y).
-
-    When the total dataset is ~10 K configs and only changes by tens per gen,
-    a plain bar chart gives the illusion of a flat line.  This dual-axis view
-    makes *both* the absolute scale and the incremental additions readable at
-    the same time.
-    """
+    """Training set growth: cumulative line plot."""
     gens, vals = [], []
     for r in records:
         v = r.get("n_train_cfgs", -1)
@@ -341,41 +335,27 @@ def _plot_training_size(records: list[dict], dest: Path) -> Path:
             plt.close(fig)
         return dest
 
-    # per-generation deltas (first gen delta = its full size)
-    deltas = [vals[0]] + [vals[i] - vals[i - 1] for i in range(1, len(vals))]
-
     with plt.rc_context(_STYLE):
-        fig, ax1 = plt.subplots(figsize=(7, 4))
+        fig, ax = plt.subplots(figsize=(7, 4))
 
-        # right axis — deltas as bars (drawn first so line sits on top)
-        ax2 = ax1.twinx()
-        bar_colors = [_GREEN if d >= 0 else _RED for d in deltas]
-        ax2.bar(gens, deltas, color=bar_colors, alpha=0.4, width=0.55,
-                label="Added configs (Δ)")
-        ax2.set_ylabel("Configs added per generation  (Δ)", color=_GREEN, fontsize=10)
-        ax2.tick_params(axis="y", labelcolor=_GREEN)
-        ax2.spines["top"].set_visible(False)
-        # keep delta axis from being dwarfed by the cumulative scale
-        if max(abs(d) for d in deltas) > 0:
-            delta_range = max(abs(d) for d in deltas)
-            ax2.set_ylim(-delta_range * 0.5, delta_range * 3.5)
+        # Plot cumulative total as a line
+        ax.plot(gens, vals, "-o", color=_TEAL, linewidth=2.0, markersize=6,
+                label="Cumulative total")
 
-        # left axis — cumulative total as a line
-        ax1.plot(gens, vals, "-o", color=_TEAL, linewidth=2.0, markersize=6,
-                 label="Cumulative total", zorder=3)
-        # tight y-range so small movements are visible
+        # Tight y-range so small movements remain visible
         margin = max((max(vals) - min(vals)) * 0.5, 1)
-        ax1.set_ylim(min(vals) - margin, max(vals) + margin)
-        ax1.set_xlabel("Generation")
-        ax1.set_ylabel("Total training configurations", color=_TEAL)
-        ax1.tick_params(axis="y", labelcolor=_TEAL)
-        ax1.set_title("Training Set Growth vs Generation")
-        ax1.set_xticks(gens)
+        ax.set_ylim(min(vals) - margin, max(vals) + margin)
 
-        # unified legend
-        h1, l1 = ax1.get_legend_handles_labels()
-        h2, l2 = ax2.get_legend_handles_labels()
-        ax1.legend(h1 + h2, l1 + l2, fontsize=9)
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Total training configurations", color=_TEAL)
+        ax.tick_params(axis="y", labelcolor=_TEAL)
+        ax.set_title("Training Set Growth vs Generation")
+        ax.set_xticks(gens)
+
+        # Simplified legend since we only have one axis
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=9)
 
         fig.tight_layout()
         fig.savefig(dest)
@@ -433,7 +413,7 @@ def _plot_rmse_pct_change(records: list[dict], dest: Path) -> Path:
         all_gens = sorted(set(e_pg + f_pg))
         if all_gens:
             ax.set_xticks(all_gens)
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
         ax.legend(fontsize=9)
         fig.tight_layout()
         fig.savefig(dest)
@@ -501,30 +481,14 @@ def _plot_gamma_evolution(records: list[dict], dest: Path) -> Path:
             ax.plot(max_gens, max_vals, "--s", color=_BROWN, linewidth=1.6,
                     markersize=5, label="max \u03b3")
 
-        has_save  = any(math.isfinite(r.get("frac_above_save",  float("nan"))) for r in records)
-
-        ax2 = None
-        if has_save:
-            fs_gens, fs_vals = _valid(records, "frac_above_save")
-            if fs_gens:
-                ax2 = ax.twinx()
-                ax2.bar(fs_gens, fs_vals, color=_GREEN, alpha=0.25, width=0.5,
-                        label="frac > \u03b3_save")
-                ax2.set_ylabel("Fraction above save threshold", fontsize=9)
-                ax2.set_ylim(0, max(fs_vals) * 2 + 0.01)
-                ax2.spines["top"].set_visible(False)
-
         ax.set_xlabel("Generation")
         ax.set_ylabel("Extrapolation grade \u03b3")
         ax.set_title("Gamma Evolution vs Generation")
         ax.set_xticks(_gens(records))
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
 
+        # Legend handles are simplified since we only have the primary axis lines
         handles, labels = ax.get_legend_handles_labels()
-        if ax2 is not None:
-            h2, l2 = ax2.get_legend_handles_labels()
-            handles += h2
-            labels  += l2
         if handles:
             ax.legend(handles, labels, fontsize=9)
 
@@ -533,15 +497,14 @@ def _plot_gamma_evolution(records: list[dict], dest: Path) -> Path:
         plt.close(fig)
     return dest
 
-
 def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
     """
     2×2 combined summary panel.
 
     Top-left:  energy + forces RMSE on dual y-axes.
-    Top-right: training set growth (cumulative + delta).
-    Bottom-left: selected structures.
-    Bottom-right: gamma evolution.
+    Top-right: training set growth (cumulative line only).
+    Bottom-left: selected structures (bars only).
+    Bottom-right: gamma evolution (lines only).
     """
     with plt.rc_context(_STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -561,7 +524,7 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax1.tick_params(axis="y", labelcolor=_TEAL)
         ax1.set_title("RMSE: Energy | Forces")
         ax1.set_xticks(_gens(records))
-        _mark_failed(ax1, records)
+        #_mark_failed(ax1, records)
 
         if f_gens:
             ax1r = ax1.twinx()
@@ -577,24 +540,14 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         else:
             ax1.legend(fontsize=8)
 
-        # ── top-right: training set growth (cumulative + delta) ──────────────
+        # ── top-right: training set growth (cumulative line only) ───────────
         ax_t = axes[0, 1]
         gens_t = [r["generation"] for r in records if r.get("n_train_cfgs", -1) >= 0]
         vals_t = [r["n_train_cfgs"] for r in records if r.get("n_train_cfgs", -1) >= 0]
         if gens_t:
-            deltas_t = [vals_t[0]] + [vals_t[i] - vals_t[i-1] for i in range(1, len(vals_t))]
-            ax_t2 = ax_t.twinx()
-            bar_colors = [_GREEN if d >= 0 else _RED for d in deltas_t]
-            ax_t2.bar(gens_t, deltas_t, color=bar_colors, alpha=0.35, width=0.55)
-            ax_t2.set_ylabel("Configs added (Δ)", color=_GREEN, fontsize=9)
-            ax_t2.tick_params(axis="y", labelcolor=_GREEN)
-            ax_t2.spines["top"].set_visible(False)
-            if max(abs(d) for d in deltas_t) > 0:
-                dr = max(abs(d) for d in deltas_t)
-                ax_t2.set_ylim(-dr * 0.5, dr * 3.5)
             margin_t = max((max(vals_t) - min(vals_t)) * 0.5, 1)
             ax_t.plot(gens_t, vals_t, "-o", color=_TEAL, linewidth=1.6,
-                      markersize=5, zorder=3)
+                      markersize=5)
             ax_t.set_ylim(min(vals_t) - margin_t, max(vals_t) + margin_t)
         ax_t.set_xlabel("Generation")
         ax_t.set_ylabel("Total configs", color=_TEAL)
@@ -602,7 +555,7 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax_t.set_title("Training Set Growth")
         ax_t.set_xticks(_gens(records))
 
-        # ── bottom-left: selected structures ──────────────────────────────
+        # ── bottom-left: selected structures (bars only) ───────────────────
         ax = axes[1, 0]
         gens_s = [r["generation"] for r in records if r.get("selected_count", -1) >= 0]
         vals_s = [r["selected_count"] for r in records if r.get("selected_count", -1) >= 0]
@@ -613,7 +566,7 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax.set_title("New Structures Selected")
         ax.set_xticks(_gens(records))
 
-        # ── bottom-right: gamma evolution ─────────────────────────────────
+        # ── bottom-right: gamma evolution (lines only) ─────────────────────
         ax = axes[1, 1]
         mean_gg, mean_vv = _valid(records, "mean_gamma")
         max_gg,  max_vv  = _valid(records, "max_gamma")
@@ -627,7 +580,7 @@ def _plot_summary_panel(records: list[dict], dest: Path) -> Path:
         ax.set_ylabel("Extrapolation grade \u03b3")
         ax.set_title("Gamma Evolution")
         ax.set_xticks(_gens(records))
-        _mark_failed(ax, records)
+        #_mark_failed(ax, records)
         ax.legend(fontsize=8)
 
         fig.tight_layout()
