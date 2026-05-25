@@ -1,0 +1,29 @@
+# requirements.txt — pinned runtime dependencies for reproducible installs.
+#
+# Generated from pyproject.toml [project.dependencies].
+# Install on a new machine with:
+#
+#   pip install -r requirements.txt
+#
+# Or install the package itself (editable) with all deps:
+#
+#   pip install -e .
+#
+# For a fully-pinned lock file use pip-compile (pip-tools):
+#
+#   pip install pip-tools
+#   pip-compile pyproject.toml -o requirements-lock.txt
+
+# Core
+PyYAML>=6.0
+typer>=0.9
+numpy>=1.24
+rich>=13.0
+
+# Materials Project integration
+mp-api>=0.41
+requests>=2.31
+
+# Optional: type stubs, linting (not required at runtime)
+# ruff>=0.4
+# pytest>=7.0

@@ -4,6 +4,10 @@
 # Template syntax:  {{ key }}  or  {{ section.key }}
 # The `generation` key is injected automatically by run-loop / run-gen.
 # To run a single generation manually, add:  generation: "07"  at the top.
+#
+# NOTE: The [training] section has been removed.  Initial training-set
+# preparation (DeePMD → CFG conversion) is a one-time step handled by:
+#   python scripts/prepare_initial_training.py --data-root /path/to/systems ...
 # ═══════════════════════════════════════════════════════════════════════════
 
 project_root: "/home/saitto/mlip_pipeline_v1"
@@ -45,13 +49,6 @@ materials_project:
   lammps_output_subdir: "lammps_data"
   lammps_atom_style:    "atomic"
   ff_elements:          ["Pb"]
-
-
-# ── Training set ─────────────────────────────────────────────────────────────
-training:
-  input_glob:    "Pb*"
-  output_subdir: "pb_cfg"
-  merge_name:    "train.cfg"
 
 
 # ── Fit ──────────────────────────────────────────────────────────────────────
