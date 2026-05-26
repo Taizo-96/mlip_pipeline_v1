@@ -11,10 +11,21 @@ initial training set before calling ``mlip-pipeline fit``.
 
 Usage
 -----
-    python scripts/prepare_initial_training.py \
-        --data-root /path/to/deepmd/systems \
-        --output-dir /path/to/datasets/fe_cfg \
+    # Recommended — read output paths directly from your pipeline config:
+    python scripts/prepare_initial_training.py \\
+        --config configs/Fe_loop.yaml \\
+        --data-root /path/to/deepmd/systems \\
+        --type-map-elements Fe Pb
+
+    # Legacy — explicit output directory (no config needed):
+    python scripts/prepare_initial_training.py \\
+        --data-root /path/to/deepmd/systems \\
+        --output-dir /path/to/datasets/converted_cfg \\
         --merge-name train.cfg
+
+When --config is supplied:
+  * output-dir  →  <datasets_root>/converted_cfg          (from paths.datasets_root)
+  * vasp_template + type_map.raw are created automatically under <datasets_root>/vasp_template
 
 The script walks the full directory tree under --data-root and automatically
 finds every valid DeePMD system (any folder containing set.000/ with the
@@ -32,6 +43,10 @@ from pathlib import Path
 
 import numpy as np
 
+
+# ---------------------------------------------------------------------------
+# DeePMD helpers
+# ---------------------------------------------------------------------------
 
 def _is_valid_system(directory: Path) -> bool:
     """Return True if directory looks like a complete DeePMD system."""
@@ -53,7 +68,6 @@ def _find_all_systems(data_root: Path) -> list[Path]:
         candidate = Path(dirpath)
         if _is_valid_system(candidate):
             systems.append(candidate)
-            # Don't descend further into a valid system folder
             dirnames.clear()
     return sorted(systems)
 
@@ -115,13 +129,81 @@ def _write_cfg(system_dir: Path, out_path: Path) -> int:
     return nframes
 
 
+# ---------------------------------------------------------------------------
+# vasp_template scaffold
+# ---------------------------------------------------------------------------
+
+def _create_vasp_template(datasets_root: Path, elements: list[str]) -> Path:
+    """Create datasets_root/vasp_template/ and write type_map.raw.
+
+    Returns the path to the vasp_template directory.
+    """
+    tmpl_dir = datasets_root / "vasp_template"
+    tmpl_dir.mkdir(parents=True, exist_ok=True)
+
+    type_map_path = tmpl_dir / "type_map.raw"
+    type_map_path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+    print(f"vasp_template created : {tmpl_dir}/")
+    print(f"type_map.raw          : {type_map_path}  ({' '.join(elements)})")
+
+    # Remind the user about files they must supply manually
+    for fname in ("POTCAR", "KPOINTS"):
+        fpath = tmpl_dir / fname
+        if not fpath.exists():
+            print(f"  [REMINDER] copy your {fname} into {tmpl_dir}/")
+
+    return tmpl_dir
+
+
+# ---------------------------------------------------------------------------
+# Config reader (minimal — no jinja2/pyyaml required)
+# ---------------------------------------------------------------------------
+
+def _resolve_datasets_root(config_path: Path) -> Path:
+    """
+    Parse the YAML config just enough to resolve paths.datasets_root.
+
+    Handles the {{ project_root }} template token used in the pipeline configs.
+    Does not require pyyaml to be importable (falls back to a line-by-line scan).
+    """
+    try:
+        import yaml  # type: ignore
+        with open(config_path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+        project_root = raw.get("project_root", "")
+        datasets_root = raw.get("paths", {}).get("datasets_root", "")
+        datasets_root = datasets_root.replace("{{ project_root }}", project_root)
+        return Path(datasets_root)
+    except Exception:
+        pass
+
+    # Fallback: naive line scan
+    project_root = ""
+    datasets_root = ""
+    with open(config_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("project_root:"):
+                project_root = line.split(":", 1)[1].strip().strip('"').strip("'")
+            if "datasets_root:" in line:
+                datasets_root = line.split(":", 1)[1].strip().strip('"').strip("'")
+                datasets_root = datasets_root.replace("{{ project_root }}", project_root)
+    if not datasets_root:
+        raise ValueError(f"Could not resolve paths.datasets_root from {config_path}")
+    return Path(datasets_root)
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
 def prepare(
     data_root: str | Path,
-    output_dir: str | Path = "fe_cfg",
+    output_dir: str | Path,
     merge_name: str = "train.cfg",
     manifest_name: str = "manifest.json",
 ) -> Path:
-    """Main entry-point for the script.
+    """Convert all DeePMD systems and merge into a single train.cfg.
 
     Returns the path to the merged .cfg file.
     """
@@ -137,12 +219,11 @@ def prepare(
 
     print(f"Found {len(systems)} system(s) under {data_root}\n")
 
-    generated:  list[Path]       = []
-    cfg_counts: dict[str, int]   = {}
-    total_cfgs: int              = 0
+    generated:  list[Path]     = []
+    cfg_counts: dict[str, int] = {}
+    total_cfgs: int            = 0
 
     for system_dir in systems:
-        # Use the relative path as a unique name to avoid collisions
         rel_name = str(system_dir.relative_to(data_root)).replace(os.sep, "_")
         out_path = output_dir / f"{rel_name}.cfg"
         n_cfgs   = _write_cfg(system_dir, out_path)
@@ -164,10 +245,10 @@ def prepare(
 
     manifest_path = output_dir / manifest_name
     manifest = {
-        "total_cfgs":      total_cfgs,
-        "per_system":      cfg_counts,
-        "merged_cfg":      str(merged_cfg) if merged_cfg is not None else None,
-        "generated_cfgs":  [str(p) for p in generated],
+        "total_cfgs":     total_cfgs,
+        "per_system":     cfg_counts,
+        "merged_cfg":     str(merged_cfg) if merged_cfg is not None else None,
+        "generated_cfgs": [str(p) for p in generated],
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -178,17 +259,87 @@ def prepare(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert all DeePMD systems (nested or flat) to a single MLIP-3 train.cfg."
+        description=(
+            "Convert all DeePMD systems (nested or flat) to a single MLIP-3 train.cfg.\n\n"
+            "Pass --config to read output paths automatically from your pipeline YAML.\n"
+            "Pass --output-dir to specify the output directory explicitly (legacy mode)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--data-root",  required=True, help="Root directory to search recursively")
-    parser.add_argument("--output-dir", default="fe_cfg", help="Output directory for .cfg files")
-    parser.add_argument("--merge-name", default="train.cfg", help="Filename for merged .cfg")
-    parser.add_argument("--manifest",   default="manifest.json", help="Filename for manifest JSON")
+
+    parser.add_argument(
+        "--data-root", required=True,
+        help="Root directory to search recursively for DeePMD systems",
+    )
+    parser.add_argument(
+        "--config",
+        help=(
+            "Path to pipeline YAML config (e.g. configs/Fe_loop.yaml). "
+            "When given, --output-dir defaults to <datasets_root>/converted_cfg "
+            "and vasp_template/type_map.raw is created automatically."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Output directory for .cfg files (overrides config; default: <datasets_root>/converted_cfg)",
+    )
+    parser.add_argument(
+        "--merge-name", default="train.cfg",
+        help="Filename for merged .cfg (default: train.cfg)",
+    )
+    parser.add_argument(
+        "--manifest", default="manifest.json",
+        help="Filename for manifest JSON (default: manifest.json)",
+    )
+    parser.add_argument(
+        "--type-map-elements", nargs="+", default=None,
+        metavar="ELEMENT",
+        help=(
+            "Ordered element list for type_map.raw, e.g. --type-map-elements Fe Pb. "
+            "Required when --config is used and vasp_template does not yet exist."
+        ),
+    )
+
     args = parser.parse_args()
 
+    # ── Resolve output directory ──────────────────────────────────────────
+    datasets_root: Path | None = None
+
+    if args.config:
+        datasets_root = _resolve_datasets_root(Path(args.config))
+        output_dir    = Path(args.output_dir) if args.output_dir else datasets_root / "converted_cfg"
+        print(f"Config          : {args.config}")
+        print(f"datasets_root   : {datasets_root}")
+        print(f"output_dir      : {output_dir}\n")
+    elif args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        parser.error("Provide either --config or --output-dir.")
+
+    # ── vasp_template scaffold ────────────────────────────────────────────
+    if datasets_root is not None:
+        elements = args.type_map_elements
+        if not elements:
+            # Try to read ff_elements from config as a fallback
+            try:
+                import yaml  # type: ignore
+                with open(args.config, encoding="utf-8") as f:
+                    raw = yaml.safe_load(f)
+                elements = raw.get("materials_project", {}).get("ff_elements")
+            except Exception:
+                pass
+        if not elements:
+            parser.error(
+                "--type-map-elements is required when using --config "
+                "(e.g. --type-map-elements Fe Pb)"
+            )
+        _create_vasp_template(datasets_root, elements)
+        print()
+
+    # ── Convert + merge ───────────────────────────────────────────────────
     prepare(
         data_root     = args.data_root,
-        output_dir    = args.output_dir,
+        output_dir    = output_dir,
         merge_name    = args.merge_name,
         manifest_name = args.manifest,
     )
