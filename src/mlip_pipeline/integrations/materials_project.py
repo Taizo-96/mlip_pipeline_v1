@@ -17,7 +17,7 @@ def download_structures_from_mp(config: dict, resolved_paths: dict) -> list[Path
         raise RuntimeError('mp-api is required for Materials Project downloads') from e
 
     out_dir = ensure_dir(resolved_paths['structures_root'] / mp_cfg.get('output_subdir', 'mp_raw'))
-    api_key = mp_cfg.get('api_key')
+    api_key = mp_cfg.get('api_key') or None
     downloaded: list[Path] = []
 
     with MPRester(api_key) as mpr:

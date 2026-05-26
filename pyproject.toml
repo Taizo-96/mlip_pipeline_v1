@@ -9,6 +9,8 @@ description = "Active-learning pipeline for MLIP-3 MTP fitting with LAMMPS explo
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # Atomic structures & data handling
+    "ase>=3.22",
     # Config & CLI
     "PyYAML>=6.0",
     "typer>=0.9",

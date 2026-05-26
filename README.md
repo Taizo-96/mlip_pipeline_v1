@@ -278,7 +278,7 @@ generations.
 
 ## Design notes
 
-### Manifest JSON (no duplication)
+### Manifest JSON
 
 Every step result dataclass (`FitResult`, `ExploreResult`, `SelectionResult`, etc.)
 has a unified `save_manifest()` / `load_manifest()` interface that writes a single
