@@ -48,12 +48,7 @@ def _safe_mpi_np(
     cutoff: Optional[float] = None,
     supercell_repeat: int = 1,
 ) -> int:
-    """Return safe MPI rank count, accounting for supercell replication.
-
-    The data file describes the *unit cell*; the actual simulation box is
-    replicate_factor times larger.  We scale up the atom count and box
-    lengths before applying the cutoff / atom-count caps.
-    """
+    """Return safe MPI rank count, accounting for supercell replication."""
     if requested is None or requested <= 1:
         return requested if requested is not None else 1
     cap = requested
@@ -216,15 +211,12 @@ def write_melting_input(
     Protocol
     --------
     1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
-    2. Split atoms into two halves by z-coordinate.
-    3. Heat the upper half to 3*T_target in NVT to create liquid seed, then
-       cool back to T_target.
-    4. Run NPT at T_target; monitor volume drift -> written to coex_thermo.txt.
-
-    Volume trend classification (done in Python after the run):
-    - volume expanding -> liquid growing  -> T > T_melt
-    - volume shrinking -> solid growing   -> T < T_melt
-    - volume stable    -> at coexistence  -> T ≈ T_melt
+    2. Split atoms by z using a small epsilon offset so no atom sits exactly
+       on the boundary (avoids double-integration warning).
+    3. Gently ramp the liquid half from T to 3*T over n_equil steps (NVT),
+       while holding the solid half at T.  Using a ramp instead of an
+       instant velocity re-assignment prevents 'Lost atoms' crashes.
+    4. Run NPT at T_target (whole cell); monitor volume -> coex_thermo.txt.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -232,6 +224,8 @@ def write_melting_input(
     script_path = work_dir / "melting.in"
 
     T_heat = 3.0 * temperature
+    # Use a shorter timestep during the violent heating phase
+    dt_heat = dt / 4.0
 
     lines = [
         "units           metal",
@@ -244,26 +238,33 @@ def write_melting_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
+        "# --- minimise first ---",
+        "minimize        1e-8 1e-10 5000 50000",
+        "",
         "# --- split into solid (lo-z) and liquid (hi-z) halves ---",
-        "variable        zmid   equal (zlo+zhi)/2.0",
+        "# Use epsilon offset so no atom sits exactly on the boundary",
+        "variable        Lz     equal lz",
+        "variable        zmid   equal (zlo+zhi)/2.0 + 1e-6*v_Lz",
         "region          solid_region  block INF INF INF INF INF ${zmid} units box",
         "region          liquid_region block INF INF INF INF ${zmid} INF units box",
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
-        "# --- minimise ---",
-        "minimize        1e-8 1e-10 5000 50000",
+        f"timestep        {dt_heat}",
+        "thermo_modify   flush yes lost ignore",
         "",
-        f"timestep        {dt}",
-        "thermo_modify   flush yes",
-        "",
-        "# --- heat liquid half to 3*T to create melt seed, hold solid at T ---",
+        "# --- initialise velocities at T, then RAMP liquid half to 3*T ---",
+        "# Gentle ramp prevents 'Lost atoms' from instant high-T assignment",
         f"velocity        all         create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        f"fix             fxL liquid_atoms nvt temp {T_heat:.1f}      {T_heat:.1f}      $(100*dt)",
+        f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(200*dt)",
+        f"fix             fxL liquid_atoms nvt temp {temperature:.1f} {T_heat:.1f}   $(200*dt)",
         f"run             {n_equil}",
         "unfix           fxS",
         "unfix           fxL",
+        "",
+        "# --- switch to production timestep and restore lost=error ---",
+        f"timestep        {dt}",
+        "thermo_modify   lost error",
         "",
         "# --- production NPT at T_target (whole cell) ---",
         f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} $(100*dt) "
@@ -272,9 +273,6 @@ def write_melting_input(
         "thermo_style    custom step temp vol pe",
         "thermo          50",
         "",
-        # Write header once with 'file' (overwrites), then use 'fix print'
-        # with 'append' for the data rows.  No title= argument to avoid
-        # duplicate header lines that confuse the Python parser.
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
@@ -298,10 +296,6 @@ def write_thermal_expansion_input(
     n_prod: int = 10000,
     seed: int = 42,
 ) -> Path:
-    """NPT run at each temperature; print average volume per atom.
-
-    Output: thexp_output.txt  with lines:  T  <vol_per_atom>
-    """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     out_file  = (work_dir / "thexp_output.txt").resolve()
@@ -349,11 +343,6 @@ def write_vacancy_inputs(
     *,
     supercell_repeat: int = 3,
 ) -> tuple[Path, Path]:
-    """Write two LAMMPS input scripts: perfect supercell and vacancy supercell.
-
-    Returns (perfect_script, vacancy_script).
-    Output files: perfect_energy.txt, vacancy_energy.txt.
-    """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
 
@@ -408,21 +397,22 @@ def write_rdf_input(
 ) -> Path:
     """NVT MD run followed by compute rdf accumulation.
 
-    The 'cutoff' keyword in compute rdf is not available in older LAMMPS
-    builds; r_max is enforced via the pair_style cutoff instead.  The
-    output is the standard ave/time multi-column file (rdf_output.txt).
+    ave/time parameters:
+      Nevery  = 10          sample every 10 steps
+      Nfreq   = n_prod//10  output every n_prod//10 steps (10 output blocks)
+      Nrepeat = Nfreq//10   average Nrepeat samples into each output block
+
+    This ensures Nevery * Nrepeat <= Nfreq (LAMMPS requirement) and that
+    the compute fires multiple times during the production run.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     out_file  = (work_dir / "rdf_output.txt").resolve()
     script_path = work_dir / "rdf.in"
 
-    # ave/time parameters: sample every 10 steps, average over n_prod steps
-    # Nrepeat = n_prod // 10  (number of samples per output block)
-    # Nfreq   = n_prod        (output once at the end of the production run)
     n_every  = 10
-    n_repeat = n_prod // n_every
-    n_freq   = n_prod
+    n_freq   = max(n_every * 2, n_prod // 10)   # output 10 times during production
+    n_repeat = n_freq // n_every                  # Nevery * Nrepeat == Nfreq
 
     lines = [
         "units           metal",
@@ -446,11 +436,11 @@ def write_rdf_input(
         "# --- equilibration ---",
         f"run             {n_equil}",
         "",
-        "# --- RDF accumulation (no 'cutoff' keyword for compatibility) ---",
+        "# --- RDF accumulation ---",
         f"compute         rdf_c all rdf {n_bins}",
         f"fix             rdf_avg all ave/time {n_every} {n_repeat} {n_freq} "
         f"c_rdf_c[*] file {out_file} mode vector",
-        f"run             {n_freq}",
+        f"run             {n_prod}",
         "unfix           fxNVT",
         "unfix           rdf_avg",
     ]
