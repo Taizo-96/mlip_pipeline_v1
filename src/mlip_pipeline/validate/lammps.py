@@ -4,9 +4,53 @@ Only builds input scripts and runs LAMMPS — no physics logic here.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+
+# ------------------------------------------------------------------ #
+# Utilities                                                            #
+# ------------------------------------------------------------------ #
+
+def _count_atoms(lammps_data: Path) -> Optional[int]:
+    """Return the number of atoms declared in a LAMMPS data file.
+
+    Looks for a line of the form ``<int> atoms`` near the top of the file.
+    Returns None if the line is not found.
+    """
+    try:
+        with lammps_data.open() as fh:
+            for line in fh:
+                m = re.match(r"^\s*(\d+)\s+atoms\s*$", line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def _safe_mpi_np(
+    requested: Optional[int],
+    lammps_data: Optional[Path] = None,
+) -> Optional[int]:
+    """Return a safe MPI rank count for the given structure.
+
+    LAMMPS domain decomposition requires that each sub-domain contains at
+    least one atom.  For tiny unit cells (e.g. 4-atom FCC primitive cell)
+    running with more ranks than atoms triggers MPI_ABORT.
+
+    The returned value is ``min(requested, n_atoms)`` when the atom count
+    can be determined, otherwise ``requested`` is returned unchanged.
+    """
+    if requested is None or requested <= 1:
+        return requested
+    if lammps_data is not None:
+        n_atoms = _count_atoms(lammps_data)
+        if n_atoms is not None and requested > n_atoms:
+            return n_atoms
+    return requested
 
 
 # ------------------------------------------------------------------ #
@@ -180,16 +224,40 @@ def run_lammps(
     mpi_command: Optional[str] = None,
     mpi_np: Optional[int] = None,
     log_file: Optional[Path] = None,
+    lammps_data: Optional[Path] = None,
 ) -> None:
     """Execute LAMMPS for the given input script.
 
+    Parameters
+    ----------
+    script:
+        Path to the LAMMPS input file.
+    work_dir:
+        Working directory for the subprocess.
+    lammps_cmd:
+        LAMMPS executable name or path.
+    mpi_command:
+        MPI launcher (e.g. ``"mpirun"``).  None means run without MPI.
+    mpi_np:
+        Number of MPI ranks requested.  Automatically capped to the number
+        of atoms in ``lammps_data`` to prevent domain-decomposition failures
+        on small unit cells (e.g. 4-atom FCC primitive cell with a cutoff
+        larger than the box).
+    log_file:
+        Path for the LAMMPS log file (passed via ``-log``).
+    lammps_data:
+        Path to the LAMMPS data file being simulated.  Used only to count
+        atoms for the ``mpi_np`` safety cap; may be None.
+
     Raises RuntimeError if the process exits with a non-zero return code.
     """
+    safe_np = _safe_mpi_np(mpi_np, lammps_data)
+
     cmd: list[str] = []
     if mpi_command:
         cmd += mpi_command.split()
-        if mpi_np is not None:
-            cmd += ["-n", str(mpi_np)]
+        if safe_np is not None:
+            cmd += ["-n", str(safe_np)]
     cmd += [lammps_cmd, "-in", str(script)]
     if log_file:
         cmd += ["-log", str(log_file)]
