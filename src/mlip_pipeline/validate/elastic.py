@@ -131,6 +131,7 @@ def run_elastic(
             mpi_command=mpi_command,
             mpi_np=mpi_np,
             log_file=work_dir / "lammps.log",
+            lammps_data=lammps_data,
         )
     except RuntimeError as exc:
         print(f"  [elastic] WARNING: LAMMPS failed for {structure_id}: {exc}")

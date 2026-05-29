@@ -127,6 +127,7 @@ def run_eos(
             mpi_command=mpi_command,
             mpi_np=mpi_np,
             log_file=work_dir / "lammps.log",
+            lammps_data=lammps_data,
         )
     except RuntimeError as exc:
         print(f"  [eos]     WARNING: LAMMPS failed for {structure_id}: {exc}")
