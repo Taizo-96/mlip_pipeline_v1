@@ -4,6 +4,7 @@ Only builds input scripts and runs LAMMPS — no physics logic here.
 """
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -31,26 +32,81 @@ def _count_atoms(lammps_data: Path) -> Optional[int]:
     return None
 
 
+def _box_lengths(lammps_data: Path) -> Optional[tuple[float, float, float]]:
+    """Return (Lx, Ly, Lz) box lengths from a LAMMPS data file.
+
+    Parses the three ``xlo xhi``, ``ylo yhi``, ``zlo zhi`` lines.
+    Returns None if parsing fails.
+    """
+    lengths: list[float] = []
+    pattern = re.compile(
+        r"^\s*(-?[\d.eE+\-]+)\s+(-?[\d.eE+\-]+)\s+(xlo xhi|ylo yhi|zlo zhi)"
+    )
+    try:
+        with lammps_data.open() as fh:
+            for line in fh:
+                m = pattern.match(line)
+                if m:
+                    lo, hi = float(m.group(1)), float(m.group(2))
+                    lengths.append(hi - lo)
+                    if len(lengths) == 3:
+                        return (lengths[0], lengths[1], lengths[2])
+    except OSError:
+        pass
+    return None
+
+
 def _safe_mpi_np(
     requested: Optional[int],
     lammps_data: Optional[Path] = None,
-) -> Optional[int]:
+    cutoff: Optional[float] = None,
+) -> int:
     """Return a safe MPI rank count for the given structure.
 
-    LAMMPS domain decomposition requires that each sub-domain contains at
-    least one atom.  For tiny unit cells (e.g. 4-atom FCC primitive cell)
-    running with more ranks than atoms triggers MPI_ABORT.
+    LAMMPS domain decomposition fails when:
+    1. More ranks than atoms (each subdomain must own ≥ 1 atom).
+    2. Any box dimension is smaller than the pair cutoff — LAMMPS cannot
+       fit even one bin per subdomain in that direction, triggering MPI_ABORT.
 
-    The returned value is ``min(requested, n_atoms)`` when the atom count
-    can be determined, otherwise ``requested`` is returned unchanged.
+    The returned value is clamped to the most restrictive of these limits.
+    Always returns at least 1.
+
+    Parameters
+    ----------
+    requested:
+        Number of MPI ranks requested by the user.
+    lammps_data:
+        Path to the LAMMPS data file (used to read atom count and box size).
+    cutoff:
+        Pair potential cutoff in Å.  When provided, the rank count is also
+        capped so that every box dimension is ≥ cutoff (i.e. the box can
+        host ≥ 1 bin in each direction).  If None, only the atom-count cap
+        is applied.
     """
     if requested is None or requested <= 1:
-        return requested
+        return requested if requested is not None else 1
+
+    cap = requested
+
     if lammps_data is not None:
+        # Cap 1: n_ranks ≤ n_atoms
         n_atoms = _count_atoms(lammps_data)
-        if n_atoms is not None and requested > n_atoms:
-            return n_atoms
-    return requested
+        if n_atoms is not None:
+            cap = min(cap, n_atoms)
+
+        # Cap 2: box must be ≥ cutoff in every direction for >1 rank.
+        # With N ranks, LAMMPS tries to decompose into roughly N^(1/3) per
+        # dimension.  The safe conservative rule: if ANY box side < cutoff,
+        # force n=1 because LAMMPS cannot safely ghost atoms across a
+        # subdomain narrower than the interaction range.
+        if cutoff is not None and cutoff > 0:
+            box = _box_lengths(lammps_data)
+            if box is not None:
+                L_min = min(box)
+                if L_min < cutoff:
+                    cap = 1
+
+    return max(1, cap)
 
 
 # ------------------------------------------------------------------ #
@@ -225,6 +281,7 @@ def run_lammps(
     mpi_np: Optional[int] = None,
     log_file: Optional[Path] = None,
     lammps_data: Optional[Path] = None,
+    cutoff: Optional[float] = None,
 ) -> None:
     """Execute LAMMPS for the given input script.
 
@@ -239,19 +296,24 @@ def run_lammps(
     mpi_command:
         MPI launcher (e.g. ``"mpirun"``).  None means run without MPI.
     mpi_np:
-        Number of MPI ranks requested.  Automatically capped to the number
-        of atoms in ``lammps_data`` to prevent domain-decomposition failures
-        on small unit cells (e.g. 4-atom FCC primitive cell with a cutoff
-        larger than the box).
+        Number of MPI ranks requested.  Automatically capped to prevent
+        domain-decomposition failures:
+
+        * cap at ``n_atoms`` (each subdomain must own ≥ 1 atom), and
+        * cap at 1 when any box dimension < ``cutoff`` (LAMMPS cannot
+          ghost atoms across a subdomain narrower than the cutoff).
     log_file:
         Path for the LAMMPS log file (passed via ``-log``).
     lammps_data:
-        Path to the LAMMPS data file being simulated.  Used only to count
-        atoms for the ``mpi_np`` safety cap; may be None.
+        Path to the LAMMPS data file being simulated.  Used to read atom
+        count and box dimensions for the safety cap; may be None.
+    cutoff:
+        Pair potential cutoff in Å used for the box-size safety cap.
+        If None, only the atom-count cap is applied.
 
     Raises RuntimeError if the process exits with a non-zero return code.
     """
-    safe_np = _safe_mpi_np(mpi_np, lammps_data)
+    safe_np = _safe_mpi_np(mpi_np, lammps_data, cutoff=cutoff)
 
     cmd: list[str] = []
     if mpi_command:
