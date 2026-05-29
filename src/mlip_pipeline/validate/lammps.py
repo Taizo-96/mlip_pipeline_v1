@@ -139,18 +139,10 @@ def write_elastic_input(
 ) -> Path:
     """Write a LAMMPS input script for elastic constants via finite-difference stress.
 
-    Strategy
-    --------
-    1. Read structure, set up potential.
-    2. Minimize to true equilibrium.
-    3. Convert box to triclinic (required for xy/xz/yz shear strains).
-    4. Declare ALL variables (must precede any change_box that uses them).
-    5. Apply each of the 6 strain states, run 0, print stress, undo strain.
-
-    The 'change_box all triclinic' command converts an orthogonal box
-    (as read from a standard LAMMPS data file) to triclinic form so that
-    shear tilt components (xy, xz, yz) can be manipulated.  Without this,
-    LAMMPS aborts with "Cannot change box to orthogonal" or similar.
+    pxx, pyy, etc. are LAMMPS thermo keywords, NOT variables.  They cannot
+    be used as ${pxx} in a print command.  The fix is to declare them as
+    equal-style variables (e.g. 'variable v_pxx equal pxx') which wrap the
+    thermo keyword and ARE substitutable via ${v_pxx}.
     """
     script_path = out_file.parent / "elastic.in"
     abs_data  = Path(lammps_data).resolve()
@@ -167,44 +159,52 @@ def write_elastic_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
-        # Minimize to true equilibrium before straining
         "minimize        1e-10 1e-12 10000 100000",
         "",
-        # Convert orthogonal box -> triclinic so shear change_box commands work
+        # Required for shear (xy/xz/yz) change_box commands
         "change_box      all triclinic",
         "",
         "thermo_style    custom step pxx pyy pzz pxy pxz pyz",
         "thermo          1",
         "",
-        # --- ALL variable declarations BEFORE any change_box strain ---
+        # Strain variables
         f"variable        delta        equal {delta}",
         "variable        sdelta       equal 1.0+v_delta",
         "variable        sinv_normal  equal 1.0/(1.0+v_delta)",
-        # Shear displacement = delta * current box length (equal-style = live)
         "variable        shear_d      equal v_delta*lx",
         "variable        neg_shear_d  equal -v_delta*lx",
         "variable        shear_dy     equal v_delta*ly",
         "variable        neg_shear_dy equal -v_delta*ly",
         "",
+        # Stress variables — wrap thermo keywords so they can be used in print
+        # pxx etc. are thermo keywords, NOT variables; ${pxx} is illegal.
+        # Declaring 'variable v_pxx equal pxx' makes them substitutable.
+        "variable        v_pxx        equal pxx",
+        "variable        v_pyy        equal pyy",
+        "variable        v_pzz        equal pzz",
+        "variable        v_pxy        equal pxy",
+        "variable        v_pxz        equal pxz",
+        "variable        v_pyz        equal pyz",
+        "",
         f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {abs_out} screen no",
         "",
     ]
 
-    # Six Voigt strain states
     strains = [
-        ("0", "x scale ${sdelta} remap",         "x scale ${sinv_normal} remap"),
-        ("1", "y scale ${sdelta} remap",         "y scale ${sinv_normal} remap"),
-        ("2", "z scale ${sdelta} remap",         "z scale ${sinv_normal} remap"),
-        ("3", "xy delta ${shear_d} remap",       "xy delta ${neg_shear_d} remap"),
-        ("4", "xz delta ${shear_d} remap",       "xz delta ${neg_shear_d} remap"),
-        ("5", "yz delta ${shear_dy} remap",      "yz delta ${neg_shear_dy} remap"),
+        ("0", "x scale ${sdelta} remap",        "x scale ${sinv_normal} remap"),
+        ("1", "y scale ${sdelta} remap",        "y scale ${sinv_normal} remap"),
+        ("2", "z scale ${sdelta} remap",        "z scale ${sinv_normal} remap"),
+        ("3", "xy delta ${shear_d} remap",      "xy delta ${neg_shear_d} remap"),
+        ("4", "xz delta ${shear_d} remap",      "xz delta ${neg_shear_d} remap"),
+        ("5", "yz delta ${shear_dy} remap",     "yz delta ${neg_shear_dy} remap"),
     ]
 
     for sid, apply_strain, undo_strain in strains:
         lines += [
             f"change_box      all {apply_strain}",
             "run             0",
-            f"print           \"{sid} ${{pxx}} ${{pyy}} ${{pzz}} ${{pxy}} ${{pxz}} ${{pyz}}\""
+            f"print           \"{sid} ${{v_pxx}} ${{v_pyy}} ${{v_pzz}}"
+            f" ${{v_pxy}} ${{v_pxz}} ${{v_pyz}}\""
             f" append {abs_out} screen no",
             f"change_box      all {undo_strain}",
             "",
