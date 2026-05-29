@@ -20,7 +20,7 @@ _GPA_TO_EV_ANG3 = 1.0 / 160.2176634
 def _birch_murnaghan(
     V: float, V0: float, E0: float, B0_ev: float, B0p: float
 ) -> float:
-    """3rd-order BM EOS.  B0_ev must be in eV/Å³."""
+    """3rd-order BM EOS.  V and V0 in Å³/atom, E0 in eV/atom, B0_ev in eV/Å³."""
     eta = (V0 / V) ** (2.0 / 3.0)
     return (
         E0
@@ -35,7 +35,14 @@ def _birch_murnaghan(
 def _fit_bm(
     volumes: list[float], energies: list[float]
 ) -> tuple[float, float, float, float]:
-    """Fit a 3rd-order BM EOS.  Returns (V0 [Å³], E0 [eV], B0 [GPa], B0p)."""
+    """Fit a 3rd-order BM EOS.
+
+    Parameters: volumes in Å³/atom, energies in eV/atom.
+    Returns: (V0 [Å³/atom], E0 [eV/atom], B0 [GPa], B0p [dimensionless]).
+
+    The fitter works entirely in eV/Å³ internally and converts B0 to GPa
+    only in the return value.
+    """
     try:
         from scipy.optimize import curve_fit  # type: ignore
         import numpy as np  # type: ignore
@@ -46,23 +53,27 @@ def _fit_bm(
     es = np.array(energies, dtype=float)
 
     i_min = int(np.argmin(es))
-    V0_guess = float(vs[i_min])
-    E0_guess = float(es[i_min])
-    # Use a modest B0 initial guess (40 GPa covers most metals including soft Pb)
-    B0_guess_ev = 40.0 * _GPA_TO_EV_ANG3
-    p0 = [V0_guess, E0_guess, B0_guess_ev, 4.0]
+    V0_guess  = float(vs[i_min])
+    E0_guess  = float(es[i_min])
+    # 40 GPa is a reasonable starting point for most metals (Pb ≈ 43 GPa)
+    B0_guess  = 40.0 * _GPA_TO_EV_ANG3   # in eV/Å³
+    B0p_guess = 4.0
 
-    # Bounds: V0 > 0, B0 > 0, B0p > 1
-    lower = [1e-3,  -1e6, 1e-6, 1.0]
-    upper = [1e6,    1e6, 1.0,  20.0]
+    p0 = [V0_guess, E0_guess, B0_guess, B0p_guess]
+
+    # Physical bounds: V0 > 0, B0 > 0 eV/Å³ (>0 GPa), 1 < B0p < 20
+    lower = [V0_guess * 0.5, E0_guess - 10.0, 1e-5,  1.0]
+    upper = [V0_guess * 2.0, E0_guess + 10.0, 1.0,  20.0]
 
     def model(V, V0, E0, B0_ev, B0p):
         return np.array([_birch_murnaghan(v, V0, E0, B0_ev, B0p) for v in V])
 
     popt, _ = curve_fit(
-        model, vs, es, p0=p0,
+        model, vs, es,
+        p0=p0,
         bounds=(lower, upper),
-        maxfev=50000,
+        maxfev=100000,
+        method="trf",   # Trust Region Reflective — robust with bounds
     )
     V0, E0, B0_ev, B0p = popt
     B0_gpa = B0_ev / _GPA_TO_EV_ANG3
@@ -74,7 +85,7 @@ def _fit_bm(
 # ------------------------------------------------------------------ #
 
 def _parse_eos_output(out_file: Path) -> tuple[list[float], list[float]]:
-    """Parse LAMMPS EOS output: returns (volumes, energies)."""
+    """Parse LAMMPS EOS output: returns (volumes_per_atom, energies_per_atom)."""
     volumes: list[float] = []
     energies: list[float] = []
     for line in out_file.read_text().splitlines():
@@ -154,7 +165,8 @@ def run_eos(
         V0, E0, B0, B0p = _fit_bm(volumes, energies)
         print(
             f"  [eos]     {structure_id}: "
-            f"V0={V0:.4f} Å³  E0={E0:.6f} eV  B0={B0:.1f} GPa  B0\'={B0p:.2f}"
+            f"V0={V0:.4f} Å³/atom  E0={E0:.6f} eV/atom  "
+            f"B0={B0:.1f} GPa  B0\'={B0p:.2f}"
         )
         return EosResult(
             structure_id=structure_id,

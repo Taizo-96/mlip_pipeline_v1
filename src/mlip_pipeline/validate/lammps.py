@@ -139,12 +139,18 @@ def write_elastic_input(
 ) -> Path:
     """Write a LAMMPS input script for elastic constants via finite-difference stress.
 
-    Variable declarations are placed BEFORE the change_box commands that
-    reference them.  The order is:
-      1. Setup (units, read_data, pair_style, minimize, thermo)
-      2. ALL variable declarations (delta, sdelta, sinv, shear_d, ...)
-      3. Print header
-      4. The six strain/run/print/undo blocks
+    Strategy
+    --------
+    1. Read structure, set up potential.
+    2. Minimize to true equilibrium.
+    3. Convert box to triclinic (required for xy/xz/yz shear strains).
+    4. Declare ALL variables (must precede any change_box that uses them).
+    5. Apply each of the 6 strain states, run 0, print stress, undo strain.
+
+    The 'change_box all triclinic' command converts an orthogonal box
+    (as read from a standard LAMMPS data file) to triclinic form so that
+    shear tilt components (xy, xz, yz) can be manipulated.  Without this,
+    LAMMPS aborts with "Cannot change box to orthogonal" or similar.
     """
     script_path = out_file.parent / "elastic.in"
     abs_data  = Path(lammps_data).resolve()
@@ -161,15 +167,20 @@ def write_elastic_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
+        # Minimize to true equilibrium before straining
         "minimize        1e-10 1e-12 10000 100000",
+        "",
+        # Convert orthogonal box -> triclinic so shear change_box commands work
+        "change_box      all triclinic",
         "",
         "thermo_style    custom step pxx pyy pzz pxy pxz pyz",
         "thermo          1",
         "",
-        # --- ALL variable declarations BEFORE any change_box ---
+        # --- ALL variable declarations BEFORE any change_box strain ---
         f"variable        delta        equal {delta}",
         "variable        sdelta       equal 1.0+v_delta",
         "variable        sinv_normal  equal 1.0/(1.0+v_delta)",
+        # Shear displacement = delta * current box length (equal-style = live)
         "variable        shear_d      equal v_delta*lx",
         "variable        neg_shear_d  equal -v_delta*lx",
         "variable        shear_dy     equal v_delta*ly",
@@ -179,15 +190,14 @@ def write_elastic_input(
         "",
     ]
 
-    # Six strain states: exx, eyy, ezz, exy, exz, eyz
-    # Normal strains use scale; shear strains use delta (box tilt)
+    # Six Voigt strain states
     strains = [
-        ("0", "x scale ${sdelta} remap",          "x scale ${sinv_normal} remap"),
-        ("1", "y scale ${sdelta} remap",          "y scale ${sinv_normal} remap"),
-        ("2", "z scale ${sdelta} remap",          "z scale ${sinv_normal} remap"),
-        ("3", "xy delta ${shear_d} remap",        "xy delta ${neg_shear_d} remap"),
-        ("4", "xz delta ${shear_d} remap",        "xz delta ${neg_shear_d} remap"),
-        ("5", "yz delta ${shear_dy} remap",       "yz delta ${neg_shear_dy} remap"),
+        ("0", "x scale ${sdelta} remap",         "x scale ${sinv_normal} remap"),
+        ("1", "y scale ${sdelta} remap",         "y scale ${sinv_normal} remap"),
+        ("2", "z scale ${sdelta} remap",         "z scale ${sinv_normal} remap"),
+        ("3", "xy delta ${shear_d} remap",       "xy delta ${neg_shear_d} remap"),
+        ("4", "xz delta ${shear_d} remap",       "xz delta ${neg_shear_d} remap"),
+        ("5", "yz delta ${shear_dy} remap",      "yz delta ${neg_shear_dy} remap"),
     ]
 
     for sid, apply_strain, undo_strain in strains:
