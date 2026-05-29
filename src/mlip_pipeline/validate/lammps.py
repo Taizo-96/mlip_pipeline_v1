@@ -227,33 +227,24 @@ def write_melting_input(
       * Both halves in a single NVT fix at T.
       * Still at reduced timestep; lost ignore still active.
 
-    Stage 3 - Production NPT (full dt, n_prod steps):
+    Stage 3 - Production NVT (full dt, n_prod steps):
       * reset_atoms id (LAMMPS >=22Jul2023 syntax) to close any ID gaps
         left by lost ignore before velocity reinitialisation.
       * velocity all create T seed+1.
-      * fix NPT with iso 0 0 barostat: allows volume to evolve so the
-        volume time series written to coex_thermo.txt carries a real
-        signal.  The two-phase interface is already established by Stages
-        1+2, so the barostat acts on a bounded interface rather than a
-        homogeneous liquid, preventing the runaway box expansion seen
-        when NPT is applied to a freshly-melted single-phase cell.
       * IMPORTANT: thermo_style must come BEFORE thermo_modify in this
         stage.  Every new thermo_style command silently resets all
         thermo_modify settings (LAMMPS warns: "previous thermo_modify
         settings will be lost").  Placing thermo_modify after thermo_style
         ensures lost ignore is active when the production run begins.
-      * thermo + file output every 50 steps.
+      * fix nvt on the whole cell; thermo + file output every 50 steps.
 
-    Volume classifier
+    Classifier signal
     -----------------
-    _classify_volume_trend() in melting.py reads coex_thermo.txt and fits
-    a linear slope to the last 50% of the volume time series:
-      - slope > +threshold  ->  liquid growing  ->  T > T_melt
-      - slope < -threshold  ->  solid growing   ->  T < T_melt
-      - |slope| <= threshold ->  coexistence    ->  T ~= T_melt
-    This only works if the volume is free to change, i.e. NPT must be used
-    here.  Using NVT (constant volume) always gives slope=0 ('stable') and
-    the bracket scan terminates immediately at T_start.
+    The production stage intentionally uses NVT (constant volume).  The
+    order-parameter used by _classify_volume_trend is the POTENTIAL ENERGY
+    slope, not the volume slope.  Under NVT, liquid has higher PE than solid
+    at the same T; if the liquid phase is growing the mean PE rises, and
+    vice versa.  The volume column is written for diagnostics only.
 
     Atom-loss sentinel
     ------------------
@@ -308,19 +299,12 @@ def write_melting_input(
         "",
         "# ----------------------------------------------------------------",
         "# Stage 1: Liquid disordering via NVE + temp/rescale.",
-        "# temp/rescale injects KE every Nevery steps without fighting",
-        "# MTP forces, avoiding the runaway ejections seen with NVT ramps.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
         "",
-        "# Adaptive timestep safety net (shrinks dt if any atom moves >0.02 Ang).",
         f"fix             fxDT all dt/reset 1 {dt_heat*0.1:.6f} {dt_heat:.6f} 0.02 units box",
         "",
-        "# Solid half: standard NVT at target T.",
         f"fix             fxS_dis solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        "# Liquid half: NVE dynamics + velocity rescaling every 10 steps.",
-        "# temp/rescale args: Nevery T_start T_stop T_window fraction",
-        "#   T_window = 20 K tolerance band, fraction = 1.0 (rescale all KE)",
         f"fix             fxL_nve  liquid_atoms nve",
         f"fix             fxL_rsc  liquid_atoms temp/rescale 10 {T_liq:.1f} {T_liq:.1f} 20.0 1.0",
         f"run             {n_dis}",
@@ -337,12 +321,9 @@ def write_melting_input(
         "unfix           fxEQ",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 3: Production NPT.",
-        "# The barostat (iso 0 0) lets the volume respond to the phase",
-        "# balance.  Liquid growing -> volume increases; solid growing ->",
-        "# volume decreases.  This signal is read by _classify_volume_trend.",
-        "# reset_atoms id closes ID gaps left by lost ignore before velocity",
-        "# reinitialisation (required for `velocity all create ... loop all`).",
+        "# Stage 3: Production NVT.",
+        "# Classifier reads PE slope from coex_thermo.txt col 3.",
+        "# reset_atoms id closes ID gaps left by lost ignore.",
         "# ----------------------------------------------------------------",
         "reset_atoms     id",
         "",
@@ -350,26 +331,20 @@ def write_melting_input(
         "",
         f"timestep        {dt}",
         "",
-        "# CRITICAL ORDER: thermo_style MUST come before thermo_modify.",
-        "# thermo_style resets all thermo_modify settings (LAMMPS warns:",
-        "# 'previous thermo_modify settings will be lost'). Setting",
-        "# lost ignore after thermo_style ensures it is not silently cleared.",
         "thermo_style    custom step temp vol pe atoms",
         "thermo          50",
         "thermo_modify   flush yes lost ignore",
         "",
-        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} $(100*dt) "
-        f"iso 0.0 0.0 $(1000*dt)",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
         "",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
-        "unfix           fxNPT",
+        "unfix           fxNVT",
         "unfix           fxPrint",
         "",
-        "# Write final atom count so Python can detect excessive atom loss.",
         f"print           \"$(atoms)\" file {natom_out} screen no",
     ]
     script_path.write_text("\n".join(lines) + "\n")
