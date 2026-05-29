@@ -1,0 +1,52 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Fe_validate.yaml  –  Standalone physics validation config
+#
+# Usage:
+#   python scripts/run_validation.py \
+#       --model  runs/gen_05/FePb16.almtp \
+#       --config configs/Fe_validate.yaml \
+#       --outdir runs/gen_05/validate
+#
+# This file can also be embedded inside Fe_loop.yaml as a top-level
+# "validate:" section so the loop runner can call validation automatically.
+# ═══════════════════════════════════════════════════════════════════════════
+
+project_root: "/home/saitto/mlip_pipeline_v1"
+
+# Primary element — passed to pair_coeff as the species label
+element: "Fe"
+
+# LAMMPS binary (override per machine if needed)
+lammps_command: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
+mpi_command:    "mpirun"
+mpi_np:         4
+
+# ── Equation of State ──────────────────────────────────────────────────────
+eos:
+  enabled:    true
+  scale_min:  0.85    # minimum lattice scale factor
+  scale_max:  1.15    # maximum lattice scale factor
+  n_points:   21      # number of volume points
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps   # relative to project_root
+
+    - id:          fcc
+      lammps_data: structures/Fe_fcc.lammps
+
+    - id:          hcp
+      lammps_data: structures/Fe_hcp.lammps
+
+
+# ── Elastic constants ──────────────────────────────────────────────────────
+elastic:
+  enabled:    true
+  delta:      0.01    # finite-difference strain magnitude
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps
+
+    - id:          fcc
+      lammps_data: structures/Fe_fcc.lammps
