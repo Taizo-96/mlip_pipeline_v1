@@ -56,7 +56,7 @@ def _safe_mpi_np(
     if lammps_data is not None:
         n_atoms = _count_atoms(lammps_data)
         if n_atoms is not None:
-            n_sim = n_atoms * rep ** 3
+            n_sim = n_atoms * rep ** 2 * (rep * 2)  # NxNx2N for melting, else N^3
             cap = min(cap, n_sim)
         if cutoff is not None and cutoff > 0:
             box = _box_lengths(lammps_data)
@@ -203,38 +203,46 @@ def write_melting_input(
     supercell_repeat: int = 5,
     dt: float = 0.002,
     n_equil: int = 5000,
-    n_prod: int = 50000,
+    n_prod: int = 20000,
     seed: int = 12345,
 ) -> Path:
-    """Write a near-melting NVT+NPT LAMMPS input script.
+    """Write a two-phase coexistence LAMMPS input script.
 
-    Protocol (mirrors the exploration LAMMPS script exactly)
-    ---------------------------------------------------------
-    No group splitting is used. Splitting solid/liquid groups and applying
-    different thermostats causes the groups to fight each other: the solid
-    NVT drains KE from the NVE liquid, dropping the liquid temperature to
-    ~330 K instead of T_melt, leaving residual forces and causing atom loss.
+    Disordering protocol
+    --------------------
+    The liquid half is disordered using NVE + fix temp/rescale rather than
+    a tight NVT thermostat.  temp/rescale injects kinetic energy every N steps
+    without fighting the MTP forces, which prevents the force spikes and atom
+    ejections seen with NVT ramping near T_melt.
 
-    Stage 1 - Pre-equilibration NVT (n_equil steps, dt=0.002 ps):
-      Matches the exploration 'fix PRE nvt' block. Whole-cell NVT with
-      fix MOM (linear momentum zeroing), ramping from seed velocities
-      at target T. Thermostat tau = 2 ps.
+    Stage 1 – Liquid disordering (dt_heat = dt/20, n_disorder steps):
+      * Solid half: fix nvt at T (standard thermostat).
+      * Liquid half: fix nve + fix temp/rescale every 10 steps up to T+50 K.
+        The tiny timestep (0.0001 ps) and velocity rescaling keep forces
+        manageable while gently disordering the liquid region.
+      * thermo_modify lost ignore throughout disordering.
+      * Adaptive timestep (fix dt/reset) as a further safety net.
 
-    Stage 2 - Production NPT (n_prod steps, dt=0.002 ps):
-      Matches the exploration 'fix 1 npt' block. NPT at T and P=0 bar,
-      iso barostat tau = 10 ps. fix MOM retained. Thermo + trajectory
-      output every 50 steps.
+    Stage 2 – Whole-system NVT equilibration (dt_heat, n_equil steps):
+      * Both halves in a single NVT fix at T.
+      * Still at reduced timestep; lost ignore still active.
 
-    The NPT ensemble at P=0 lets the box volume relax, which is the
-    correct observable for detecting the melting transition: if T is
-    below T_melt the solid phase is stable and volume stays near V0;
-    above T_melt the liquid expands and volume grows monotonically.
+    Stage 3 – Production NVT (full dt, n_prod steps):
+      * reset_atoms id (LAMMPS >=22Jul2023 syntax) to close any ID gaps
+        left by lost ignore before velocity reinitialisation.
+      * velocity all create T seed+1.
+      * IMPORTANT: thermo_style must come BEFORE thermo_modify in this
+        stage.  Every new thermo_style command silently resets all
+        thermo_modify settings (LAMMPS warns: "previous thermo_modify
+        settings will be lost").  Placing thermo_modify after thermo_style
+        ensures lost ignore is active when the production run begins.
+      * fix nvt on the whole cell; thermo + file output every 50 steps.
 
     Atom-loss sentinel
     ------------------
     After production the script writes the final atom count to
-    atom_count.txt using $(atoms) (immediate keyword evaluation).
-    ${atoms} would fail: 'atoms' is a thermo keyword, not a variable.
+    ``atom_count.txt``.  The Python caller reads this and emits a warning
+    if >10 % of atoms were lost, treating the temperature point as unreliable.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -242,47 +250,102 @@ def write_melting_input(
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
+    # Timestep for disordering: 20x smaller than production dt.
+    dt_heat   = dt / 20.0          # 0.0001 ps when dt=0.002
+    T_liq     = temperature + 50.0  # target for liquid rescaling (mild overshoot)
+    n_dis     = max(1000, n_equil // 2)   # disordering steps
+    n_eq      = max(500,  n_equil // 4)   # whole-system equilibration steps
+
     lines = [
         "units           metal",
         "atom_style      atomic",
         "boundary        p p p",
         "",
         f"read_data       {abs_data}",
-        f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat}",
+        f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat * 2}",
         "",
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
-        "neighbor        4.0 bin",
-        "neigh_modify    every 1 delay 0 check yes",
+        "# Increase neighbour list capacity for dense/disordered configs.",
+        "neigh_modify    one 4000 page 100000",
+        "",
+        "# Minimise before any dynamics to remove any residual forces.",
+        "minimize        1e-8 1e-10 5000 50000",
+        "",
+        "# Split into solid (lo-z) and liquid (hi-z) halves.",
+        "# Epsilon offset prevents atoms sitting exactly on the boundary.",
+        "variable        Lz     equal lz",
+        "variable        zmid   equal (zlo+zhi)/2.0 + 1e-6*v_Lz",
+        "region          solid_region  block INF INF INF INF INF ${zmid} units box",
+        "region          liquid_region block INF INF INF INF ${zmid} INF units box",
+        "group           solid_atoms   region solid_region",
+        "group           liquid_atoms  region liquid_region",
+        "",
+        "# Record the initial atom count for the loss check after production.",
+        "variable        N0 equal atoms",
+        "",
+        f"timestep        {dt_heat}",
+        "thermo_modify   flush yes lost ignore",
+        "thermo          200",
+        "",
+        "# ----------------------------------------------------------------",
+        "# Stage 1: Liquid disordering via NVE + temp/rescale.",
+        "# temp/rescale injects KE every Nevery steps without fighting",
+        "# MTP forces, avoiding the runaway ejections seen with NVT ramps.",
+        "# ----------------------------------------------------------------",
+        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
+        "",
+        "# Adaptive timestep safety net (shrinks dt if any atom moves >0.02 Ang).",
+        f"fix             fxDT all dt/reset 1 {dt_heat*0.1:.6f} {dt_heat:.6f} 0.02 units box",
+        "",
+        "# Solid half: standard NVT at target T.",
+        f"fix             fxS_dis solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        "# Liquid half: NVE dynamics + velocity rescaling every 10 steps.",
+        "# temp/rescale args: Nevery T_start T_stop T_window fraction",
+        "#   T_window = 20 K tolerance band, fraction = 1.0 (rescale all KE)",
+        f"fix             fxL_nve  liquid_atoms nve",
+        f"fix             fxL_rsc  liquid_atoms temp/rescale 10 {T_liq:.1f} {T_liq:.1f} 20.0 1.0",
+        f"run             {n_dis}",
+        "unfix           fxS_dis",
+        "unfix           fxL_nve",
+        "unfix           fxL_rsc",
+        "unfix           fxDT",
+        "",
+        "# ----------------------------------------------------------------",
+        "# Stage 2: Whole-system NVT equilibration at target T.",
+        "# ----------------------------------------------------------------",
+        f"fix             fxEQ all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"run             {n_eq}",
+        "unfix           fxEQ",
+        "",
+        "# ----------------------------------------------------------------",
+        "# Stage 3: Production NVT.",
+        "# reset_atoms id closes ID gaps left by lost ignore before velocity",
+        "# reinitialisation (required for `velocity all create ... loop all`).",
+        "# ----------------------------------------------------------------",
+        "reset_atoms     id",
+        "",
+        f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
         "",
         f"timestep        {dt}",
-        f"velocity        all create {temperature:.1f} {seed} mom yes rot no dist gaussian",
         "",
+        "# CRITICAL ORDER: thermo_style MUST come before thermo_modify.",
+        "# thermo_style resets all thermo_modify settings (LAMMPS warns:",
+        "# 'previous thermo_modify settings will be lost'). Setting",
+        "# lost ignore after thermo_style ensures it is not silently cleared.",
+        "thermo_style    custom step temp vol pe atoms",
         "thermo          50",
-        "thermo_style    custom step temp pe ke etotal press vol",
         "thermo_modify   flush yes lost ignore",
         "",
-        "# ----------------------------------------------------------------",
-        "# Stage 1: Pre-equilibration NVT (mirrors exploration 'fix PRE').",
-        "# ----------------------------------------------------------------",
-        "fix             MOM all momentum 1 linear 1 1 1 rescale",
-        f"fix             PRE all nvt temp {temperature:.1f} {temperature:.1f} 2",
-        f"run             {n_equil}",
-        "unfix           PRE",
-        "",
-        "# ----------------------------------------------------------------",
-        "# Stage 2: Production NPT (mirrors exploration 'fix 1 npt').",
-        "# ----------------------------------------------------------------",
-        f"fix             1 all npt temp {temperature:.1f} {temperature:.1f} 2 iso 1 1 10.0",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
         "",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
-        "unfix           1",
-        "unfix           MOM",
+        "unfix           fxNVT",
         "unfix           fxPrint",
         "",
         "# Write final atom count so Python can detect excessive atom loss.",
@@ -402,24 +465,14 @@ def write_rdf_input(
     seed: int = 99,
     supercell_repeat: int = 3,
 ) -> Path:
-    """NVT MD run followed by compute rdf accumulation.
-
-    ave/time parameters:
-      Nevery  = 10          sample every 10 steps
-      Nfreq   = n_prod//10  output every n_prod//10 steps (10 output blocks)
-      Nrepeat = Nfreq//10   average Nrepeat samples into each output block
-
-    This ensures Nevery * Nrepeat <= Nfreq (LAMMPS requirement) and that
-    the compute fires multiple times during the production run.
-    """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     out_file  = (work_dir / "rdf_output.txt").resolve()
     script_path = work_dir / "rdf.in"
 
     n_every  = 10
-    n_freq   = max(n_every * 2, n_prod // 10)   # output 10 times during production
-    n_repeat = n_freq // n_every                  # Nevery * Nrepeat == Nfreq
+    n_freq   = max(n_every * 2, n_prod // 10)
+    n_repeat = n_freq // n_every
 
     lines = [
         "units           metal",
