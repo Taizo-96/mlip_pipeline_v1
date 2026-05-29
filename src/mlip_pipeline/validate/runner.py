@@ -34,14 +34,37 @@ def _resolve_data_path(s: dict, config: dict) -> Path:
     return data_path
 
 
+def _step_enabled(
+    name: str,
+    cfg_enabled: bool,
+    only_steps: Optional[list[str]],
+    skip_steps: list[str],
+) -> bool:
+    """Return True when a validation step should run.
+
+    Priority order (highest first):
+      1. --only  → run *only* the listed steps (ignores config enabled flag)
+      2. --skip  → suppress listed steps (ignores config enabled flag)
+      3. config  → respect the ``enabled`` key in the step's config block
+    """
+    if only_steps is not None:
+        return name in only_steps
+    if name in skip_steps:
+        return False
+    return cfg_enabled
+
+
 def run_validation(
     config: dict,
     model_path: Path,
     out_dir: Path,
+    only_steps: Optional[list[str]] = None,
+    skip_steps: Optional[list[str]] = None,
 ) -> ValidationResult:
     val_cfg    = _resolve_val_config(config)
     val_dir    = ensure_dir(out_dir)
     model_path = Path(model_path).resolve()
+    skip_steps = list(skip_steps or [])
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
@@ -57,6 +80,10 @@ def run_validation(
     print(f"  out_dir:  {val_dir}")
     print(f"  lammps:   {lammps_cmd}")
     print(f"  element:  {element}")
+    if only_steps is not None:
+        print(f"  only:     {only_steps}")
+    if skip_steps:
+        print(f"  skip:     {skip_steps}")
 
     eos_results:    list[EosResult]              = []
     elastic_results: list[ElasticResult]         = []
@@ -68,7 +95,7 @@ def run_validation(
 
     # ── EOS ──────────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
-    if eos_cfg.get("enabled", True):
+    if _step_enabled("eos", eos_cfg.get("enabled", True), only_steps, skip_steps):
         for s in eos_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -96,7 +123,7 @@ def run_validation(
 
     # ── Elastic constants ─────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
-    if el_cfg.get("enabled", True):
+    if _step_enabled("elastic", el_cfg.get("enabled", True), only_steps, skip_steps):
         for s in el_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -123,7 +150,7 @@ def run_validation(
 
     # ── Melting temperature ───────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
-    if melt_cfg.get("enabled", False):
+    if _step_enabled("melting", melt_cfg.get("enabled", False), only_steps, skip_steps):
         for s in melt_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -156,7 +183,7 @@ def run_validation(
 
     # ── Thermal expansion ─────────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thermal_expansion", {})
-    if thexp_cfg.get("enabled", False):
+    if _step_enabled("thermal_expansion", thexp_cfg.get("enabled", False), only_steps, skip_steps):
         for s in thexp_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -187,7 +214,7 @@ def run_validation(
 
     # ── Vacancy formation energy ──────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
-    if vac_cfg.get("enabled", False):
+    if _step_enabled("vacancy", vac_cfg.get("enabled", False), only_steps, skip_steps):
         for s in vac_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -214,7 +241,7 @@ def run_validation(
 
     # ── RDF ───────────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
-    if rdf_cfg.get("enabled", False):
+    if _step_enabled("rdf", rdf_cfg.get("enabled", False), only_steps, skip_steps):
         for s in rdf_cfg.get("structures", []):
             sid = s["id"]
             data_path = _resolve_data_path(s, config)
@@ -294,31 +321,3 @@ def run_validation(
         plot_paths=plot_paths,
     )
     manifest_path = result.save_manifest()
-    print(f"\nValidation complete -- manifest -> {manifest_path}")
-
-    # ── Summary print ─────────────────────────────────────────────────────
-    for r in eos_results:
-        if r.fit_ok:
-            print(f"  EOS [{r.structure_id}]  "
-                  f"V0={r.V0:.3f} \u00c5\u00b3  B0={r.B0:.1f} GPa  B0'={r.B0p:.2f}  E0={r.E0:.4f} eV")
-    for r in elastic_results:
-        print(f"  Elastic [{r.structure_id}]  "
-              f"B={r.B_voigt:.1f} GPa  G={r.G_voigt:.1f} GPa  Cij={r.C}")
-    for r in melting_results:
-        if r.compute_ok:
-            print(f"  Melting [{r.structure_id}]  T_melt\u2248{r.T_melt:.0f} K  "
-                  f"bracket=[{r.T_bracket_lo:.0f}, {r.T_bracket_hi:.0f}] K")
-    for r in thexp_results:
-        if r.compute_ok:
-            print(f"  ThExp [{r.structure_id}]  alpha={r.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9")
-    for r in vacancy_results:
-        if r.compute_ok:
-            print(f"  Vacancy [{r.structure_id}]  E_vac={r.E_vac:.4f} eV")
-    for r in rdf_results:
-        if r.compute_ok:
-            print(f"  RDF [{r.structure_id}]  r_1={r.first_peak_r:.3f} \u00c5  "
-                  f"g(r_1)={r.first_peak_g:.3f}  ({r.temperature:.0f} K)")
-    for k, v in plot_paths.items():
-        print(f"  Plot [{k}]: {v}")
-
-    return result

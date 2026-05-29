@@ -33,6 +33,9 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False
 )
 
+# All physics validation steps, in the order they run.
+VALIDATE_STEPS = ("eos", "elastic", "melting", "thermal_expansion", "vacancy", "rdf")
+
 
 def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
     fit_dir = resolved_paths["runs_root"] / config["fit"]["output_subdir"]
@@ -609,6 +612,19 @@ def compare_parity(
 # PHYSICS VALIDATION
 # ---------------------------------------------------------------------------
 
+def _parse_validate_steps(value: str, flag: str) -> list[str]:
+    """Parse a comma-separated step list and validate against VALIDATE_STEPS."""
+    steps = [s.strip().lower() for s in value.split(",") if s.strip()]
+    unknown = [s for s in steps if s not in VALIDATE_STEPS]
+    if unknown:
+        raise typer.BadParameter(
+            f"Unknown step(s): {unknown}. "
+            f"Valid steps: {', '.join(VALIDATE_STEPS)}",
+            param_hint=flag,
+        )
+    return steps
+
+
 @app.command("validate")
 def validate(
     config: Annotated[str, typer.Option(..., help="Path to validate yaml (e.g. configs/Pb_validate.yaml)")],
@@ -617,19 +633,53 @@ def validate(
         "--outdir",
         help="Output directory for plots and manifest. Defaults to <model_dir>/validate/",
     )] = None,
+    only: Annotated[str, typer.Option(
+        "--only",
+        help=(
+            f"Comma-separated list of steps to run exclusively. "
+            f"Valid: {', '.join(VALIDATE_STEPS)}. "
+            "Mutually exclusive with --skip."
+        ),
+    )] = "",
+    skip: Annotated[str, typer.Option(
+        "--skip",
+        help=(
+            f"Comma-separated list of steps to suppress. "
+            f"Valid: {', '.join(VALIDATE_STEPS)}. "
+            "Mutually exclusive with --only."
+        ),
+    )] = "",
 ):
     """
-    Run physics validation (EOS + elastic constants) for a trained MTP potential.
+    Run physics validation (EOS, elastic constants, melting temperature, …)
+    for a trained MTP potential.
 
-    Runs LAMMPS to compute E(V) curves and finite-difference elastic constants,
-    fits a Birch-Murnaghan EOS, and writes plots + a JSON manifest.
+    Use --only to run a single step without touching the config file:
 
     Examples
     --------
-    # Pb after generation 16:
+    # Full validation:
         mlip-pipeline validate \\
             --config configs/Pb_validate.yaml \\
             --model  runs/gen_16/fit/Pb16.almtp
+
+    # Melting temperature only:
+        mlip-pipeline validate \\
+            --config configs/Pb_validate.yaml \\
+            --model  runs/gen_16/fit/Pb16.almtp \\
+            --only melting
+
+    # Everything except the slow melting step:
+        mlip-pipeline validate \\
+            --config configs/Pb_validate.yaml \\
+            --model  runs/gen_16/fit/Pb16.almtp \\
+            --skip melting
+
+    # EOS and elastic only:
+        mlip-pipeline validate \\
+            --config configs/Pb_validate.yaml \\
+            --model  runs/gen_16/fit/Pb16.almtp \\
+            --only eos,elastic
 
     # Custom output directory:
         mlip-pipeline validate \\
@@ -639,6 +689,19 @@ def validate(
     """
     from mlip_pipeline.validate.runner import run_validation
 
+    if only and skip:
+        raise typer.BadParameter("--only and --skip are mutually exclusive.")
+
+    only_steps: Optional[list[str]] = None
+    skip_steps: list[str] = []
+
+    if only:
+        only_steps = _parse_validate_steps(only, "--only")
+        typer.echo(f"  [validate] running only: {only_steps}")
+    if skip:
+        skip_steps = _parse_validate_steps(skip, "--skip")
+        typer.echo(f"  [validate] skipping: {skip_steps}")
+
     model_path = Path(model)
     if not model_path.exists():
         typer.echo(f"Model not found: {model_path}", err=True)
@@ -647,7 +710,11 @@ def validate(
     out_path = Path(outdir) if outdir else model_path.parent / "validate"
 
     cfg = load_yaml(config)
-    result = run_validation(cfg, model_path, out_path)
+    result = run_validation(
+        cfg, model_path, out_path,
+        only_steps=only_steps,
+        skip_steps=skip_steps,
+    )
 
     manifest = result.validate_dir / "validate_manifest.json"
     typer.echo(f"Manifest: {manifest}")
