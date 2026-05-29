@@ -32,6 +32,16 @@ def write_eos_input(
         scale  vol_per_atom  energy_per_atom
 
     Returns the path of the written input script.
+
+    Notes
+    -----
+    The MLIP-3 LAMMPS interface (interface-lammps-mlip-3) requires::
+
+        pair_style  mlip load_from=<path>
+        pair_coeff  * *
+
+    The model path is passed via the ``load_from=`` keyword on the
+    ``pair_style`` line; ``pair_coeff`` takes no element arguments.
     """
     script_path = out_file.parent / "eos.in"
     lines = [
@@ -41,8 +51,8 @@ def write_eos_input(
         "",
         f"read_data       {lammps_data}",
         "",
-        f"pair_style      mlip {model_path}",
-        f"pair_coeff      * * {element}",
+        f"pair_style      mlip load_from={model_path}",
+        "pair_coeff      * *",
         "",
         "thermo_style    custom step vol pe",
         "thermo          1",
@@ -90,6 +100,16 @@ def write_elastic_input(
     Elastic constants are computed in ``elastic.py`` from these stresses.
 
     Returns the path of the written input script.
+
+    Notes
+    -----
+    The MLIP-3 LAMMPS interface (interface-lammps-mlip-3) requires::
+
+        pair_style  mlip load_from=<path>
+        pair_coeff  * *
+
+    The model path is passed via the ``load_from=`` keyword on the
+    ``pair_style`` line; ``pair_coeff`` takes no element arguments.
     """
     script_path = out_file.parent / "elastic.in"
     bars_per_gpa = 10000.0
@@ -100,8 +120,8 @@ def write_elastic_input(
         "",
         f"read_data       {lammps_data}",
         "",
-        f"pair_style      mlip {model_path}",
-        f"pair_coeff      * * {element}",
+        f"pair_style      mlip load_from={model_path}",
+        "pair_coeff      * *",
         "",
         "minimize        1e-10 1e-12 10000 100000",
         "",
