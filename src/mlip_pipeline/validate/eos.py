@@ -45,10 +45,11 @@ def _find_fit_range(
     Strategy:
     1. Find the true equilibrium minimum by looking only in the upper 60%
        of the volume range (avoids picking the compression artefact).
-    2. Keep all points within `window_ev` eV/atom ABOVE e_min.
-       The physical BM well typically spans < 0.5 eV, so window_ev=0.8
-       captures the full well on both compression and expansion sides
-       while excluding the catastrophic extrapolation points.
+    2. Discard points whose energy is more than `window_ev` below e_min,
+       i.e. keep only points with  E >= e_min - window_ev.
+       Physical BM wells are shallow (< 0.5 eV deep from the rim), so
+       window_ev=0.8 retains the full well on both sides while excluding
+       catastrophic extrapolation points (-6, -15, -42, -100 eV, etc.).
     """
     import numpy as np  # type: ignore
 
@@ -62,8 +63,8 @@ def _find_fit_range(
     i_min = upper_indices[i_min_upper]
     e_min = es[i_min]
 
-    # Step 2: keep points within window_ev above e_min
-    mask = es <= e_min + window_ev
+    # Step 2: discard points that dive more than window_ev below e_min
+    mask = es >= e_min - window_ev
     return mask
 
 
@@ -209,7 +210,7 @@ def run_eos(
         print(
             f"  [eos]     {structure_id}: "
             f"V0={V0:.4f} Å³/atom  E0={E0:.6f} eV/atom  "
-            f"B0={B0:.1f} GPa  B0\'={B0p:.2f}"
+            f"B0={B0:.1f} GPa  B0'={B0p:.2f}"
         )
         return EosResult(
             structure_id=structure_id,
