@@ -213,48 +213,47 @@ def write_melting_input(
     1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
     2. Split atoms by z using a small epsilon offset so no atom sits exactly
        on the boundary (avoids the double-integration group warning).
-    3. Multi-stage ramp: heat the liquid seed through four intermediate
-       temperatures (T -> T+50 -> T+100 -> T+150 -> T+200 K) using a reduced
-       timestep and tight thermostat damping.  A fix dt/reset is active
-       throughout the ramp to dynamically shrink the timestep if any atom
-       moves too far in one step, preventing runaway trajectories without
-       requiring the limit/force package.  The solid half is held at T.
-    4. After the ramp: remove dt/reset, hard-rescale all velocities back to
-       T, then run NVT production at T_target (constant volume, whole cell).
+    3. Multi-stage ramp: heat the liquid seed across four stages of +25 K
+       (T -> T+25 -> T+50 -> T+75 -> T+100 K) using a reduced timestep and
+       tight thermostat damping.  The ramp top is kept at T+100 K (not +200 K)
+       to avoid the massive MTP force spikes that cause atom loss near T_melt.
+       A fix dt/reset is active throughout to dynamically shrink dt if any atom
+       moves too far, without requiring the limit/force package.
+       The solid half is held at T throughout.
+    4. After the ramp: remove dt/reset, re-initialise all velocities with
+       `velocity all create` (safe even if T=0), then run NVT production.
        NVT is the correct ensemble for two-phase coexistence: the volume signal
-       is preserved and there is no barostat that can destabilise a
-       partially-disordered cell.
+       is preserved and there is no barostat that can destabilise the cell.
 
     Stabilisation techniques applied
     ---------------------------------
     a) Neighbour list capacity increase  (neigh_modify one 4000 page 100000)
        Prevents neighbour overflow in dense liquid regions.
-    b) Staged liquid-seed ramp  (T -> T+50 -> T+100 -> T+150 -> T+200 K)
-       Four equal sub-steps; each runs n_equil//4 steps at dt/4 timestep.
-       Avoids velocity-rescaling shock and gives the MTP descriptor time to
-       adapt incrementally to the disordering structure.
+    b) Conservative staged liquid-seed ramp  (T -> T+25 -> T+50 -> T+75 -> T+100 K)
+       Four equal +25 K sub-steps; each runs n_equil//4 steps at dt/4 timestep.
+       Ramp top is T+100 K, NOT T+200 K: the smaller overshoot prevents runaway
+       MTP forces near T_melt while still disordering the liquid half.
     c) Adaptive timestep during ramp  (fix dt/reset, max_move=0.05 Ang)
        Dynamically reduces dt whenever any atom would move more than 0.05 Ang
        per step.  Standard LAMMPS fix; no extra package needed.  Removed
        before production so the fixed timestep is used for the thermo output.
     d) Tight thermostat damping during ramp  (20*dt instead of 200*dt)
        Removes kinetic energy from local hot spots faster during disordering.
-    e) Hard velocity rescale before production  (velocity all scale T)
-       Resets velocities to the target Maxwell-Boltzmann distribution so the
-       production thermostat starts from a well-defined thermodynamic state.
+    e) Velocity re-initialisation before production  (velocity all create T seed+1)
+       Uses `create` rather than `scale` so it is safe even when the system
+       temperature is 0 K (which can happen if atoms were lost during ramp).
+       This resets all atoms to the target Maxwell-Boltzmann distribution so
+       the production thermostat starts from a well-defined thermodynamic state.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     thermo_out = (work_dir / "coex_thermo.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # Four intermediate temperatures for the staged liquid-seed ramp.
-    ramp_stages = [
-        temperature + 50.0,
-        temperature + 100.0,
-        temperature + 150.0,
-        temperature + 200.0,
-    ]
+    # Four conservative ramp stages: +25 K each, top = T+100 K.
+    # Previously T+200 K caused runaway atom loss for Pb near T_melt.
+    ramp_delta  = 25.0
+    ramp_stages = [temperature + ramp_delta * (i + 1) for i in range(4)]
     dt_heat     = dt / 4.0          # reduced timestep during ramp
     n_ramp_each = max(500, n_equil // 4)  # steps per ramp stage
 
@@ -292,8 +291,6 @@ def write_melting_input(
         "",
         "# [stab-c] Adaptive timestep: shrinks dt if any atom moves > 0.05 Ang/step.",
         "# fix dt/reset is a standard LAMMPS fix; no extra package required.",
-        "# min_dt = dt/4 prevents the timestep becoming uselessly small;",
-        "# max_dt = dt/4 keeps us at the ramp timestep (reset has no upper effect here).",
         f"fix             fxDT all dt/reset 1 {dt_heat*0.1:.6f} {dt_heat:.6f} 0.05 units box",
         "",
         "# [stab-d] Tight damping (20*dt) on both thermostats during ramp",
@@ -319,9 +316,10 @@ def write_melting_input(
         "# --- remove adaptive timestep before production ---",
         "unfix           fxDT",
         "",
-        "# [stab-e] Hard velocity rescale: resets all velocities to target",
-        "# Maxwell-Boltzmann before the production thermostat takes over.",
-        f"velocity        all scale {temperature:.1f}",
+        "# [stab-e] Re-initialise velocities before production.",
+        "# Using `velocity all create` (not `scale`) is safe even when",
+        "# the system T=0 after the ramp (e.g. if some atoms were lost).",
+        f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
         "",
         "# --- switch to production timestep, restore lost=error ---",
         f"timestep        {dt}",
