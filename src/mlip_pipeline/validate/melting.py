@@ -3,13 +3,14 @@
 Physics
 -------
 A supercell is split into solid (bottom half) and liquid (top half) by z.
-The liquid seed is created by briefly heating that half to ~2*T_target in NVT.
-The full cell is then run in NPT at T_target.
+The liquid seed is created by briefly heating that half to ~T+50 K in NVT.
+The full cell is then run in NVT at T_target.
 
-The volume time series reveals which phase is stable at T_target:
-  - V increasing  ->  liquid growing  ->  T > T_melt
-  - V decreasing  ->  solid growing   ->  T < T_melt
-  - V stable      ->  coexistence     ->  T ≈ T_melt
+The potential energy time series reveals which phase is stable at T_target
+under NVT (constant volume):
+  - PE increasing  ->  liquid growing  ->  T > T_melt
+  - PE decreasing  ->  solid growing   ->  T < T_melt
+  - PE flat        ->  ambiguous; scan continues
 
 A bracket search across candidate temperatures is performed to locate T_melt
 to within `T_step` K.
@@ -25,54 +26,62 @@ from mlip_pipeline.utils.fs import ensure_dir
 
 
 # ------------------------------------------------------------------ #
-# Volume trend classifier                                              #
+# PE trend classifier                                                  #
 # ------------------------------------------------------------------ #
 
-def _classify_volume_trend(thermo_file: Path) -> str:
-    """Return 'growing_liquid', 'growing_solid', or 'stable'.
+def _classify_pe_trend(thermo_file: Path) -> str:
+    """Return 'growing_liquid', 'growing_solid', or 'ambiguous'.
 
-    Reads the NPT production thermo file and fits a linear slope to the
-    volume time series.  Sign of slope determines which phase is growing.
+    Reads the NVT production thermo file (coex_thermo.txt) and fits a
+    linear slope to the POTENTIAL ENERGY (col 3, 0-indexed) time series.
+    Under NVT the volume is fixed, so the PE signal is the correct
+    indicator of which phase is growing:
+      PE slope > 0  ->  liquid growing  (higher PE per atom)
+      PE slope < 0  ->  solid growing   (lower  PE per atom)
+      |slope| small ->  ambiguous; neither phase clearly winning
     """
-    vols: list[float] = []
+    pes: list[float] = []
     try:
         for line in thermo_file.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) >= 3:
+            if len(parts) >= 4:
                 try:
-                    vols.append(float(parts[2]))  # col 2 = vol
+                    pes.append(float(parts[3]))  # col 3 = pe
                 except ValueError:
                     continue
     except OSError:
-        return "stable"
+        return "ambiguous"
 
-    if len(vols) < 4:
-        return "stable"
+    if len(pes) < 4:
+        return "ambiguous"
 
     # Use last 50% of points for the slope (skip transient)
-    mid = len(vols) // 2
-    tail = vols[mid:]
+    mid = len(pes) // 2
+    tail = pes[mid:]
     n = len(tail)
     xs = list(range(n))
     mean_x = sum(xs) / n
-    mean_v = sum(tail) / n
-    num = sum((x - mean_x) * (v - mean_v) for x, v in zip(xs, tail))
+    mean_p = sum(tail) / n
+    num = sum((x - mean_x) * (p - mean_p) for x, p in zip(xs, tail))
     den = sum((x - mean_x) ** 2 for x in xs)
     if den == 0:
-        return "stable"
+        return "ambiguous"
     slope = num / den
 
-    # Normalise slope by mean volume to get fractional change per step
-    rel_slope = slope / mean_v
-    THRESHOLD = 5e-7   # fractional volume change per timestep
+    # Normalise slope by |mean PE| to get fractional change per step.
+    # PE is negative for metals; use abs() to avoid sign flip.
+    if mean_p == 0:
+        return "ambiguous"
+    rel_slope = slope / abs(mean_p)
+    THRESHOLD = 5e-8   # fractional PE change per timestep
     if rel_slope > THRESHOLD:
         return "growing_liquid"
     elif rel_slope < -THRESHOLD:
         return "growing_solid"
-    return "stable"
+    return "ambiguous"
 
 
 # ------------------------------------------------------------------ #
@@ -98,7 +107,7 @@ def run_melting(
     n_prod: int = 20000,
     dt: float = 0.002,
 ) -> MeltingResult:
-    """Bracket T_melt by scanning temperatures and classifying volume trend."""
+    """Bracket T_melt by scanning temperatures and classifying PE trend."""
     work_dir = ensure_dir(validate_dir / "melting" / structure_id)
     print(f"  [melting] {structure_id}: scanning T = {T_start:.0f}..{T_end:.0f} K "
           f"in steps of {T_step:.0f} K ...")
@@ -109,8 +118,8 @@ def run_melting(
         candidates.append(round(T, 1))
         T += T_step
 
-    T_lo: Optional[float] = None   # highest T where solid grew
-    T_hi: Optional[float] = None   # lowest T where liquid grew
+    T_lo: Optional[float] = None   # highest T where solid grew (PE decreasing)
+    T_hi: Optional[float] = None   # lowest  T where liquid grew (PE increasing)
     trend_map: dict[float, str] = {}
 
     for T_cand in candidates:
@@ -138,27 +147,22 @@ def run_melting(
         except RuntimeError as exc:
             print(f"  [melting] WARNING: LAMMPS failed at T={T_cand}: {exc}")
             trend_map[T_cand] = "error"
-            # Do not break — continue scanning to find a valid bracket
             continue
 
         thermo_file = T_dir / "coex_thermo.txt"
-        trend = _classify_volume_trend(thermo_file)
+        trend = _classify_pe_trend(thermo_file)
         trend_map[T_cand] = trend
         print(f"  [melting]   T={T_cand:.0f} K -> {trend}")
 
         if trend == "growing_solid":
-            T_lo = T_cand
+            T_lo = T_cand          # update: keep highest solid-growing T
         elif trend == "growing_liquid":
             if T_hi is None:
-                T_hi = T_cand
-            # Only stop scanning once we have BOTH sides of the bracket
-            if T_lo is not None:
+                T_hi = T_cand      # record: lowest liquid-growing T
+            # Early exit only once we have a proper bracket (both sides seen)
+            if T_lo is not None and T_hi is not None and T_lo < T_hi:
                 break
-        elif trend == "stable":
-            # Coexistence found directly
-            T_lo = T_cand
-            T_hi = T_cand
-            break
+        # "ambiguous": continue scanning — do NOT update bracket or break
 
     if T_lo is None and T_hi is None:
         msg = "could not bracket T_melt in the given range"
@@ -166,9 +170,9 @@ def run_melting(
         return MeltingResult(structure_id=structure_id, error=msg)
 
     # Estimate T_melt as midpoint of bracket
-    if T_lo is not None and T_hi is not None and T_lo != T_hi:
+    if T_lo is not None and T_hi is not None and T_lo < T_hi:
         T_melt = (T_lo + T_hi) / 2.0
-    elif T_lo == T_hi:
+    elif T_lo is not None and T_hi is not None and T_lo == T_hi:
         T_melt = T_lo
     elif T_lo is None:
         T_melt = T_hi   # only upper bound known
