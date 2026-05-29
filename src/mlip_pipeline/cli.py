@@ -606,6 +606,67 @@ def compare_parity(
 
 
 # ---------------------------------------------------------------------------
+# PHYSICS VALIDATION
+# ---------------------------------------------------------------------------
+
+@app.command("validate")
+def validate(
+    config: Annotated[str, typer.Option(..., help="Path to validate yaml (e.g. configs/Pb_validate.yaml)")],
+    model: Annotated[str, typer.Option(..., "--model", help="Path to trained .almtp potential")],
+    outdir: Annotated[Optional[str], typer.Option(
+        "--outdir",
+        help="Output directory for plots and manifest. Defaults to <model_dir>/validate/",
+    )] = None,
+):
+    """
+    Run physics validation (EOS + elastic constants) for a trained MTP potential.
+
+    Runs LAMMPS to compute E(V) curves and finite-difference elastic constants,
+    fits a Birch-Murnaghan EOS, and writes plots + a JSON manifest.
+
+    Examples
+    --------
+    # Pb after generation 5:
+        mlip-pipeline validate \\
+            --config configs/Pb_validate.yaml \\
+            --model  runs/gen_05/Pb16.almtp
+
+    # Custom output directory:
+        mlip-pipeline validate \\
+            --config configs/Pb_validate.yaml \\
+            --model  runs/gen_05/Pb16.almtp \\
+            --outdir runs/gen_05/validate
+    """
+    from mlip_pipeline.validate.runner import run_validation
+
+    model_path = Path(model)
+    if not model_path.exists():
+        typer.echo(f"Model not found: {model_path}", err=True)
+        raise typer.Exit(1)
+
+    out_path = Path(outdir) if outdir else model_path.parent / "validate"
+
+    cfg = load_yaml(config)
+    result = run_validation(cfg, model_path, out_path)
+
+    typer.echo(f"Manifest: {result.manifest_path}")
+    if result.eos_results:
+        for struct_id, eos in result.eos_results.items():
+            typer.echo(
+                f"  EOS [{struct_id}]  V0={eos.V0:.3f} Å³  B0={eos.B0:.1f} GPa  "
+                f"B0'={eos.B0_prime:.2f}  E0={eos.E0:.4f} eV"
+            )
+    if result.elastic_results:
+        for struct_id, el in result.elastic_results.items():
+            typer.echo(
+                f"  Elastic [{struct_id}]  B={el.bulk_modulus:.1f} GPa  "
+                f"G={el.shear_modulus:.1f} GPa"
+            )
+    for p in result.plot_paths:
+        typer.echo(f"  Plot: {p}")
+
+
+# ---------------------------------------------------------------------------
 # STATE MANAGEMENT
 # ---------------------------------------------------------------------------
 
