@@ -215,7 +215,7 @@ def write_melting_input(
     without fighting the MTP forces, which prevents the force spikes and atom
     ejections seen with NVT ramping near T_melt.
 
-    Stage 1 – Liquid disordering (dt_heat = dt/20, n_disorder steps):
+    Stage 1 - Liquid disordering (dt_heat = dt/20, n_disorder steps):
       * Solid half: fix nvt at T (standard thermostat).
       * Liquid half: fix nve + fix temp/rescale every 10 steps up to T+50 K.
         The tiny timestep (0.0001 ps) and velocity rescaling keep forces
@@ -223,20 +223,37 @@ def write_melting_input(
       * thermo_modify lost ignore throughout disordering.
       * Adaptive timestep (fix dt/reset) as a further safety net.
 
-    Stage 2 – Whole-system NVT equilibration (dt_heat, n_equil steps):
+    Stage 2 - Whole-system NVT equilibration (dt_heat, n_equil steps):
       * Both halves in a single NVT fix at T.
       * Still at reduced timestep; lost ignore still active.
 
-    Stage 3 – Production NVT (full dt, n_prod steps):
+    Stage 3 - Production NPT (full dt, n_prod steps):
       * reset_atoms id (LAMMPS >=22Jul2023 syntax) to close any ID gaps
         left by lost ignore before velocity reinitialisation.
       * velocity all create T seed+1.
+      * fix NPT with iso 0 0 barostat: allows volume to evolve so the
+        volume time series written to coex_thermo.txt carries a real
+        signal.  The two-phase interface is already established by Stages
+        1+2, so the barostat acts on a bounded interface rather than a
+        homogeneous liquid, preventing the runaway box expansion seen
+        when NPT is applied to a freshly-melted single-phase cell.
       * IMPORTANT: thermo_style must come BEFORE thermo_modify in this
         stage.  Every new thermo_style command silently resets all
         thermo_modify settings (LAMMPS warns: "previous thermo_modify
         settings will be lost").  Placing thermo_modify after thermo_style
         ensures lost ignore is active when the production run begins.
-      * fix nvt on the whole cell; thermo + file output every 50 steps.
+      * thermo + file output every 50 steps.
+
+    Volume classifier
+    -----------------
+    _classify_volume_trend() in melting.py reads coex_thermo.txt and fits
+    a linear slope to the last 50% of the volume time series:
+      - slope > +threshold  ->  liquid growing  ->  T > T_melt
+      - slope < -threshold  ->  solid growing   ->  T < T_melt
+      - |slope| <= threshold ->  coexistence    ->  T ~= T_melt
+    This only works if the volume is free to change, i.e. NPT must be used
+    here.  Using NVT (constant volume) always gives slope=0 ('stable') and
+    the bracket scan terminates immediately at T_start.
 
     Atom-loss sentinel
     ------------------
@@ -320,7 +337,10 @@ def write_melting_input(
         "unfix           fxEQ",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 3: Production NVT.",
+        "# Stage 3: Production NPT.",
+        "# The barostat (iso 0 0) lets the volume respond to the phase",
+        "# balance.  Liquid growing -> volume increases; solid growing ->",
+        "# volume decreases.  This signal is read by _classify_volume_trend.",
         "# reset_atoms id closes ID gaps left by lost ignore before velocity",
         "# reinitialisation (required for `velocity all create ... loop all`).",
         "# ----------------------------------------------------------------",
@@ -338,14 +358,15 @@ def write_melting_input(
         "thermo          50",
         "thermo_modify   flush yes lost ignore",
         "",
-        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} $(100*dt) "
+        f"iso 0.0 0.0 $(1000*dt)",
         "",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
-        "unfix           fxNVT",
+        "unfix           fxNPT",
         "unfix           fxPrint",
         "",
         "# Write final atom count so Python can detect excessive atom loss.",
