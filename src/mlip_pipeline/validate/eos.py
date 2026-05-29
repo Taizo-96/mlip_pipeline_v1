@@ -16,11 +16,6 @@ from mlip_pipeline.utils.fs import ensure_dir
 # Conversion: 1 GPa = 1 / 160.2176634 eV/Å³
 _GPA_TO_EV_ANG3 = 1.0 / 160.2176634
 
-# Points more than this many eV/atom above the minimum are trimmed before
-# fitting.  MTP potentials extrapolate badly under high compression and can
-# produce catastrophically negative energies that corrupt the BM fit.
-_OUTLIER_THRESHOLD_EV = 2.0
-
 
 def _birch_murnaghan(
     V: float, V0: float, E0: float, B0_ev: float, B0p: float
@@ -37,14 +32,37 @@ def _birch_murnaghan(
     )
 
 
+def _find_fit_range(
+    vs: "np.ndarray", es: "np.ndarray"
+) -> "np.ndarray":
+    """Return a boolean mask selecting points suitable for BM fitting.
+
+    MTP potentials extrapolate badly under high compression, producing
+    catastrophically negative energies at small volumes.  The true
+    equilibrium minimum sits in the upper (larger-volume) portion of
+    the scan.  Strategy:
+
+    1. Find the minimum energy in the upper 60% of the volume range
+       (i.e. volumes >= 40th percentile).  This avoids picking up the
+       spurious deep minimum at extreme compression.
+    2. Keep all points within 1.5 eV/atom ABOVE that reference minimum.
+       This selects the physical parabolic well and discards both the
+       compression spike and any far-expansion anomalies.
+    """
+    import numpy as np  # type: ignore
+    v_lo_cut = float(np.percentile(vs, 40))
+    upper_mask = vs >= v_lo_cut
+    if upper_mask.sum() == 0:
+        return np.ones(len(vs), dtype=bool)
+    e_ref = es[upper_mask].min()
+    mask = es <= e_ref + 1.5
+    return mask
+
+
 def _fit_bm(
     volumes: list[float], energies: list[float]
 ) -> tuple[float, float, float, float]:
     """Fit a 3rd-order BM EOS.
-
-    Before fitting, trims points that are more than _OUTLIER_THRESHOLD_EV
-    above the minimum energy.  This prevents catastrophic MTP extrapolation
-    at extreme compression from dominating the fit.
 
     Returns: (V0 [Å³/atom], E0 [eV/atom], B0 [GPa], B0p [dimensionless]).
     """
@@ -57,32 +75,30 @@ def _fit_bm(
     vs = np.array(volumes, dtype=float)
     es = np.array(energies, dtype=float)
 
-    # Trim outliers: keep only points within _OUTLIER_THRESHOLD_EV of minimum
-    e_min = es.min()
-    mask = es <= e_min + _OUTLIER_THRESHOLD_EV
+    mask = _find_fit_range(vs, es)
     vs_fit = vs[mask]
     es_fit = es[mask]
 
-    n_trimmed = len(vs) - mask.sum()
+    n_trimmed = int((~mask).sum())
     if n_trimmed > 0:
-        print(f"  [eos]     BM fit: trimmed {n_trimmed} outlier points "
-              f"(>{_OUTLIER_THRESHOLD_EV} eV/atom above minimum)")
+        print(f"  [eos]     BM fit: trimmed {n_trimmed} extrapolation points, "
+              f"fitting on {len(vs_fit)} points")
 
     if len(vs_fit) < 5:
         raise RuntimeError(
-            f"Only {len(vs_fit)} points remain after outlier trimming — "
+            f"Only {len(vs_fit)} points remain after trimming — "
             "scan range may be too narrow or model is unphysical"
         )
 
     i_min = int(np.argmin(es_fit))
     V0_guess  = float(vs_fit[i_min])
     E0_guess  = float(es_fit[i_min])
-    B0_guess  = 40.0 * _GPA_TO_EV_ANG3   # 40 GPa in eV/Å³
+    B0_guess  = 40.0 * _GPA_TO_EV_ANG3
     B0p_guess = 4.0
 
     p0 = [V0_guess, E0_guess, B0_guess, B0p_guess]
-    lower = [V0_guess * 0.5, E0_guess - 10.0, 1e-5,  1.0]
-    upper = [V0_guess * 2.0, E0_guess + 10.0, 1.0,  20.0]
+    lower = [V0_guess * 0.5, E0_guess - 5.0, 1e-5,  1.0]
+    upper = [V0_guess * 2.0, E0_guess + 5.0, 1.0,  20.0]
 
     def model(V, V0, E0, B0_ev, B0p):
         return np.array([_birch_murnaghan(v, V0, E0, B0_ev, B0p) for v in V])
