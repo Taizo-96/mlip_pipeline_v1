@@ -38,33 +38,56 @@ def _find_fit_range(
 ) -> "np.ndarray":
     """Return a boolean mask selecting points suitable for BM fitting.
 
-    MTP potentials produce catastrophically negative energies under high
-    compression (e.g. -100 eV vs -3.5 eV at equilibrium).  These must be
-    excluded before fitting.
+    MTP potentials extrapolate badly outside the training volume range,
+    producing:
+      - catastrophically low energies under compression (-100 eV etc.)
+      - monotonically decreasing energies on the expansion side (no upturn)
+
+    Both pathologies are handled by anchoring the fit window to the
+    *local* equilibrium minimum (dE/dV sign change), not the global argmin.
 
     Strategy:
-    1. Find the true equilibrium minimum by looking only in the upper 60%
-       of the volume range (avoids picking the compression artefact).
-    2. Discard points whose energy is more than `window_ev` below e_min,
-       i.e. keep only points with  E >= e_min - window_ev.
-       Physical BM wells are shallow (< 0.5 eV deep from the rim), so
-       window_ev=0.8 retains the full well on both sides while excluding
-       catastrophic extrapolation points (-6, -15, -42, -100 eV, etc.).
+    1. Sort by volume and compute finite-difference gradients dE/dV.
+    2. Find the first point where dE/dV changes from negative to positive
+       (i.e. the physical well bottom).  If no sign change is found, fall
+       back to the argmin in the central 40–80% volume percentile range.
+    3. Keep only points within `window_ev` eV/atom of e_min on each side:
+         E >= e_min - window_ev   (exclude catastrophic compression)
+         V <= V_min * 1.5         (exclude unphysical flat expansion tail)
     """
     import numpy as np  # type: ignore
 
-    # Step 1: find e_min in the upper 60% of volumes
-    v_lo_cut = float(np.percentile(vs, 40))
-    upper_mask = vs >= v_lo_cut
-    if upper_mask.sum() == 0:
-        upper_mask = np.ones(len(vs), dtype=bool)
-    upper_indices = np.where(upper_mask)[0]
-    i_min_upper = int(np.argmin(es[upper_mask]))
-    i_min = upper_indices[i_min_upper]
-    e_min = es[i_min]
+    # Ensure sorted by volume
+    order = np.argsort(vs)
+    vs_s = vs[order]
+    es_s = es[order]
 
-    # Step 2: discard points that dive more than window_ev below e_min
-    mask = es >= e_min - window_ev
+    # Step 1: locate local minimum via dE/dV sign change
+    dE = np.diff(es_s)
+    sign_changes = np.where((dE[:-1] < 0) & (dE[1:] > 0))[0]
+
+    if len(sign_changes) > 0:
+        # Use the first (lowest-volume) local minimum — that is equilibrium
+        i_min_s = sign_changes[0] + 1
+    else:
+        # Fallback: argmin in central 40–80% of volume range
+        lo = float(np.percentile(vs_s, 40))
+        hi = float(np.percentile(vs_s, 80))
+        central = (vs_s >= lo) & (vs_s <= hi)
+        if central.sum() == 0:
+            central = np.ones(len(vs_s), dtype=bool)
+        central_idx = np.where(central)[0]
+        i_min_s = central_idx[int(np.argmin(es_s[central]))]
+
+    e_min = es_s[i_min_s]
+    v_min = vs_s[i_min_s]
+
+    # Step 2: energy window + volume ceiling to exclude expansion artefacts
+    mask_s = (es_s >= e_min - window_ev) & (vs_s <= v_min * 1.5)
+
+    # Map mask back to original (unsorted) order
+    mask = np.empty(len(vs), dtype=bool)
+    mask[order] = mask_s
     return mask
 
 
