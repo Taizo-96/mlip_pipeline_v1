@@ -1,36 +1,26 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # Fe_validate.yaml  –  Standalone physics validation config
-#
-# Usage:
-#   python scripts/run_validation.py \
-#       --model  runs/gen_05/FePb16.almtp \
-#       --config configs/Fe_validate.yaml \
-#       --outdir runs/gen_05/validate
-#
-# This file can also be embedded inside Fe_loop.yaml as a top-level
-# "validate:" section so the loop runner can call validation automatically.
 # ═══════════════════════════════════════════════════════════════════════════
 
 project_root: "/home/saitto/mlip_pipeline_v1"
 
-# Primary element — passed to pair_coeff as the species label
 element: "Fe"
 
-# LAMMPS binary (override per machine if needed)
 lammps_command: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
 mpi_command:    "mpirun"
 mpi_np:         4
 
+
 # ── Equation of State ──────────────────────────────────────────────────────
 eos:
   enabled:    true
-  scale_min:  0.85    # minimum lattice scale factor
-  scale_max:  1.15    # maximum lattice scale factor
-  n_points:   21      # number of volume points
+  scale_min:  0.85
+  scale_max:  1.15
+  n_points:   21
 
   structures:
     - id:          bcc
-      lammps_data: structures/Fe_bcc.lammps   # relative to project_root
+      lammps_data: structures/Fe_bcc.lammps
 
     - id:          fcc
       lammps_data: structures/Fe_fcc.lammps
@@ -42,7 +32,7 @@ eos:
 # ── Elastic constants ──────────────────────────────────────────────────────
 elastic:
   enabled:    true
-  delta:      0.01    # finite-difference strain magnitude
+  delta:      0.01
 
   structures:
     - id:          bcc
@@ -50,3 +40,64 @@ elastic:
 
     - id:          fcc
       lammps_data: structures/Fe_fcc.lammps
+
+
+# ── Melting temperature (two-phase coexistence) ─────────────────────────────
+# Fe experimental T_melt = 1811 K.
+# Set enabled: true to activate (expensive: ~10 LAMMPS runs × ~2 min each).
+melting:
+  enabled:          false
+  T_start:          1500.0  # K
+  T_end:            2100.0  # K
+  T_step:           100.0   # K
+  supercell_repeat: 4
+  n_equil:          5000
+  n_prod:           20000
+  dt:               0.001   # ps  (shorter for Fe, stiffer bonds)
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps
+
+
+# ── Thermal expansion coefficient (NPT MD) ──────────────────────────────────
+# Fe experimental alpha ≈ 11.8e-6 K⁻¹ at 300 K.
+thermal_expansion:
+  enabled:      false
+  temperatures: [100.0, 300.0, 500.0, 700.0, 900.0]  # K  (below Curie ~1043 K)
+  T_ref:        300.0
+  n_equil:      5000
+  n_prod:       10000
+  dt:           0.001  # ps
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps
+
+
+# ── Vacancy formation energy ─────────────────────────────────────────────────
+# Fe bcc experimental E_vac ≈ 2.0 eV.
+vacancy:
+  enabled:          false
+  supercell_repeat: 3
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps
+
+
+# ── Radial distribution function (NVT MD) ────────────────────────────────────
+# Fe bcc: r_1 ≈ 2.48 Å  (a*sqrt(3)/2, a ≈ 2.87 Å).
+rdf:
+  enabled:          false
+  temperature:      300.0
+  r_max:            8.0
+  n_bins:           200
+  n_equil:          5000
+  n_prod:           20000
+  dt:               0.001
+  supercell_repeat: 3
+
+  structures:
+    - id:          bcc
+      lammps_data: structures/Fe_bcc.lammps

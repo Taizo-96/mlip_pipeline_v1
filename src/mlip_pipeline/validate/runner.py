@@ -148,6 +148,11 @@ def run_validation(
                 dt=melt_cfg.get("dt", 0.002),
             )
             melting_results.append(res)
+        if melting_results:
+            p = plots.plot_melting(melting_results, val_dir)
+            if p:
+                plot_paths["melting_temperature"] = p
+                print(f"  [melting] bracket plot -> {p.name}")
 
     # ── Thermal expansion ─────────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thermal_expansion", {})
@@ -201,6 +206,11 @@ def run_validation(
                 supercell_repeat=vac_cfg.get("supercell_repeat", 3),
             )
             vacancy_results.append(res)
+        if vacancy_results:
+            p = plots.plot_vacancy(vacancy_results, val_dir)
+            if p:
+                plot_paths["vacancy_formation"] = p
+                print(f"  [vacancy] bar chart -> {p.name}")
 
     # ── RDF ───────────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
@@ -290,23 +300,23 @@ def run_validation(
     for r in eos_results:
         if r.fit_ok:
             print(f"  EOS [{r.structure_id}]  "
-                  f"V0={r.V0:.3f} Å³  B0={r.B0:.1f} GPa  B0'={r.B0p:.2f}  E0={r.E0:.4f} eV")
+                  f"V0={r.V0:.3f} \u00c5\u00b3  B0={r.B0:.1f} GPa  B0'={r.B0p:.2f}  E0={r.E0:.4f} eV")
     for r in elastic_results:
         print(f"  Elastic [{r.structure_id}]  "
               f"B={r.B_voigt:.1f} GPa  G={r.G_voigt:.1f} GPa  Cij={r.C}")
     for r in melting_results:
         if r.compute_ok:
-            print(f"  Melting [{r.structure_id}]  T_melt≈{r.T_melt:.0f} K  "
+            print(f"  Melting [{r.structure_id}]  T_melt\u2248{r.T_melt:.0f} K  "
                   f"bracket=[{r.T_bracket_lo:.0f}, {r.T_bracket_hi:.0f}] K")
     for r in thexp_results:
         if r.compute_ok:
-            print(f"  ThExp [{r.structure_id}]  alpha={r.alpha*1e6:.2f}×10⁻⁶ K⁻¹")
+            print(f"  ThExp [{r.structure_id}]  alpha={r.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9")
     for r in vacancy_results:
         if r.compute_ok:
             print(f"  Vacancy [{r.structure_id}]  E_vac={r.E_vac:.4f} eV")
     for r in rdf_results:
         if r.compute_ok:
-            print(f"  RDF [{r.structure_id}]  r_1={r.first_peak_r:.3f} Å  "
+            print(f"  RDF [{r.structure_id}]  r_1={r.first_peak_r:.3f} \u00c5  "
                   f"g(r_1)={r.first_peak_g:.3f}  ({r.temperature:.0f} K)")
     for k, v in plot_paths.items():
         print(f"  Plot [{k}]: {v}")
