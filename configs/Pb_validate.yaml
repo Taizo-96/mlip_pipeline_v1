@@ -20,13 +20,13 @@ eos:
 
   structures:
     - id:          fcc
-      lammps_data: structures/Pb_fcc.lammps
+      lammps_data: structures/lammps_data/mp-20483.data
 
-    - id:          bcc
-      lammps_data: structures/Pb_bcc.lammps
+    #- id:          bcc
+    #  lammps_data: structures/lammps_data/mp-20483.data
 
-    - id:          hcp
-      lammps_data: structures/Pb_hcp.lammps
+    #- id:          hcp
+    #  lammps_data: structures/lammps_data/mp-20483.data
 
 
 # ── Elastic constants ───────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ elastic:
 
   structures:
     - id:          fcc
-      lammps_data: structures/Pb_fcc.lammps
+      lammps_data: structures/lammps_data/mp-20483.data
 
 
 # ── Materials Project reference ─────────────────────────────────────────────
