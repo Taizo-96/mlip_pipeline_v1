@@ -37,26 +37,32 @@ def _find_fit_range(
 ) -> "np.ndarray":
     """Return a boolean mask selecting points suitable for BM fitting.
 
-    MTP potentials extrapolate badly under high compression, producing
-    catastrophically negative energies at small volumes.  The true
-    equilibrium minimum sits in the upper (larger-volume) portion of
-    the scan.
+    MTP potentials extrapolate badly under high compression.  Strategy:
 
-    Strategy:
-    1. Find the minimum energy in the upper 60% of the volume range
-       (volumes >= 40th percentile) as the reference minimum e_ref.
-    2. Keep only points with energy >= e_ref - 1.5 eV/atom.
-       This discards the catastrophic compression points (e.g. -100 eV)
-       which are far BELOW e_ref, while keeping the physical parabola.
+    1. Find the global minimum energy point (the equilibrium).
+    2. Discard ALL points at volumes smaller than V(E_min) - some margin.
+       This removes the entire unphysical compression branch, including
+       points that accidentally have energies close to the well depth.
+    3. Also discard expansion points more than 1.5 eV above E_min.
     """
     import numpy as np  # type: ignore
+
+    i_min = int(np.argmin(es))
+
+    # If the global minimum is in the lower 40% of the volume range,
+    # it's a compression artefact.  Find the true minimum in the upper 60%.
     v_lo_cut = float(np.percentile(vs, 40))
     upper_mask = vs >= v_lo_cut
-    if upper_mask.sum() == 0:
-        return np.ones(len(vs), dtype=bool)
-    e_ref = es[upper_mask].min()          # minimum in the physical region
-    # Keep points that are not more than 1.5 eV/atom BELOW e_ref
-    mask = es >= e_ref - 1.5
+    if upper_mask.sum() > 0:
+        i_min = int(np.argmin(es[upper_mask]))
+        # map back to original index
+        i_min = int(np.where(upper_mask)[0][i_min])
+
+    v_min = vs[i_min]
+    e_min = es[i_min]
+
+    # Keep points: volume >= v_min * 0.92  AND  energy <= e_min + 1.5
+    mask = (vs >= v_min * 0.92) & (es <= e_min + 1.5)
     return mask
 
 
@@ -98,8 +104,8 @@ def _fit_bm(
     B0p_guess = 4.0
 
     p0 = [V0_guess, E0_guess, B0_guess, B0p_guess]
-    lower = [V0_guess * 0.5, E0_guess - 5.0, 1e-5,  1.0]
-    upper = [V0_guess * 2.0, E0_guess + 5.0, 1.0,  20.0]
+    lower = [V0_guess * 0.7, E0_guess - 5.0, 1e-5,  1.0]
+    upper = [V0_guess * 1.3, E0_guess + 5.0, 1.0,  20.0]
 
     def model(V, V0, E0, B0_ev, B0p):
         return np.array([_birch_murnaghan(v, V0, E0, B0_ev, B0p) for v in V])
