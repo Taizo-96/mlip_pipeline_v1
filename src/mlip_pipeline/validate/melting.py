@@ -3,7 +3,7 @@
 Physics
 -------
 A supercell is split into solid (bottom half) and liquid (top half) by z.
-The liquid seed is created by briefly heating that half to ~3*T_target in NVT.
+The liquid seed is created by briefly heating that half to ~2*T_target in NVT.
 The full cell is then run in NPT at T_target.
 
 The volume time series reveals which phase is stable at T_target:
@@ -90,9 +90,9 @@ def run_melting(
     mpi_command: Optional[str] = None,
     mpi_np: Optional[int] = None,
     cutoff: Optional[float] = None,
-    T_start: float = 400.0,
-    T_end: float = 900.0,
-    T_step: float = 50.0,
+    T_start: float = 500.0,
+    T_end: float = 750.0,
+    T_step: float = 25.0,
     supercell_repeat: int = 4,
     n_equil: int = 5000,
     n_prod: int = 20000,
@@ -138,6 +138,7 @@ def run_melting(
         except RuntimeError as exc:
             print(f"  [melting] WARNING: LAMMPS failed at T={T_cand}: {exc}")
             trend_map[T_cand] = "error"
+            # Do not break — continue scanning to find a valid bracket
             continue
 
         thermo_file = T_dir / "coex_thermo.txt"
@@ -148,11 +149,13 @@ def run_melting(
         if trend == "growing_solid":
             T_lo = T_cand
         elif trend == "growing_liquid":
-            T_hi = T_cand
-            # Once we find the first liquid-growing T, we can stop scanning up
-            break
-        # stable: coexistence found directly
+            if T_hi is None:
+                T_hi = T_cand
+            # Only stop scanning once we have BOTH sides of the bracket
+            if T_lo is not None:
+                break
         elif trend == "stable":
+            # Coexistence found directly
             T_lo = T_cand
             T_hi = T_cand
             break
@@ -168,9 +171,9 @@ def run_melting(
     elif T_lo == T_hi:
         T_melt = T_lo
     elif T_lo is None:
-        T_melt = T_hi
+        T_melt = T_hi   # only upper bound known
     else:
-        T_melt = T_lo
+        T_melt = T_lo   # only lower bound known
 
     print(f"  [melting] {structure_id}: T_melt ≈ {T_melt:.0f} K "
           f"(bracket [{T_lo}, {T_hi}] K)")

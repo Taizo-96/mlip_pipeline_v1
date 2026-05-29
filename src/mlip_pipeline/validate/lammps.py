@@ -213,9 +213,9 @@ def write_melting_input(
     1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
     2. Split atoms by z using a small epsilon offset so no atom sits exactly
        on the boundary (avoids double-integration warning).
-    3. Gently ramp the liquid half from T to 3*T over n_equil steps (NVT),
-       while holding the solid half at T.  Using a ramp instead of an
-       instant velocity re-assignment prevents 'Lost atoms' crashes.
+    3. Gently ramp the liquid half from T to 2*T over n_equil steps (NVT).
+       2*T keeps the seed well above T_melt while staying within the MTP
+       training distribution (3*T for low T puts atoms into deep extrapolation).
     4. Run NPT at T_target (whole cell); monitor volume -> coex_thermo.txt.
     """
     abs_data  = Path(lammps_data).resolve()
@@ -223,8 +223,9 @@ def write_melting_input(
     thermo_out = (work_dir / "coex_thermo.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    T_heat = 3.0 * temperature
-    # Use a shorter timestep during the violent heating phase
+    # 2*T is sufficient to melt the seed while staying within training range
+    T_heat = 2.0 * temperature
+    # Use a shorter timestep during the heating phase for stability
     dt_heat = dt / 4.0
 
     lines = [
@@ -242,7 +243,7 @@ def write_melting_input(
         "minimize        1e-8 1e-10 5000 50000",
         "",
         "# --- split into solid (lo-z) and liquid (hi-z) halves ---",
-        "# Use epsilon offset so no atom sits exactly on the boundary",
+        "# Epsilon offset prevents any atom sitting exactly on the boundary",
         "variable        Lz     equal lz",
         "variable        zmid   equal (zlo+zhi)/2.0 + 1e-6*v_Lz",
         "region          solid_region  block INF INF INF INF INF ${zmid} units box",
@@ -253,8 +254,8 @@ def write_melting_input(
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost ignore",
         "",
-        "# --- initialise velocities at T, then RAMP liquid half to 3*T ---",
-        "# Gentle ramp prevents 'Lost atoms' from instant high-T assignment",
+        "# --- initialise velocities at T, then RAMP liquid half to 2*T ---",
+        "# 2*T keeps seed above T_melt without extrapolating the MTP",
         f"velocity        all         create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(200*dt)",
         f"fix             fxL liquid_atoms nvt temp {temperature:.1f} {T_heat:.1f}   $(200*dt)",
@@ -262,7 +263,7 @@ def write_melting_input(
         "unfix           fxS",
         "unfix           fxL",
         "",
-        "# --- switch to production timestep and restore lost=error ---",
+        "# --- switch to production timestep, restore lost=error ---",
         f"timestep        {dt}",
         "thermo_modify   lost error",
         "",
