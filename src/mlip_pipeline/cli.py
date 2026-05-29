@@ -626,16 +626,16 @@ def validate(
 
     Examples
     --------
-    # Pb after generation 5:
+    # Pb after generation 16:
         mlip-pipeline validate \\
             --config configs/Pb_validate.yaml \\
-            --model  runs/gen_05/Pb16.almtp
+            --model  runs/gen_16/fit/Pb16.almtp
 
     # Custom output directory:
         mlip-pipeline validate \\
             --config configs/Pb_validate.yaml \\
-            --model  runs/gen_05/Pb16.almtp \\
-            --outdir runs/gen_05/validate
+            --model  runs/gen_16/fit/Pb16.almtp \\
+            --outdir runs/gen_16/validate
     """
     from mlip_pipeline.validate.runner import run_validation
 
@@ -649,21 +649,31 @@ def validate(
     cfg = load_yaml(config)
     result = run_validation(cfg, model_path, out_path)
 
-    typer.echo(f"Manifest: {result.manifest_path}")
+    manifest = result.validate_dir / "validate_manifest.json"
+    typer.echo(f"Manifest: {manifest}")
+
     if result.eos_results:
-        for struct_id, eos in result.eos_results.items():
-            typer.echo(
-                f"  EOS [{struct_id}]  V0={eos.V0:.3f} Å³  B0={eos.B0:.1f} GPa  "
-                f"B0'={eos.B0_prime:.2f}  E0={eos.E0:.4f} eV"
-            )
+        for eos in result.eos_results:
+            if eos.fit_ok:
+                typer.echo(
+                    f"  EOS [{eos.structure_id}]  V0={eos.V0:.3f} Å³  B0={eos.B0:.1f} GPa  "
+                    f"B0'={eos.B0p:.2f}  E0={eos.E0:.4f} eV"
+                )
+            else:
+                typer.echo(f"  EOS [{eos.structure_id}]  fit failed: {eos.fit_error}")
+
     if result.elastic_results:
-        for struct_id, el in result.elastic_results.items():
-            typer.echo(
-                f"  Elastic [{struct_id}]  B={el.bulk_modulus:.1f} GPa  "
-                f"G={el.shear_modulus:.1f} GPa"
-            )
-    for p in result.plot_paths:
-        typer.echo(f"  Plot: {p}")
+        for el in result.elastic_results:
+            if el.compute_ok:
+                typer.echo(
+                    f"  Elastic [{el.structure_id}]  B={el.B_voigt:.1f} GPa  "
+                    f"G={el.G_voigt:.1f} GPa  Cij={el.C}"
+                )
+            else:
+                typer.echo(f"  Elastic [{el.structure_id}]  failed: {el.error}")
+
+    for name, p in result.plot_paths.items():
+        typer.echo(f"  Plot [{name}]: {p}")
 
 
 # ---------------------------------------------------------------------------
