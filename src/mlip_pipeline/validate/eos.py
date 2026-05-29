@@ -40,22 +40,23 @@ def _find_fit_range(
     MTP potentials extrapolate badly under high compression, producing
     catastrophically negative energies at small volumes.  The true
     equilibrium minimum sits in the upper (larger-volume) portion of
-    the scan.  Strategy:
+    the scan.
 
+    Strategy:
     1. Find the minimum energy in the upper 60% of the volume range
-       (i.e. volumes >= 40th percentile).  This avoids picking up the
-       spurious deep minimum at extreme compression.
-    2. Keep all points within 1.5 eV/atom ABOVE that reference minimum.
-       This selects the physical parabolic well and discards both the
-       compression spike and any far-expansion anomalies.
+       (volumes >= 40th percentile) as the reference minimum e_ref.
+    2. Keep only points with energy >= e_ref - 1.5 eV/atom.
+       This discards the catastrophic compression points (e.g. -100 eV)
+       which are far BELOW e_ref, while keeping the physical parabola.
     """
     import numpy as np  # type: ignore
     v_lo_cut = float(np.percentile(vs, 40))
     upper_mask = vs >= v_lo_cut
     if upper_mask.sum() == 0:
         return np.ones(len(vs), dtype=bool)
-    e_ref = es[upper_mask].min()
-    mask = es <= e_ref + 1.5
+    e_ref = es[upper_mask].min()          # minimum in the physical region
+    # Keep points that are not more than 1.5 eV/atom BELOW e_ref
+    mask = es >= e_ref - 1.5
     return mask
 
 
