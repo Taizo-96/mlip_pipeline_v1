@@ -228,19 +228,21 @@ def write_melting_input(
       * Still at reduced timestep; lost ignore still active.
 
     Stage 3 – Production NVT (full dt, n_prod steps):
-      * reset_atoms id (new LAMMPS >=22Jul2023 syntax) to close any ID gaps
+      * reset_atoms id (LAMMPS >=22Jul2023 syntax) to close any ID gaps
         left by lost ignore before velocity reinitialisation.
       * velocity all create T seed+1.
-      * thermo_modify lost ignore kept (never switch to lost error for
-        two-phase runs — any remaining ejections simply reflect a potential
-        that cannot hold the liquid at this T, which is useful information).
+      * IMPORTANT: thermo_style must come BEFORE thermo_modify in this
+        stage.  Every new thermo_style command silently resets all
+        thermo_modify settings (LAMMPS warns: "previous thermo_modify
+        settings will be lost").  Placing thermo_modify after thermo_style
+        ensures lost ignore is active when the production run begins.
       * fix nvt on the whole cell; thermo + file output every 50 steps.
 
     Atom-loss sentinel
     ------------------
     After production the script writes the final atom count to
     ``atom_count.txt``.  The Python caller reads this and emits a warning
-    if >10 % of atoms were lost, treating the temperature point as failed.
+    if >10 % of atoms were lost, treating the temperature point as unreliable.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -248,7 +250,7 @@ def write_melting_input(
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # Timestep for disordering: 10x smaller than production dt.
+    # Timestep for disordering: 20x smaller than production dt.
     dt_heat   = dt / 20.0          # 0.0001 ps when dt=0.002
     T_liq     = temperature + 50.0  # target for liquid rescaling (mild overshoot)
     n_dis     = max(1000, n_equil // 2)   # disordering steps
@@ -327,14 +329,16 @@ def write_melting_input(
         f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
         "",
         f"timestep        {dt}",
-        "# Keep lost ignore in production: ejections signal instability at",
-        "# this T, which the Python caller detects via atom_count.txt.",
+        "",
+        "# CRITICAL ORDER: thermo_style MUST come before thermo_modify.",
+        "# thermo_style resets all thermo_modify settings (LAMMPS warns:",
+        "# 'previous thermo_modify settings will be lost'). Setting",
+        "# lost ignore after thermo_style ensures it is not silently cleared.",
+        "thermo_style    custom step temp vol pe atoms",
+        "thermo          50",
         "thermo_modify   flush yes lost ignore",
         "",
         f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        "",
-        "thermo_style    custom step temp vol pe atoms",
-        "thermo          50",
         "",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
