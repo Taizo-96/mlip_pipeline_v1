@@ -249,7 +249,7 @@ def run_single_generation(
 
             if step == "fit":
                 from mlip_pipeline.fit.trainer import train_potential, resolve_train_cfg
-                from mlip_pipeline.checks import check_training_cfg_count
+                from mlip_pipeline.loop.checks import check_training_cfg_count
 
                 train_cfg = resolve_train_cfg(config["fit"], config, resolved)
 
