@@ -213,18 +213,23 @@ def write_melting_input(
     1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
     2. Split atoms by z using a small epsilon offset so no atom sits exactly
        on the boundary (avoids double-integration warning).
-    3. Gently ramp the liquid half from T to 2*T over n_equil steps (NVT).
-       2*T keeps the seed well above T_melt while staying within the MTP
-       training distribution (3*T for low T puts atoms into deep extrapolation).
-    4. Run NPT at T_target (whole cell); monitor volume -> coex_thermo.txt.
+    3. Gently ramp the liquid half from T to T+200 K over n_equil steps (NVT).
+       A modest +200 K overheat is sufficient to disorder the liquid seed while
+       staying safely within the MTP training distribution (2*T at high T
+       pushes atoms into deep extrapolation and causes explosive trajectories).
+    4. Run NVT at T_target (whole cell, constant volume); monitor volume ->
+       coex_thermo.txt.  NVT is the scientifically correct ensemble for the
+       two-phase coexistence method — NPT can destabilise the simulation when
+       the liquid seed has already expanded during the ramp phase.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     thermo_out = (work_dir / "coex_thermo.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # 2*T is sufficient to melt the seed while staying within training range
-    T_heat = 2.0 * temperature
+    # Modest overheat: T + 200 K keeps the liquid seed well above T_melt
+    # while remaining within the MTP training domain.
+    T_heat = temperature + 200.0
     # Use a shorter timestep during the heating phase for stability
     dt_heat = dt / 4.0
 
@@ -238,6 +243,9 @@ def write_melting_input(
         "",
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
+        "",
+        "# --- increase neighbour list capacity for dense liquid configs ---",
+        "neigh_modify    one 4000 page 100000",
         "",
         "# --- minimise first ---",
         "minimize        1e-8 1e-10 5000 50000",
@@ -254,8 +262,8 @@ def write_melting_input(
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost ignore",
         "",
-        "# --- initialise velocities at T, then RAMP liquid half to 2*T ---",
-        "# 2*T keeps seed above T_melt without extrapolating the MTP",
+        "# --- initialise velocities at T, then RAMP liquid half to T+200 K ---",
+        "# +200 K overheat disorders the seed without pushing MTP into extrapolation",
         f"velocity        all         create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(200*dt)",
         f"fix             fxL liquid_atoms nvt temp {temperature:.1f} {T_heat:.1f}   $(200*dt)",
@@ -267,9 +275,11 @@ def write_melting_input(
         f"timestep        {dt}",
         "thermo_modify   lost error",
         "",
-        "# --- production NPT at T_target (whole cell) ---",
-        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} $(100*dt) "
-        f"iso 0.0 0.0 $(1000*dt)",
+        "# --- production NVT at T_target (whole cell, constant volume) ---",
+        "# NVT is the correct ensemble for two-phase coexistence: the volume",
+        "# signal (growing liquid vs growing solid) is preserved, and there is",
+        "# no risk of the barostat destabilising a partially-disordered cell.",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
         "",
         "thermo_style    custom step temp vol pe",
         "thermo          50",
@@ -279,7 +289,7 @@ def write_melting_input(
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
-        "unfix           fxNPT",
+        "unfix           fxNVT",
         "unfix           fxPrint",
     ]
     script_path.write_text("\n".join(lines) + "\n")
