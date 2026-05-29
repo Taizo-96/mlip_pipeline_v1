@@ -108,10 +108,17 @@ def run_elastic(
     mpi_command: Optional[str] = None,
     mpi_np: Optional[int] = None,
     delta: float = 0.01,
+    cutoff: Optional[float] = None,
 ) -> ElasticResult:
     """Compute elastic constants and return an ElasticResult.
 
     The work directory is <validate_dir>/elastic/<structure_id>/.
+
+    Parameters
+    ----------
+    cutoff:
+        Pair potential cutoff in Å.  Passed to ``run_lammps`` for the MPI
+        safety cap: if any box dimension < cutoff, ``mpi_np`` is forced to 1.
     """
     work_dir = ensure_dir(validate_dir / "elastic" / structure_id)
     out_file = work_dir / "stress_data.txt"
@@ -132,6 +139,7 @@ def run_elastic(
             mpi_np=mpi_np,
             log_file=work_dir / "lammps.log",
             lammps_data=lammps_data,
+            cutoff=cutoff,
         )
     except RuntimeError as exc:
         print(f"  [elastic] WARNING: LAMMPS failed for {structure_id}: {exc}")

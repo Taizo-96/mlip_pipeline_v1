@@ -55,12 +55,17 @@ def run_validation(
     mpi_command = val_cfg.get("mpi_command") or val_cfg.get("mpi_prefix")
     mpi_np      = val_cfg.get("mpi_np")
     element     = val_cfg.get("element", "Fe")   # primary element symbol
+    # Pair potential cutoff used for MPI safety cap (box must be > cutoff).
+    # Read from config; fall back to None (cap disabled) if not set.
+    cutoff: Optional[float] = val_cfg.get("cutoff") or val_cfg.get("lammps_cutoff")
 
     print(f"\n=== Validation ===")
     print(f"  model:    {model_path}")
     print(f"  out_dir:  {val_dir}")
     print(f"  lammps:   {lammps_cmd}")
     print(f"  element:  {element}")
+    if cutoff is not None:
+        print(f"  cutoff:   {cutoff} Å  (used for MPI safety cap)")
 
     eos_results: list[EosResult] = []
     elastic_results: list[ElasticResult] = []
@@ -97,6 +102,7 @@ def run_validation(
                 scale_min=eos_cfg.get("scale_min", 0.85),
                 scale_max=eos_cfg.get("scale_max", 1.15),
                 n_points=eos_cfg.get("n_points", 21),
+                cutoff=cutoff,
             )
             eos_results.append(res)
 
@@ -136,6 +142,7 @@ def run_validation(
                 mpi_command=mpi_command,
                 mpi_np=mpi_np,
                 delta=el_cfg.get("delta", 0.01),
+                cutoff=cutoff,
             )
             elastic_results.append(res)
 

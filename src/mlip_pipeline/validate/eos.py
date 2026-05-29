@@ -104,10 +104,17 @@ def run_eos(
     scale_min: float = 0.85,
     scale_max: float = 1.15,
     n_points: int = 21,
+    cutoff: Optional[float] = None,
 ) -> EosResult:
     """Run an EOS calculation and return an EosResult.
 
     The work directory is <validate_dir>/eos/<structure_id>/.
+
+    Parameters
+    ----------
+    cutoff:
+        Pair potential cutoff in Å.  Passed to ``run_lammps`` for the MPI
+        safety cap: if any box dimension < cutoff, ``mpi_np`` is forced to 1.
     """
     work_dir = ensure_dir(validate_dir / "eos" / structure_id)
     out_file = work_dir / "eos_data.txt"
@@ -128,6 +135,7 @@ def run_eos(
             mpi_np=mpi_np,
             log_file=work_dir / "lammps.log",
             lammps_data=lammps_data,
+            cutoff=cutoff,
         )
     except RuntimeError as exc:
         print(f"  [eos]     WARNING: LAMMPS failed for {structure_id}: {exc}")
