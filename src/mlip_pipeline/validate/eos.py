@@ -1,7 +1,6 @@
 """EOS runner and Birch-Murnaghan fitter."""
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Optional
 
@@ -14,12 +13,18 @@ from mlip_pipeline.utils.fs import ensure_dir
 # Birch-Murnaghan equation of state (3rd order)                        #
 # ------------------------------------------------------------------ #
 
-def _birch_murnaghan(V: float, V0: float, E0: float, B0: float, B0p: float) -> float:
-    """3rd-order Birch-Murnaghan EOS — energy in eV, volume in Å³."""
+# Conversion: 1 GPa = 1 / 160.2176634 eV/Å³
+_GPA_TO_EV_ANG3 = 1.0 / 160.2176634
+
+
+def _birch_murnaghan(
+    V: float, V0: float, E0: float, B0_ev: float, B0p: float
+) -> float:
+    """3rd-order BM EOS.  B0_ev must be in eV/Å³."""
     eta = (V0 / V) ** (2.0 / 3.0)
     return (
         E0
-        + (9.0 * V0 * B0 / 16.0)
+        + (9.0 * V0 * B0_ev / 16.0)
         * (
             (eta - 1.0) ** 3 * B0p
             + (eta - 1.0) ** 2 * (6.0 - 4.0 * eta)
@@ -27,31 +32,40 @@ def _birch_murnaghan(V: float, V0: float, E0: float, B0: float, B0p: float) -> f
     )
 
 
-def _fit_bm(volumes: list[float], energies: list[float]) -> tuple[float, float, float, float]:
-    """Fit a 3rd-order Birch-Murnaghan EOS using scipy.optimize.curve_fit.
-
-    Returns (V0, E0, B0_GPa, B0p).
-    Raises RuntimeError if the fit fails.
-    """
+def _fit_bm(
+    volumes: list[float], energies: list[float]
+) -> tuple[float, float, float, float]:
+    """Fit a 3rd-order BM EOS.  Returns (V0 [Å³], E0 [eV], B0 [GPa], B0p)."""
     try:
         from scipy.optimize import curve_fit  # type: ignore
         import numpy as np  # type: ignore
     except ImportError as exc:
         raise RuntimeError("scipy and numpy are required for EOS fitting") from exc
 
-    vs = np.array(volumes)
-    es = np.array(energies)
+    vs = np.array(volumes, dtype=float)
+    es = np.array(energies, dtype=float)
 
     i_min = int(np.argmin(es))
-    p0 = [vs[i_min], es[i_min], 100.0, 4.0]  # V0, E0, B0 (GPa), B0p
+    V0_guess = float(vs[i_min])
+    E0_guess = float(es[i_min])
+    # Use a modest B0 initial guess (40 GPa covers most metals including soft Pb)
+    B0_guess_ev = 40.0 * _GPA_TO_EV_ANG3
+    p0 = [V0_guess, E0_guess, B0_guess_ev, 4.0]
 
-    def model(V, V0, E0, B0_gpa, B0p):
-        # Convert GPa → eV/Å³  (1 GPa = 1 / 160.2176634 eV/Å³)
-        B0_ev = B0_gpa / 160.2176634
+    # Bounds: V0 > 0, B0 > 0, B0p > 1
+    lower = [1e-3,  -1e6, 1e-6, 1.0]
+    upper = [1e6,    1e6, 1.0,  20.0]
+
+    def model(V, V0, E0, B0_ev, B0p):
         return np.array([_birch_murnaghan(v, V0, E0, B0_ev, B0p) for v in V])
 
-    popt, _ = curve_fit(model, vs, es, p0=p0, maxfev=10000)
-    V0, E0, B0_gpa, B0p = popt
+    popt, _ = curve_fit(
+        model, vs, es, p0=p0,
+        bounds=(lower, upper),
+        maxfev=50000,
+    )
+    V0, E0, B0_ev, B0p = popt
+    B0_gpa = B0_ev / _GPA_TO_EV_ANG3
     return float(V0), float(E0), float(B0_gpa), float(B0p)
 
 
@@ -60,16 +74,7 @@ def _fit_bm(volumes: list[float], energies: list[float]) -> tuple[float, float, 
 # ------------------------------------------------------------------ #
 
 def _parse_eos_output(out_file: Path) -> tuple[list[float], list[float]]:
-    """Parse the LAMMPS EOS output file.
-
-    Expected format (one data line per volume point)::
-
-        # scale vol_per_atom energy_per_atom
-        0.850  12.345  -4.321
-        ...
-
-    Returns (volumes, energies).
-    """
+    """Parse LAMMPS EOS output: returns (volumes, energies)."""
     volumes: list[float] = []
     energies: list[float] = []
     for line in out_file.read_text().splitlines():
@@ -106,20 +111,10 @@ def run_eos(
     n_points: int = 21,
     cutoff: Optional[float] = None,
 ) -> EosResult:
-    """Run an EOS calculation and return an EosResult.
-
-    The work directory is <validate_dir>/eos/<structure_id>/.
-
-    Parameters
-    ----------
-    cutoff:
-        Pair potential cutoff in Å.  Passed to ``run_lammps`` for the MPI
-        safety cap: if any box dimension < cutoff, ``mpi_np`` is forced to 1.
-    """
+    """Run EOS calculation and return an EosResult."""
     work_dir = ensure_dir(validate_dir / "eos" / structure_id)
     out_file = work_dir / "eos_data.txt"
 
-    # Remove stale output from previous runs so append-mode print starts clean.
     if out_file.exists():
         out_file.unlink()
 
@@ -155,12 +150,11 @@ def run_eos(
             fit_error=msg,
         )
 
-    # Birch-Murnaghan fit
     try:
         V0, E0, B0, B0p = _fit_bm(volumes, energies)
         print(
-            f"  [eos]     {structure_id}: V0={V0:.4f} Å³  "
-            f"E0={E0:.6f} eV  B0={B0:.1f} GPa  B0'={B0p:.2f}"
+            f"  [eos]     {structure_id}: "
+            f"V0={V0:.4f} Å³  E0={E0:.6f} eV  B0={B0:.1f} GPa  B0\'={B0p:.2f}"
         )
         return EosResult(
             structure_id=structure_id,

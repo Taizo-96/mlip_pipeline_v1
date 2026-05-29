@@ -4,7 +4,6 @@ Only builds input scripts and runs LAMMPS — no physics logic here.
 """
 from __future__ import annotations
 
-import math
 import re
 import subprocess
 from pathlib import Path
@@ -16,11 +15,7 @@ from typing import Optional
 # ------------------------------------------------------------------ #
 
 def _count_atoms(lammps_data: Path) -> Optional[int]:
-    """Return the number of atoms declared in a LAMMPS data file.
-
-    Looks for a line of the form ``<int> atoms`` near the top of the file.
-    Returns None if the line is not found.
-    """
+    """Return the number of atoms declared in a LAMMPS data file."""
     try:
         with lammps_data.open() as fh:
             for line in fh:
@@ -33,11 +28,7 @@ def _count_atoms(lammps_data: Path) -> Optional[int]:
 
 
 def _box_lengths(lammps_data: Path) -> Optional[tuple[float, float, float]]:
-    """Return (Lx, Ly, Lz) box lengths from a LAMMPS data file.
-
-    Parses the three ``xlo xhi``, ``ylo yhi``, ``zlo zhi`` lines.
-    Returns None if parsing fails.
-    """
+    """Return (Lx, Ly, Lz) box lengths from a LAMMPS data file."""
     lengths: list[float] = []
     pattern = re.compile(
         r"^\s*(-?[\d.eE+\-]+)\s+(-?[\d.eE+\-]+)\s+(xlo xhi|ylo yhi|zlo zhi)"
@@ -61,44 +52,17 @@ def _safe_mpi_np(
     lammps_data: Optional[Path] = None,
     cutoff: Optional[float] = None,
 ) -> int:
-    """Return a safe MPI rank count for the given structure.
-
-    LAMMPS domain decomposition fails when:
-    1. More ranks than atoms (each subdomain must own ≥ 1 atom).
-    2. Any box dimension is smaller than the pair cutoff — LAMMPS cannot
-       fit even one bin per subdomain in that direction, triggering MPI_ABORT.
-
-    The returned value is clamped to the most restrictive of these limits.
-    Always returns at least 1.
-
-    Parameters
-    ----------
-    requested:
-        Number of MPI ranks requested by the user.
-    lammps_data:
-        Path to the LAMMPS data file (used to read atom count and box size).
-    cutoff:
-        Pair potential cutoff in Å.  When provided, the rank count is also
-        capped so that every box dimension is ≥ cutoff (i.e. the box can
-        host ≥ 1 bin in each direction).  If None, only the atom-count cap
-        is applied.
-    """
+    """Return a safe MPI rank count for the given structure."""
     if requested is None or requested <= 1:
         return requested if requested is not None else 1
 
     cap = requested
 
     if lammps_data is not None:
-        # Cap 1: n_ranks ≤ n_atoms
         n_atoms = _count_atoms(lammps_data)
         if n_atoms is not None:
             cap = min(cap, n_atoms)
 
-        # Cap 2: box must be ≥ cutoff in every direction for >1 rank.
-        # With N ranks, LAMMPS tries to decompose into roughly N^(1/3) per
-        # dimension.  The safe conservative rule: if ANY box side < cutoff,
-        # force n=1 because LAMMPS cannot safely ghost atoms across a
-        # subdomain narrower than the interaction range.
         if cutoff is not None and cutoff > 0:
             box = _box_lengths(lammps_data)
             if box is not None:
@@ -123,39 +87,11 @@ def write_eos_input(
     scale_max: float = 1.15,
     n_points: int = 21,
 ) -> Path:
-    """Write a LAMMPS input script that computes energy at scaled volumes.
-
-    For each volume point the lattice is uniformly scaled by a factor
-    ``s`` in [scale_min, scale_max] and a single-point energy computed.
-    Output is written to ``out_file`` as whitespace-separated lines::
-
-        scale  vol_per_atom  energy_per_atom
-
-    Returns the path of the written input script.
-
-    Notes
-    -----
-    The MLIP-3 LAMMPS interface (interface-lammps-mlip-3) requires::
-
-        pair_style  mlip load_from=<path>
-        pair_coeff  * *
-
-    The model path is passed via the ``load_from=`` keyword on the
-    ``pair_style`` line; ``pair_coeff`` takes no element arguments.
-
-    The undo scale step uses a named variable ``sinv = 1/s`` rather than
-    the inline ``$(1/${s})`` expression, which is not valid in all LAMMPS
-    builds (triggers "Invalid syntax in variable formula").
-
-    All file paths written into the script are resolved to absolute paths
-    so the script works regardless of LAMMPS working directory.
-    """
+    """Write a LAMMPS input script that computes energy at scaled volumes."""
     script_path = out_file.parent / "eos.in"
-    # Use absolute paths inside the script so LAMMPS finds files regardless
-    # of cwd (the subprocess is run from work_dir, not the project root).
-    abs_data    = Path(lammps_data).resolve()
-    abs_model   = Path(model_path).resolve()
-    abs_out     = Path(out_file).resolve()
+    abs_data  = Path(lammps_data).resolve()
+    abs_model = Path(model_path).resolve()
+    abs_out   = Path(out_file).resolve()
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -201,36 +137,20 @@ def write_elastic_input(
     element: str,
     delta: float = 0.01,
 ) -> Path:
-    """Write a LAMMPS input script that computes the stress tensor for
-    six finite-difference strain states.
+    """Write a LAMMPS input script for elastic constants via finite-difference stress.
 
-    Each strain state is applied, the stress tensor read, then the
-    strain is reversed.  The six states are written to ``out_file`` as::
-
-        strain_id  sxx  syy  szz  sxy  sxz  syz   (all in bar)
-
-    where strain_id encodes the deformation (0=exx, 1=eyy, ..., 5=eyz).
-    Elastic constants are computed in ``elastic.py`` from these stresses.
-
-    Returns the path of the written input script.
-
-    Notes
-    -----
-    The MLIP-3 LAMMPS interface (interface-lammps-mlip-3) requires::
-
-        pair_style  mlip load_from=<path>
-        pair_coeff  * *
-
-    Inline ``$(1/(1+v_delta))`` is replaced by a named variable
-    ``sinv = 1/(1+delta)`` for the same reason as in write_eos_input.
-
-    All file paths written into the script are resolved to absolute paths
-    so the script works regardless of LAMMPS working directory.
+    Variable declarations are placed BEFORE the change_box commands that
+    reference them.  The order is:
+      1. Setup (units, read_data, pair_style, minimize, thermo)
+      2. ALL variable declarations (delta, sdelta, sinv, shear_d, ...)
+      3. Print header
+      4. The six strain/run/print/undo blocks
     """
     script_path = out_file.parent / "elastic.in"
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     abs_out   = Path(out_file).resolve()
+
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -246,28 +166,30 @@ def write_elastic_input(
         "thermo_style    custom step pxx pyy pzz pxy pxz pyz",
         "thermo          1",
         "",
-        f"variable        delta   equal {delta}",
-        "variable        sinv    equal 1.0/(1.0+v_delta)",
-        f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {abs_out} screen no",
-        "",
-    ]
-    # Six strain states: exx, eyy, ezz, exy, exz, eyz
-    strains = [
-        ("0", "x scale ${sdelta} remap",        "x scale ${sinv} remap"),
-        ("1", "y scale ${sdelta} remap",        "y scale ${sinv} remap"),
-        ("2", "z scale ${sdelta} remap",        "z scale ${sinv} remap"),
-        ("3", "xy delta ${shear_d} remap",      "xy delta ${neg_shear_d} remap"),
-        ("4", "xz delta ${shear_d} remap",      "xz delta ${neg_shear_d} remap"),
-        ("5", "yz delta ${shear_dy} remap",     "yz delta ${neg_shear_dy} remap"),
-    ]
-    lines += [
+        # --- ALL variable declarations BEFORE any change_box ---
+        f"variable        delta        equal {delta}",
         "variable        sdelta       equal 1.0+v_delta",
+        "variable        sinv_normal  equal 1.0/(1.0+v_delta)",
         "variable        shear_d      equal v_delta*lx",
         "variable        neg_shear_d  equal -v_delta*lx",
         "variable        shear_dy     equal v_delta*ly",
         "variable        neg_shear_dy equal -v_delta*ly",
         "",
+        f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {abs_out} screen no",
+        "",
     ]
+
+    # Six strain states: exx, eyy, ezz, exy, exz, eyz
+    # Normal strains use scale; shear strains use delta (box tilt)
+    strains = [
+        ("0", "x scale ${sdelta} remap",          "x scale ${sinv_normal} remap"),
+        ("1", "y scale ${sdelta} remap",          "y scale ${sinv_normal} remap"),
+        ("2", "z scale ${sdelta} remap",          "z scale ${sinv_normal} remap"),
+        ("3", "xy delta ${shear_d} remap",        "xy delta ${neg_shear_d} remap"),
+        ("4", "xz delta ${shear_d} remap",        "xz delta ${neg_shear_d} remap"),
+        ("5", "yz delta ${shear_dy} remap",       "yz delta ${neg_shear_dy} remap"),
+    ]
+
     for sid, apply_strain, undo_strain in strains:
         lines += [
             f"change_box      all {apply_strain}",
@@ -277,6 +199,7 @@ def write_elastic_input(
             f"change_box      all {undo_strain}",
             "",
         ]
+
     script_path.write_text("\n".join(lines) + "\n")
     return script_path
 
@@ -295,37 +218,7 @@ def run_lammps(
     lammps_data: Optional[Path] = None,
     cutoff: Optional[float] = None,
 ) -> None:
-    """Execute LAMMPS for the given input script.
-
-    Parameters
-    ----------
-    script:
-        Path to the LAMMPS input file.
-    work_dir:
-        Working directory for the subprocess.
-    lammps_cmd:
-        LAMMPS executable name or path.
-    mpi_command:
-        MPI launcher (e.g. ``"mpirun"``).  None means run without MPI.
-    mpi_np:
-        Number of MPI ranks requested.  Automatically capped to prevent
-        domain-decomposition failures:
-
-        * cap at ``n_atoms`` (each subdomain must own ≥ 1 atom), and
-        * cap at 1 when any box dimension < ``cutoff`` (LAMMPS cannot
-          ghost atoms across a subdomain narrower than the cutoff).
-    log_file:
-        Path for the LAMMPS log file (passed via ``-log``).  Resolved to
-        an absolute path so LAMMPS finds it regardless of ``cwd``.
-    lammps_data:
-        Path to the LAMMPS data file being simulated.  Used to read atom
-        count and box dimensions for the safety cap; may be None.
-    cutoff:
-        Pair potential cutoff in Å used for the box-size safety cap.
-        If None, only the atom-count cap is applied.
-
-    Raises RuntimeError if the process exits with a non-zero return code.
-    """
+    """Execute LAMMPS for the given input script."""
     safe_np = _safe_mpi_np(mpi_np, lammps_data, cutoff=cutoff)
 
     cmd: list[str] = []
@@ -335,8 +228,6 @@ def run_lammps(
             cmd += ["-n", str(safe_np)]
     cmd += [lammps_cmd, "-in", str(Path(script).resolve())]
     if log_file:
-        # Always use an absolute path for -log so LAMMPS can create the file
-        # regardless of the subprocess cwd.
         cmd += ["-log", str(Path(log_file).resolve())]
 
     result = subprocess.run(
