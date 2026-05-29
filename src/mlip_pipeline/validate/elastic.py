@@ -123,6 +123,10 @@ def run_elastic(
     work_dir = ensure_dir(validate_dir / "elastic" / structure_id)
     out_file = work_dir / "stress_data.txt"
 
+    # Remove stale output from previous runs so append-mode print starts clean.
+    if out_file.exists():
+        out_file.unlink()
+
     print(f"  [elastic] {structure_id}: writing LAMMPS input (delta={delta}) ...")
     script = write_elastic_input(
         lammps_data, model_path, out_file,

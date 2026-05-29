@@ -146,16 +146,24 @@ def write_eos_input(
     The undo scale step uses a named variable ``sinv = 1/s`` rather than
     the inline ``$(1/${s})`` expression, which is not valid in all LAMMPS
     builds (triggers "Invalid syntax in variable formula").
+
+    All file paths written into the script are resolved to absolute paths
+    so the script works regardless of LAMMPS working directory.
     """
     script_path = out_file.parent / "eos.in"
+    # Use absolute paths inside the script so LAMMPS finds files regardless
+    # of cwd (the subprocess is run from work_dir, not the project root).
+    abs_data    = Path(lammps_data).resolve()
+    abs_model   = Path(model_path).resolve()
+    abs_out     = Path(out_file).resolve()
     lines = [
         "units           metal",
         "atom_style      atomic",
         "boundary        p p p",
         "",
-        f"read_data       {lammps_data}",
+        f"read_data       {abs_data}",
         "",
-        f"pair_style      mlip load_from={model_path}",
+        f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
         "thermo_style    custom step vol pe",
@@ -166,7 +174,7 @@ def write_eos_input(
         f"variable        s_max   equal {scale_max}",
         "variable        ds      equal (v_s_max-v_s_min)/v_n_steps",
         "",
-        f"print           \"# scale vol_per_atom energy_per_atom\" file {out_file} screen no",
+        f"print           \"# scale vol_per_atom energy_per_atom\" file {abs_out} screen no",
         "",
         "variable        i       loop 0 ${n_steps}",
         "label           loop_start",
@@ -176,7 +184,7 @@ def write_eos_input(
         "  run           0",
         "  variable      vpat    equal vol/atoms",
         "  variable      epat    equal pe/atoms",
-        f" print         \"${{s}} ${{vpat}} ${{epat}}\" append {out_file} screen no",
+        f"  print         \"${{s}} ${{vpat}} ${{epat}}\" append {abs_out} screen no",
         "  change_box    all     x scale ${sinv} y scale ${sinv} z scale ${sinv} remap",
         "next            i",
         "jump            SELF    loop_start",
@@ -215,16 +223,22 @@ def write_elastic_input(
 
     Inline ``$(1/(1+v_delta))`` is replaced by a named variable
     ``sinv = 1/(1+delta)`` for the same reason as in write_eos_input.
+
+    All file paths written into the script are resolved to absolute paths
+    so the script works regardless of LAMMPS working directory.
     """
     script_path = out_file.parent / "elastic.in"
+    abs_data  = Path(lammps_data).resolve()
+    abs_model = Path(model_path).resolve()
+    abs_out   = Path(out_file).resolve()
     lines = [
         "units           metal",
         "atom_style      atomic",
         "boundary        p p p",
         "",
-        f"read_data       {lammps_data}",
+        f"read_data       {abs_data}",
         "",
-        f"pair_style      mlip load_from={model_path}",
+        f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
         "minimize        1e-10 1e-12 10000 100000",
@@ -234,11 +248,10 @@ def write_elastic_input(
         "",
         f"variable        delta   equal {delta}",
         "variable        sinv    equal 1.0/(1.0+v_delta)",
-        f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {out_file} screen no",
+        f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {abs_out} screen no",
         "",
     ]
     # Six strain states: exx, eyy, ezz, exy, exz, eyz
-    # Shear strains (3-5) use +/- delta*lx/ly directly — no division needed.
     strains = [
         ("0", "x scale ${sdelta} remap",        "x scale ${sinv} remap"),
         ("1", "y scale ${sdelta} remap",        "y scale ${sinv} remap"),
@@ -247,7 +260,6 @@ def write_elastic_input(
         ("4", "xz delta ${shear_d} remap",      "xz delta ${neg_shear_d} remap"),
         ("5", "yz delta ${shear_dy} remap",     "yz delta ${neg_shear_dy} remap"),
     ]
-    # Pre-compute helper variables before the strain loop
     lines += [
         "variable        sdelta       equal 1.0+v_delta",
         "variable        shear_d      equal v_delta*lx",
@@ -261,7 +273,7 @@ def write_elastic_input(
             f"change_box      all {apply_strain}",
             "run             0",
             f"print           \"{sid} ${{pxx}} ${{pyy}} ${{pzz}} ${{pxy}} ${{pxz}} ${{pyz}}\""
-            f" append {out_file} screen no",
+            f" append {abs_out} screen no",
             f"change_box      all {undo_strain}",
             "",
         ]
@@ -303,7 +315,8 @@ def run_lammps(
         * cap at 1 when any box dimension < ``cutoff`` (LAMMPS cannot
           ghost atoms across a subdomain narrower than the cutoff).
     log_file:
-        Path for the LAMMPS log file (passed via ``-log``).
+        Path for the LAMMPS log file (passed via ``-log``).  Resolved to
+        an absolute path so LAMMPS finds it regardless of ``cwd``.
     lammps_data:
         Path to the LAMMPS data file being simulated.  Used to read atom
         count and box dimensions for the safety cap; may be None.
@@ -320,9 +333,11 @@ def run_lammps(
         cmd += mpi_command.split()
         if safe_np is not None:
             cmd += ["-n", str(safe_np)]
-    cmd += [lammps_cmd, "-in", str(script)]
+    cmd += [lammps_cmd, "-in", str(Path(script).resolve())]
     if log_file:
-        cmd += ["-log", str(log_file)]
+        # Always use an absolute path for -log so LAMMPS can create the file
+        # regardless of the subprocess cwd.
+        cmd += ["-log", str(Path(log_file).resolve())]
 
     result = subprocess.run(
         cmd,

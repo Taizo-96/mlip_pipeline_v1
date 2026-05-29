@@ -119,6 +119,10 @@ def run_eos(
     work_dir = ensure_dir(validate_dir / "eos" / structure_id)
     out_file = work_dir / "eos_data.txt"
 
+    # Remove stale output from previous runs so append-mode print starts clean.
+    if out_file.exists():
+        out_file.unlink()
+
     print(f"  [eos]     {structure_id}: writing LAMMPS input ...")
     script = write_eos_input(
         lammps_data, model_path, out_file,
