@@ -26,6 +26,7 @@ element: "Pb"
 # LAMMPS binary (same as Pb_loop.yaml)
 lammps_command: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
 mpi_command:    "mpirun"
+cutoff:         7.0   # MTP cutoff in Å — used to auto-cap MPI ranks for small cells
 mpi_np:         4
 
 
@@ -45,15 +46,15 @@ eos:
     - id:          fcc
       # FCC Pb conventional cell (4 atoms), exported by the Materials Project
       # step via materials_project.export_lammps_data = true  →  mp-20483
-      lammps_data: structures/Pb_fcc.lammps   # relative to project_root
+      lammps_data: structures/lammps_data/mp-20483.data   # relative to project_root
 
     # Metastable phases — useful for checking phase-ordering is correct.
     # Comment out if lammps data files are not yet available.
-    - id:          bcc
-      lammps_data: structures/Pb_bcc.lammps
+    #- id:          bcc
+    #  lammps_data: structures/Pb_bcc.lammps
 
-    - id:          hcp
-      lammps_data: structures/Pb_hcp.lammps
+    #- id:          hcp
+    #  lammps_data: structures/Pb_hcp.lammps
 
 
 # ── Elastic constants ───────────────────────────────────────────────────────
@@ -73,4 +74,14 @@ elastic:
 
   structures:
     - id:          fcc
-      lammps_data: structures/Pb_fcc.lammps
+      lammps_data: structures/lammps_data/mp-20483.data
+
+# configs/Pb_validate.yaml  — add this block
+reference:
+  label: "MP PBE (mp-20483)"
+  V0: 31.65      # Å³/atom
+  E0: -3.556     # eV/atom  (your MTP already agrees on this)
+  B0: 43.0       # GPa
+  C11: 49.5      # GPa
+  C12: 42.3      # GPa
+  C44: 14.9      # GPa
