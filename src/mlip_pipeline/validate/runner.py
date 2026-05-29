@@ -1,12 +1,6 @@
 """Orchestrator for physics validation.
 
 Entry point:  run_validation(config, model_path, out_dir)
-
-The config dict may either be:
-  - a full pipeline config (Fe_loop.yaml style) with a ``validate`` section, or
-  - a standalone validation config (Fe_validate.yaml style).
-
-Both styles resolve to the same flat ``validate`` dict used internally.
 """
 from __future__ import annotations
 
@@ -18,10 +12,10 @@ from mlip_pipeline.validate.models import ValidationResult, EosResult, ElasticRe
 from mlip_pipeline.validate.eos import run_eos
 from mlip_pipeline.validate.elastic import run_elastic
 from mlip_pipeline.validate import plots
+from mlip_pipeline.validate.mp_reference import fetch_mp_reference, print_deviation_table
 
 
 def _resolve_val_config(config: dict) -> dict:
-    """Return the flat validate config dict regardless of input style."""
     return config.get("validate", config)
 
 
@@ -30,19 +24,6 @@ def run_validation(
     model_path: Path,
     out_dir: Path,
 ) -> ValidationResult:
-    """Run all enabled validation tasks and return a ValidationResult.
-
-    Parameters
-    ----------
-    config:
-        Full pipeline config *or* a standalone validate config dict.
-        The ``validate`` section (or the dict itself) controls what runs.
-    model_path:
-        Path to the trained ``.almtp`` file.
-    out_dir:
-        Directory where all validation output is written.
-        Sub-directories are created automatically.
-    """
     val_cfg  = _resolve_val_config(config)
     val_dir  = ensure_dir(out_dir)
     model_path = Path(model_path).resolve()
@@ -50,13 +31,10 @@ def run_validation(
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    # ---- shared LAMMPS settings -----------------------------------------
     lammps_cmd  = val_cfg.get("lammps_command", "lmp_mpi")
     mpi_command = val_cfg.get("mpi_command") or val_cfg.get("mpi_prefix")
     mpi_np      = val_cfg.get("mpi_np")
-    element     = val_cfg.get("element", "Fe")   # primary element symbol
-    # Pair potential cutoff used for MPI safety cap (box must be > cutoff).
-    # Read from config; fall back to None (cap disabled) if not set.
+    element     = val_cfg.get("element", "Fe")
     cutoff: Optional[float] = val_cfg.get("cutoff") or val_cfg.get("lammps_cutoff")
 
     print(f"\n=== Validation ===")
@@ -71,20 +49,18 @@ def run_validation(
     elastic_results: list[ElasticResult] = []
     plot_paths: dict = {}
 
-    # ---- EOS ---------------------------------------------------------------
+    # ── EOS -----------------------------------------------------------------
     eos_cfg = val_cfg.get("eos", {})
     if eos_cfg.get("enabled", True):
         structures = eos_cfg.get("structures", [])
         if not structures:
             print("  [eos]     WARNING: no structures defined under validate.eos.structures")
         for s in structures:
-            sid          = s["id"]
-            data_path    = Path(s["lammps_data"])
+            sid       = s["id"]
+            data_path = Path(s["lammps_data"])
             if not data_path.is_absolute():
-                # Resolve relative paths against project_root if present
                 root = Path(config.get("project_root", "."))
                 data_path = (root / data_path).resolve()
-
             if not data_path.exists():
                 print(f"  [eos]     WARNING: lammps_data not found for {sid}: {data_path}")
                 eos_results.append(EosResult(
@@ -92,7 +68,6 @@ def run_validation(
                     fit_error=f"data file not found: {data_path}",
                 ))
                 continue
-
             res = run_eos(
                 sid, data_path, model_path, val_dir,
                 element=element,
@@ -105,8 +80,6 @@ def run_validation(
                 cutoff=cutoff,
             )
             eos_results.append(res)
-
-            # Plot this EOS curve
             p = plots.plot_eos(res, val_dir)
             if p:
                 plot_paths[f"eos_{sid}"] = p
@@ -114,7 +87,7 @@ def run_validation(
     else:
         print("  [eos]     skipped (disabled in config)")
 
-    # ---- Elastic constants ------------------------------------------------
+    # ── Elastic constants ---------------------------------------------------
     el_cfg = val_cfg.get("elastic", {})
     if el_cfg.get("enabled", True):
         structures = el_cfg.get("structures", [])
@@ -126,7 +99,6 @@ def run_validation(
             if not data_path.is_absolute():
                 root = Path(config.get("project_root", "."))
                 data_path = (root / data_path).resolve()
-
             if not data_path.exists():
                 print(f"  [elastic] WARNING: lammps_data not found for {sid}: {data_path}")
                 elastic_results.append(ElasticResult(
@@ -134,7 +106,6 @@ def run_validation(
                     error=f"data file not found: {data_path}",
                 ))
                 continue
-
             res = run_elastic(
                 sid, data_path, model_path, val_dir,
                 element=element,
@@ -145,15 +116,42 @@ def run_validation(
                 cutoff=cutoff,
             )
             elastic_results.append(res)
-
-    # Plot elastic constants summary
     if elastic_results:
         p = plots.plot_elastic_bar(elastic_results, val_dir)
         if p:
             plot_paths["elastic_constants"] = p
             print(f"  [elastic] bar chart -> {p.name}")
 
-    # ---- Persist manifest -------------------------------------------------
+    # ── MP reference comparison ---------------------------------------------
+    ref_cfg = val_cfg.get("reference", {})
+    mp_id   = ref_cfg.get("mp_id")
+    ref     = None
+    if mp_id:
+        ref = fetch_mp_reference(
+            mp_id,
+            out_dir=val_dir,
+            api_key_env=ref_cfg.get("api_key_env", "MP_API_KEY"),
+        )
+
+    if ref:
+        # Collect MTP values from results
+        mtp_vals: dict = {}
+        for r in eos_results:
+            if r.fit_ok and r.structure_id == "fcc":
+                mtp_vals["V0"] = r.V0
+                mtp_vals["E0"] = r.E0
+                mtp_vals["B0"] = r.B0
+                break
+        for r in elastic_results:
+            if r.structure_id == "fcc" and r.cij:
+                mtp_vals["C11"] = r.cij.get("C11")
+                mtp_vals["C12"] = r.cij.get("C12")
+                mtp_vals["C44"] = r.cij.get("C44")
+                mtp_vals["G0"]  = r.G_voigt
+                break
+        print_deviation_table(mtp_vals, ref)
+
+    # ── Manifest ------------------------------------------------------------
     result = ValidationResult(
         model_path=model_path,
         validate_dir=val_dir,
@@ -162,5 +160,5 @@ def run_validation(
         plot_paths=plot_paths,
     )
     manifest_path = result.save_manifest()
-    print(f"\nValidation complete -- manifest -> {manifest_path}")
+    print(f"Validation complete -- manifest -> {manifest_path}")
     return result
