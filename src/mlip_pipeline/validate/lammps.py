@@ -210,21 +210,28 @@ def write_melting_input(
 
     Protocol (Belonoshko-style two-phase coexistence)
     -------------------------------------------------
-    Stage 1 — Liquid disordering at 2×T_target (NVT, liquid group only):
-      The liquid half is heated to 2×T_target, which is well above T_melt
-      for any reasonable scan temperature. This guarantees the liquid half
-      is truly disordered regardless of T_target. The solid half is held
-      at T_target with its own NVT thermostat throughout.
-      Timestep is reduced to dt/5 during disordering for stability.
+    Stage 1 — Liquid disordering at 1.5*T_target (NVT, liquid group only):
+      The liquid half is heated to 1.5*T_target.  This is hot enough to
+      disorder Pb at any scan temperature <= 900 K while keeping the atom
+      count stable (2*T was too aggressive and caused atoms to escape the
+      box, leaving non-consecutive IDs and crashing Stage 3).  The solid
+      half is held at T_target with its own NVT thermostat throughout.
+      A reduced timestep (dt/5) is used for stability during disordering.
 
     Stage 2 — Quench and equilibrate at T_target (NVT, whole cell):
-      The liquid half is cooled back to T_target. A whole-system NVT
+      The liquid half is cooled back to T_target.  A whole-system NVT
       equilibration allows the interface to form cleanly.
+
+    reset_atoms id — Restore consecutive atom IDs:
+      Any atoms lost during Stage 1 leave gaps in the ID sequence.
+      `reset_atoms id` renumbers all atoms consecutively so that
+      `velocity create loop all` in Stage 3 does not crash with
+      "Atom IDs must be consecutive".
 
     Stage 3 — Production NVT at T_target:
       The PE slope over the production run is the classifier signal.
       Under NVT (constant volume), PE rises if liquid grows and falls
-      if solid grows. Volume is logged for diagnostics only.
+      if solid grows.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -233,8 +240,8 @@ def write_melting_input(
     script_path = work_dir / "melting.in"
 
     dt_heat  = dt / 5.0            # 0.0004 ps — safe for high-T disordering
-    T_dis    = 2.0 * temperature   # guaranteed to disorder for any T_target
-    n_dis    = max(2000, n_equil)  # enough steps to fully disorder at 2×T
+    T_dis    = 1.5 * temperature   # hot enough to disorder; avoids atom escape
+    n_dis    = max(2000, n_equil)  # enough steps to fully disorder
     n_eq     = max(1000, n_equil // 2)  # quench + interface equilibration
 
     lines = [
@@ -260,11 +267,13 @@ def write_melting_input(
         "group           liquid_atoms  region liquid_region",
         "",
         f"timestep        {dt_heat}",
-        "thermo_modify   flush yes lost ignore",
+        # Use 'lost warn' so escaping atoms are logged but the run continues.
+        # 'lost ignore' silently deleted atoms and left non-consecutive IDs.
+        "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
         "# ----------------------------------------------------------------",
-        f"# Stage 1: Disorder liquid half at 2*T = {T_dis:.0f} K.",
+        f"# Stage 1: Disorder liquid half at 1.5*T = {T_dis:.0f} K.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
@@ -281,6 +290,13 @@ def write_melting_input(
         "unfix           fxEQ",
         "",
         "# ----------------------------------------------------------------",
+        "# Restore consecutive atom IDs before Stage 3.",
+        "# Any atoms lost during the high-T melt leave gaps in the ID",
+        "# sequence; 'velocity create loop all' requires consecutive IDs.",
+        "# ----------------------------------------------------------------",
+        "reset_atoms     id",
+        "",
+        "# ----------------------------------------------------------------",
         "# Stage 3: Production NVT. Classify via PE slope.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
@@ -288,7 +304,7 @@ def write_melting_input(
         f"timestep        {dt}",
         "thermo_style    custom step temp vol pe atoms",
         "thermo          50",
-        "thermo_modify   flush yes lost ignore",
+        "thermo_modify   flush yes lost warn",
         "",
         f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
