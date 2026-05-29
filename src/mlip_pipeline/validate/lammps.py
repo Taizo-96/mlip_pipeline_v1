@@ -46,18 +46,28 @@ def _safe_mpi_np(
     requested: Optional[int],
     lammps_data: Optional[Path] = None,
     cutoff: Optional[float] = None,
+    supercell_repeat: int = 1,
 ) -> int:
+    """Return safe MPI rank count, accounting for supercell replication.
+
+    The data file describes the *unit cell*; the actual simulation box is
+    replicate_factor times larger.  We scale up the atom count and box
+    lengths before applying the cutoff / atom-count caps.
+    """
     if requested is None or requested <= 1:
         return requested if requested is not None else 1
     cap = requested
+    rep = max(1, supercell_repeat)
     if lammps_data is not None:
         n_atoms = _count_atoms(lammps_data)
         if n_atoms is not None:
-            cap = min(cap, n_atoms)
+            n_sim = n_atoms * rep ** 2 * (rep * 2)  # NxNx2N for melting, else N^3
+            cap = min(cap, n_sim)
         if cutoff is not None and cutoff > 0:
             box = _box_lengths(lammps_data)
             if box is not None:
-                if min(box) < cutoff:
+                scaled_box = tuple(l * rep for l in box)
+                if min(scaled_box) < cutoff:
                     cap = 1
     return max(1, cap)
 
@@ -205,14 +215,13 @@ def write_melting_input(
 
     Protocol
     --------
-    1. Read the unit cell and replicate into a slab supercell.
-    2. Split atoms into two halves by x-coordinate.
+    1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
+    2. Split atoms into two halves by z-coordinate.
     3. Heat the upper half to 3*T_target in NVT to create liquid seed, then
        cool back to T_target.
-    4. Run NPT at T_target; monitor if solid or liquid phase grows by tracking
-       the instantaneous volume drift — written to coex_thermo.txt.
+    4. Run NPT at T_target; monitor volume drift -> written to coex_thermo.txt.
 
-    The Python extractor reads the volume time series and decides:
+    Volume trend classification (done in Python after the run):
     - volume expanding -> liquid growing  -> T > T_melt
     - volume shrinking -> solid growing   -> T < T_melt
     - volume stable    -> at coexistence  -> T ≈ T_melt
@@ -223,6 +232,7 @@ def write_melting_input(
     script_path = work_dir / "melting.in"
 
     T_heat = 3.0 * temperature
+
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -234,10 +244,10 @@ def write_melting_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
-        "# --- split into solid (lo) and liquid (hi) halves by z ---",
-        "variable        zmid   equal (zlo+zhi)/2",
-        "region          solid_region  block INF INF INF INF INF v_zmid",
-        "region          liquid_region block INF INF INF INF v_zmid INF",
+        "# --- split into solid (lo-z) and liquid (hi-z) halves ---",
+        "variable        zmid   equal (zlo+zhi)/2.0",
+        "region          solid_region  block INF INF INF INF INF ${zmid} units box",
+        "region          liquid_region block INF INF INF INF ${zmid} INF units box",
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
@@ -245,26 +255,33 @@ def write_melting_input(
         "minimize        1e-8 1e-10 5000 50000",
         "",
         f"timestep        {dt}",
+        "thermo_modify   flush yes",
         "",
-        "# --- heat liquid half to 3*T, equilibrate, cool to T ---",
-        f"velocity        all         create {temperature} {seed} dist gaussian",
-        f"fix             fxS solid_atoms  nvt temp {temperature} {temperature} $(100*dt)",
-        f"fix             fxL liquid_atoms nvt temp {T_heat}      {T_heat}      $(100*dt)",
+        "# --- heat liquid half to 3*T to create melt seed, hold solid at T ---",
+        f"velocity        all         create {temperature:.1f} {seed} dist gaussian",
+        f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxL liquid_atoms nvt temp {T_heat:.1f}      {T_heat:.1f}      $(100*dt)",
         f"run             {n_equil}",
         "unfix           fxS",
         "unfix           fxL",
         "",
         "# --- production NPT at T_target (whole cell) ---",
-        f"fix             fxNPT all npt temp {temperature} {temperature} $(100*dt) "
+        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} $(100*dt) "
         f"iso 0.0 0.0 $(1000*dt)",
         "",
         "thermo_style    custom step temp vol pe",
-        "thermo          100",
+        "thermo          50",
+        "",
+        # Write header once with 'file' (overwrites), then use 'fix print'
+        # with 'append' for the data rows.  No title= argument to avoid
+        # duplicate header lines that confuse the Python parser.
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
-        f"fix             print_thermo all print 100 "
-        f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no title \"# step temp vol pe\"",
+        f"fix             fxPrint all print 50 "
+        f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
+        "unfix           fxNPT",
+        "unfix           fxPrint",
     ]
     script_path.write_text("\n".join(lines) + "\n")
     return script_path
@@ -290,10 +307,6 @@ def write_thermal_expansion_input(
     out_file  = (work_dir / "thexp_output.txt").resolve()
     script_path = work_dir / "thexp.in"
 
-    T_str = " ".join(f"{t:.1f}" for t in temperatures)
-    n_T   = len(temperatures)
-
-    # Build per-temperature loops
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -313,7 +326,6 @@ def write_thermal_expansion_input(
         "",
     ]
     for i, T in enumerate(temperatures):
-        T_start = temperatures[i - 1] if i > 0 else T
         lines += [
             f"# --- T = {T:.1f} K ---",
             f"velocity        all create {T:.1f} {seed + i} dist gaussian",
@@ -394,14 +406,23 @@ def write_rdf_input(
     seed: int = 99,
     supercell_repeat: int = 3,
 ) -> Path:
-    """NVT MD run followed by compute rdf dump.
+    """NVT MD run followed by compute rdf accumulation.
 
-    Output: rdf_output.txt (LAMMPS ave/time format).
+    The 'cutoff' keyword in compute rdf is not available in older LAMMPS
+    builds; r_max is enforced via the pair_style cutoff instead.  The
+    output is the standard ave/time multi-column file (rdf_output.txt).
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     out_file  = (work_dir / "rdf_output.txt").resolve()
     script_path = work_dir / "rdf.in"
+
+    # ave/time parameters: sample every 10 steps, average over n_prod steps
+    # Nrepeat = n_prod // 10  (number of samples per output block)
+    # Nfreq   = n_prod        (output once at the end of the production run)
+    n_every  = 10
+    n_repeat = n_prod // n_every
+    n_freq   = n_prod
 
     lines = [
         "units           metal",
@@ -417,6 +438,7 @@ def write_rdf_input(
         "minimize        1e-10 1e-12 10000 100000",
         "",
         f"timestep        {dt}",
+        "thermo_modify   flush yes",
         "",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
@@ -424,11 +446,13 @@ def write_rdf_input(
         "# --- equilibration ---",
         f"run             {n_equil}",
         "",
-        "# --- RDF accumulation ---",
-        f"compute         rdf_compute all rdf {n_bins} cutoff {r_max}",
-        f"fix             rdf_avg all ave/time 10 {n_prod // 100} {n_prod} "
-        f"c_rdf_compute[*] file {out_file} mode vector",
-        f"run             {n_prod}",
+        "# --- RDF accumulation (no 'cutoff' keyword for compatibility) ---",
+        f"compute         rdf_c all rdf {n_bins}",
+        f"fix             rdf_avg all ave/time {n_every} {n_repeat} {n_freq} "
+        f"c_rdf_c[*] file {out_file} mode vector",
+        f"run             {n_freq}",
+        "unfix           fxNVT",
+        "unfix           rdf_avg",
     ]
     script_path.write_text("\n".join(lines) + "\n")
     return script_path
@@ -447,8 +471,11 @@ def run_lammps(
     log_file: Optional[Path] = None,
     lammps_data: Optional[Path] = None,
     cutoff: Optional[float] = None,
+    supercell_repeat: int = 1,
 ) -> None:
-    safe_np = _safe_mpi_np(mpi_np, lammps_data, cutoff=cutoff)
+    safe_np = _safe_mpi_np(
+        mpi_np, lammps_data, cutoff=cutoff, supercell_repeat=supercell_repeat
+    )
     cmd: list[str] = []
     if mpi_command:
         cmd += mpi_command.split()
