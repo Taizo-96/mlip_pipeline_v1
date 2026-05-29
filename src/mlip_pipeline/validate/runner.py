@@ -12,7 +12,7 @@ from mlip_pipeline.validate.models import ValidationResult, EosResult, ElasticRe
 from mlip_pipeline.validate.eos import run_eos
 from mlip_pipeline.validate.elastic import run_elastic
 from mlip_pipeline.validate import plots
-from mlip_pipeline.validate.mp_reference import fetch_mp_reference, print_deviation_table
+from mlip_pipeline.integrations.mp_reference import fetch_mp_reference, print_deviation_table
 
 
 def _resolve_val_config(config: dict) -> dict:
