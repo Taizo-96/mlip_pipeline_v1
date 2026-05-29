@@ -220,8 +220,11 @@ def write_melting_input(
        A fix dt/reset is active throughout to dynamically shrink dt if any atom
        moves too far, without requiring the limit/force package.
        The solid half is held at T throughout.
-    4. After the ramp: remove dt/reset, re-initialise all velocities with
-       `velocity all create` (safe even if T=0), then run NVT production.
+    4. After the ramp: remove dt/reset, call `reset_ids` to renumber atoms
+       consecutively (required when `lost ignore` has deleted atoms, which
+       otherwise leaves non-consecutive IDs that break `velocity ... loop all`),
+       then re-initialise all velocities with `velocity all create` and run
+       NVT production.
        NVT is the correct ensemble for two-phase coexistence: the volume signal
        is preserved and there is no barostat that can destabilise the cell.
 
@@ -239,7 +242,12 @@ def write_melting_input(
        before production so the fixed timestep is used for the thermo output.
     d) Tight thermostat damping during ramp  (20*dt instead of 200*dt)
        Removes kinetic energy from local hot spots faster during disordering.
-    e) Velocity re-initialisation before production  (velocity all create T seed+1)
+    e) reset_ids before velocity re-initialisation
+       `lost ignore` can delete atoms during the ramp, leaving non-consecutive
+       atom IDs.  `reset_ids` renumbers all atoms 1..N so that the subsequent
+       `velocity all create ... loop all` command does not raise the error
+       "Atom IDs must be consecutive for velocity create loop all".
+    f) Velocity re-initialisation before production  (velocity all create T seed+1)
        Uses `create` rather than `scale` so it is safe even when the system
        temperature is 0 K (which can happen if atoms were lost during ramp).
        This resets all atoms to the target Maxwell-Boltzmann distribution so
@@ -316,7 +324,14 @@ def write_melting_input(
         "# --- remove adaptive timestep before production ---",
         "unfix           fxDT",
         "",
-        "# [stab-e] Re-initialise velocities before production.",
+        "# [stab-e] Renumber atom IDs consecutively.",
+        "# `lost ignore` may have deleted atoms during the ramp, leaving gaps in",
+        "# the ID sequence.  `reset_ids` closes those gaps so that the subsequent",
+        "# `velocity all create ... loop all` does not raise:",
+        "#   ERROR: Atom IDs must be consecutive for velocity create loop all",
+        "reset_ids",
+        "",
+        "# [stab-f] Re-initialise velocities before production.",
         "# Using `velocity all create` (not `scale`) is safe even when",
         "# the system T=0 after the ramp (e.g. if some atoms were lost).",
         f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
