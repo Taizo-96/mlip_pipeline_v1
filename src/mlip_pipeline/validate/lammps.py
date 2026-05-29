@@ -56,7 +56,7 @@ def _safe_mpi_np(
     if lammps_data is not None:
         n_atoms = _count_atoms(lammps_data)
         if n_atoms is not None:
-            n_sim = n_atoms * rep ** 2 * (rep * 2)  # NxNx2N for melting, else N^3
+            n_sim = n_atoms * rep ** 2 * (rep * 2)
             cap = min(cap, n_sim)
         if cutoff is not None and cutoff > 0:
             box = _box_lengths(lammps_data)
@@ -171,12 +171,12 @@ def write_elastic_input(
         "",
     ]
     strains = [
-        ("0", "x scale ${sdelta} remap",        "x scale ${sinv_normal} remap"),
-        ("1", "y scale ${sdelta} remap",        "y scale ${sinv_normal} remap"),
-        ("2", "z scale ${sdelta} remap",        "z scale ${sinv_normal} remap"),
-        ("3", "xy delta ${shear_dxy} remap",    "xy delta ${neg_shear_dxy} remap"),
-        ("4", "xz delta ${shear_dxz} remap",    "xz delta ${neg_shear_dxz} remap"),
-        ("5", "yz delta ${shear_dyz} remap",    "yz delta ${neg_shear_dyz} remap"),
+        ("0", "x scale ${sdelta} remap",      "x scale ${sinv_normal} remap"),
+        ("1", "y scale ${sdelta} remap",      "y scale ${sinv_normal} remap"),
+        ("2", "z scale ${sdelta} remap",      "z scale ${sinv_normal} remap"),
+        ("3", "xy delta ${shear_dxy} remap",  "xy delta ${neg_shear_dxy} remap"),
+        ("4", "xz delta ${shear_dxz} remap",  "xz delta ${neg_shear_dxz} remap"),
+        ("5", "yz delta ${shear_dyz} remap",  "yz delta ${neg_shear_dyz} remap"),
     ]
     for sid, apply_s, undo_s in strains:
         lines += [
@@ -208,49 +208,23 @@ def write_melting_input(
 ) -> Path:
     """Write a two-phase coexistence LAMMPS input script.
 
-    Disordering protocol
-    --------------------
-    The liquid half is disordered using NVE + fix temp/rescale rather than
-    a tight NVT thermostat.  temp/rescale injects kinetic energy every N steps
-    without fighting the MTP forces, which prevents the force spikes and atom
-    ejections seen with NVT ramping near T_melt.
+    Protocol (Belonoshko-style two-phase coexistence)
+    -------------------------------------------------
+    Stage 1 — Liquid disordering at 2×T_target (NVT, liquid group only):
+      The liquid half is heated to 2×T_target, which is well above T_melt
+      for any reasonable scan temperature. This guarantees the liquid half
+      is truly disordered regardless of T_target. The solid half is held
+      at T_target with its own NVT thermostat throughout.
+      Timestep is reduced to dt/5 during disordering for stability.
 
-    Stage 1 - Liquid disordering (dt_heat = dt/20, n_disorder steps):
-      * Solid half: fix nvt at T (standard thermostat).
-      * Liquid half: fix nve + fix temp/rescale every 10 steps up to T+50 K.
-        The tiny timestep (0.0001 ps) and velocity rescaling keep forces
-        manageable while gently disordering the liquid region.
-      * thermo_modify lost ignore throughout disordering.
-      * Adaptive timestep (fix dt/reset) as a further safety net.
+    Stage 2 — Quench and equilibrate at T_target (NVT, whole cell):
+      The liquid half is cooled back to T_target. A whole-system NVT
+      equilibration allows the interface to form cleanly.
 
-    Stage 2 - Whole-system NVT equilibration (dt_heat, n_equil steps):
-      * Both halves in a single NVT fix at T.
-      * Still at reduced timestep; lost ignore still active.
-
-    Stage 3 - Production NVT (full dt, n_prod steps):
-      * reset_atoms id (LAMMPS >=22Jul2023 syntax) to close any ID gaps
-        left by lost ignore before velocity reinitialisation.
-      * velocity all create T seed+1.
-      * IMPORTANT: thermo_style must come BEFORE thermo_modify in this
-        stage.  Every new thermo_style command silently resets all
-        thermo_modify settings (LAMMPS warns: "previous thermo_modify
-        settings will be lost").  Placing thermo_modify after thermo_style
-        ensures lost ignore is active when the production run begins.
-      * fix nvt on the whole cell; thermo + file output every 50 steps.
-
-    Classifier signal
-    -----------------
-    The production stage intentionally uses NVT (constant volume).  The
-    order-parameter used by _classify_volume_trend is the POTENTIAL ENERGY
-    slope, not the volume slope.  Under NVT, liquid has higher PE than solid
-    at the same T; if the liquid phase is growing the mean PE rises, and
-    vice versa.  The volume column is written for diagnostics only.
-
-    Atom-loss sentinel
-    ------------------
-    After production the script writes the final atom count to
-    ``atom_count.txt``.  The Python caller reads this and emits a warning
-    if >10 % of atoms were lost, treating the temperature point as unreliable.
+    Stage 3 — Production NVT at T_target:
+      The PE slope over the production run is the classifier signal.
+      Under NVT (constant volume), PE rises if liquid grows and falls
+      if solid grows. Volume is logged for diagnostics only.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -258,11 +232,10 @@ def write_melting_input(
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # Timestep for disordering: 20x smaller than production dt.
-    dt_heat   = dt / 20.0          # 0.0001 ps when dt=0.002
-    T_liq     = temperature + 50.0  # target for liquid rescaling (mild overshoot)
-    n_dis     = max(1000, n_equil // 2)   # disordering steps
-    n_eq      = max(500,  n_equil // 4)   # whole-system equilibration steps
+    dt_heat  = dt / 5.0            # 0.0004 ps — safe for high-T disordering
+    T_dis    = 2.0 * temperature   # guaranteed to disorder for any T_target
+    n_dis    = max(2000, n_equil)  # enough steps to fully disorder at 2×T
+    n_eq     = max(1000, n_equil // 2)  # quench + interface equilibration
 
     lines = [
         "units           metal",
@@ -275,68 +248,49 @@ def write_melting_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
-        "# Increase neighbour list capacity for dense/disordered configs.",
         "neigh_modify    one 4000 page 100000",
         "",
-        "# Minimise before any dynamics to remove any residual forces.",
         "minimize        1e-8 1e-10 5000 50000",
         "",
         "# Split into solid (lo-z) and liquid (hi-z) halves.",
-        "# Epsilon offset prevents atoms sitting exactly on the boundary.",
-        "variable        Lz     equal lz",
-        "variable        zmid   equal (zlo+zhi)/2.0 + 1e-6*v_Lz",
+        "variable        zmid   equal (zlo+zhi)/2.0",
         "region          solid_region  block INF INF INF INF INF ${zmid} units box",
         "region          liquid_region block INF INF INF INF ${zmid} INF units box",
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
-        "# Record the initial atom count for the loss check after production.",
-        "variable        N0 equal atoms",
-        "",
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost ignore",
-        "thermo          200",
+        "thermo          500",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 1: Liquid disordering via NVE + temp/rescale.",
+        f"# Stage 1: Disorder liquid half at 2*T = {T_dis:.0f} K.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        "",
-        f"fix             fxDT all dt/reset 1 {dt_heat*0.1:.6f} {dt_heat:.6f} 0.02 units box",
-        "",
-        f"fix             fxS_dis solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        f"fix             fxL_nve  liquid_atoms nve",
-        f"fix             fxL_rsc  liquid_atoms temp/rescale 10 {T_liq:.1f} {T_liq:.1f} 20.0 1.0",
+        f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxL liquid_atoms nvt temp {T_dis:.1f} {T_dis:.1f} $(100*dt)",
         f"run             {n_dis}",
-        "unfix           fxS_dis",
-        "unfix           fxL_nve",
-        "unfix           fxL_rsc",
-        "unfix           fxDT",
+        "unfix           fxS",
+        "unfix           fxL",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 2: Whole-system NVT equilibration at target T.",
+        f"# Stage 2: Quench + equilibrate whole cell at T = {temperature:.1f} K.",
         "# ----------------------------------------------------------------",
-        f"fix             fxEQ all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxEQ all nvt temp {T_dis:.1f} {temperature:.1f} $(100*dt)",
         f"run             {n_eq}",
         "unfix           fxEQ",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 3: Production NVT.",
-        "# Classifier reads PE slope from coex_thermo.txt col 3.",
-        "# reset_atoms id closes ID gaps left by lost ignore.",
+        "# Stage 3: Production NVT. Classify via PE slope.",
         "# ----------------------------------------------------------------",
-        "reset_atoms     id",
-        "",
         f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
         "",
         f"timestep        {dt}",
-        "",
         "thermo_style    custom step temp vol pe atoms",
         "thermo          50",
         "thermo_modify   flush yes lost ignore",
         "",
         f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        "",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
@@ -429,7 +383,6 @@ def write_vacancy_inputs(
         ]
         if remove_atom:
             lines += [
-                "# remove atom with lowest ID (creates vacancy)",
                 "group           vac_atom id 1",
                 "delete_atoms    group vac_atom",
                 "",
@@ -489,10 +442,8 @@ def write_rdf_input(
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
         "",
-        "# --- equilibration ---",
         f"run             {n_equil}",
         "",
-        "# --- RDF accumulation ---",
         f"compute         rdf_c all rdf {n_bins}",
         f"fix             rdf_avg all ave/time {n_every} {n_repeat} {n_freq} "
         f"c_rdf_c[*] file {out_file} mode vector",
