@@ -212,26 +212,49 @@ def write_melting_input(
     --------
     1. Read the unit cell and replicate into a slab supercell (N x N x 2N).
     2. Split atoms by z using a small epsilon offset so no atom sits exactly
-       on the boundary (avoids double-integration warning).
-    3. Gently ramp the liquid half from T to T+200 K over n_equil steps (NVT).
-       A modest +200 K overheat is sufficient to disorder the liquid seed while
-       staying safely within the MTP training distribution (2*T at high T
-       pushes atoms into deep extrapolation and causes explosive trajectories).
-    4. Run NVT at T_target (whole cell, constant volume); monitor volume ->
-       coex_thermo.txt.  NVT is the scientifically correct ensemble for the
-       two-phase coexistence method — NPT can destabilise the simulation when
-       the liquid seed has already expanded during the ramp phase.
+       on the boundary (avoids the double-integration group warning).
+    3. Multi-stage ramp: heat the liquid seed through four intermediate
+       temperatures (T -> T+50 -> T+100 -> T+150 -> T+200 K) using a reduced
+       timestep and tight thermostat damping.  A force cap (fix limit/force)
+       is active throughout the ramp to absorb any brief MTP force spike without
+       crashing the run.  The solid half is held at T throughout.
+    4. After the ramp: remove the force cap, hard-rescale all velocities back to
+       T, then run NVT production at T_target (constant volume, whole cell).
+       NVT is the correct ensemble for two-phase coexistence: the volume signal
+       is preserved and there is no barostat that can destabilise a
+       partially-disordered cell.
+
+    Stabilisation techniques applied
+    ---------------------------------
+    a) Staged liquid-seed ramp (T -> T+50 -> T+100 -> T+150 -> T+200 K)
+       Avoids the velocity-rescaling shock of a single-step jump and allows the
+       neighbour list and MTP descriptor to adapt incrementally.
+    b) Force cap during ramp  (fix limit/force 100 eV/Å)
+       Clips runaway forces caused by momentarily poor MTP evaluations during
+       the disordering phase; removed before production so dynamics are clean.
+    c) Tight thermostat damping during ramp  (20*dt instead of 200*dt)
+       Removes heat faster and prevents local hot spots from accumulating.
+    d) Hard velocity rescale before production  (velocity all scale T)
+       Resets all velocities to the target Maxwell-Boltzmann distribution so the
+       production thermostat starts from a well-defined state.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     thermo_out = (work_dir / "coex_thermo.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # Modest overheat: T + 200 K keeps the liquid seed well above T_melt
-    # while remaining within the MTP training domain.
-    T_heat = temperature + 200.0
-    # Use a shorter timestep during the heating phase for stability
-    dt_heat = dt / 4.0
+    # Four intermediate temperatures for the staged liquid-seed ramp.
+    # Each step adds 50 K; the final overheat of +200 K is sufficient to
+    # disorder the liquid seed while staying within the MTP training domain.
+    ramp_stages = [
+        temperature + 50.0,
+        temperature + 100.0,
+        temperature + 150.0,
+        temperature + 200.0,
+    ]
+    # Reduced timestep during ramp; each stage runs n_equil//4 steps.
+    dt_heat     = dt / 4.0
+    n_ramp_each = max(500, n_equil // 4)
 
     lines = [
         "units           metal",
@@ -244,10 +267,10 @@ def write_melting_input(
         f"pair_style      mlip load_from={abs_model}",
         "pair_coeff      * *",
         "",
-        "# --- increase neighbour list capacity for dense liquid configs ---",
+        "# [stab-a] Increase neighbour list capacity for dense liquid configs",
         "neigh_modify    one 4000 page 100000",
         "",
-        "# --- minimise first ---",
+        "# --- minimise before any dynamics ---",
         "minimize        1e-8 1e-10 5000 50000",
         "",
         "# --- split into solid (lo-z) and liquid (hi-z) halves ---",
@@ -262,14 +285,40 @@ def write_melting_input(
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost ignore",
         "",
-        "# --- initialise velocities at T, then RAMP liquid half to T+200 K ---",
-        "# +200 K overheat disorders the seed without pushing MTP into extrapolation",
-        f"velocity        all         create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxS solid_atoms  nvt temp {temperature:.1f} {temperature:.1f} $(200*dt)",
-        f"fix             fxL liquid_atoms nvt temp {temperature:.1f} {T_heat:.1f}   $(200*dt)",
-        f"run             {n_equil}",
-        "unfix           fxS",
-        "unfix           fxL",
+        "# --- initialise velocities at T ---",
+        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
+        "",
+        "# [stab-b] Force cap: absorbs brief MTP force spikes during disordering.",
+        "# Removed before production so dynamics are unperturbed.",
+        "fix             fxCap all limit/force 100.0",
+        "",
+        "# [stab-c] Tight damping (20*dt) on liquid thermostat during ramp",
+        "# removes heat faster and prevents local hot spots.",
+    ]
+
+    # Staged ramp: T_prev -> T_stage for each stage
+    T_prev = temperature
+    for stage_idx, T_stage in enumerate(ramp_stages):
+        lines += [
+            f"# --- ramp stage {stage_idx + 1}/4: liquid {T_prev:.1f} K -> {T_stage:.1f} K ---",
+            f"fix             fxS{stage_idx} solid_atoms  nvt temp "
+            f"{temperature:.1f} {temperature:.1f} $(20*dt)",
+            f"fix             fxL{stage_idx} liquid_atoms nvt temp "
+            f"{T_prev:.1f} {T_stage:.1f} $(20*dt)",
+            f"run             {n_ramp_each}",
+            f"unfix           fxS{stage_idx}",
+            f"unfix           fxL{stage_idx}",
+            "",
+        ]
+        T_prev = T_stage
+
+    lines += [
+        "# --- remove force cap before production ---",
+        "unfix           fxCap",
+        "",
+        "# [stab-d] Hard velocity rescale: resets all velocities to target",
+        "# Maxwell-Boltzmann before the production thermostat takes over.",
+        f"velocity        all scale {temperature:.1f}",
         "",
         "# --- switch to production timestep, restore lost=error ---",
         f"timestep        {dt}",
