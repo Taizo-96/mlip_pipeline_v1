@@ -22,6 +22,8 @@ def _parse_stress_output(out_file: Path) -> dict[int, list[float]]:
 
     Each non-comment line: strain_id sxx syy szz sxy sxz syz (in bar)
 
+    strain_id=-1 is the reference (zero-strain) state.
+
     Returns dict mapping strain_id → [sxx, syy, szz, sxy, sxz, syz] in GPa.
     """
     stresses: dict[int, list[float]] = {}
@@ -51,29 +53,38 @@ def _compute_elastic_constants(
 ) -> dict[str, float]:
     """Extract Cij from finite-difference stresses.
 
-    Strain indices:
-        0 → exx, 1 → eyy, 2 → ezz,
-        3 → exy, 4 → exz, 5 → eyz
+    Cij = (sigma_i_strained - sigma_i_ref) / epsilon_j
 
-    sxx, syy, szz, sxy, sxz, syz = stresses[strain_id]
+    Strain indices (as written by write_elastic_input):
+        id -1 → reference (no strain)
+        id  0 → exx = delta
+        id  1 → eyy = delta
+        id  2 → ezz = delta
+        id  3 → exy = delta  (engineering shear)
+        id  4 → exz = delta
+        id  5 → eyz = delta
 
-    C_ij = sigma_i / epsilon_j  (in GPa)
+    Stress vector components: [sxx, syy, szz, sxy, sxz, syz]
     """
+    ref = stresses.get(-1, [0.0] * 6)
+
+    def _ds(strain_id: int, component: int) -> float:
+        """(sigma_strained - sigma_ref)[component] / delta."""
+        s = stresses.get(strain_id, [0.0] * 6)
+        return (s[component] - ref[component]) / delta
+
     C: dict[str, float] = {}
-
-    def _s(strain_id: int, component: int) -> float:
-        return stresses.get(strain_id, [0.0] * 6)[component] / delta
-
-    # Normal strains → normal and shear stresses
-    C["C11"] = _s(0, 0)  # sxx / exx
-    C["C22"] = _s(1, 1)  # syy / eyy
-    C["C33"] = _s(2, 2)  # szz / ezz
-    C["C12"] = _s(0, 1)  # syy / exx  (= sxx/eyy by symmetry)
-    C["C13"] = _s(0, 2)  # szz / exx
-    C["C23"] = _s(1, 2)  # szz / eyy
-    C["C44"] = _s(5, 5)  # syz / eyz  (index 5 = eyz state, component 5 = syz)
-    C["C55"] = _s(4, 4)  # sxz / exz
-    C["C66"] = _s(3, 3)  # sxy / exy
+    # Normal strains
+    C["C11"] = _ds(0, 0)  # dsxx / dexx
+    C["C22"] = _ds(1, 1)  # dsyy / deyy
+    C["C33"] = _ds(2, 2)  # dszz / dezz
+    C["C12"] = _ds(0, 1)  # dsyy / dexx
+    C["C13"] = _ds(0, 2)  # dszz / dexx
+    C["C23"] = _ds(1, 2)  # dszz / deyy
+    # Shear strains (engineering strain = delta exactly, by construction in lammps.py)
+    C["C44"] = _ds(5, 5)  # dsyz / deyz
+    C["C55"] = _ds(4, 4)  # dsxz / dexz
+    C["C66"] = _ds(3, 3)  # dsxy / dexy
 
     return C
 
@@ -110,20 +121,10 @@ def run_elastic(
     delta: float = 0.01,
     cutoff: Optional[float] = None,
 ) -> ElasticResult:
-    """Compute elastic constants and return an ElasticResult.
-
-    The work directory is <validate_dir>/elastic/<structure_id>/.
-
-    Parameters
-    ----------
-    cutoff:
-        Pair potential cutoff in Å.  Passed to ``run_lammps`` for the MPI
-        safety cap: if any box dimension < cutoff, ``mpi_np`` is forced to 1.
-    """
+    """Compute elastic constants and return an ElasticResult."""
     work_dir = ensure_dir(validate_dir / "elastic" / structure_id)
     out_file = work_dir / "stress_data.txt"
 
-    # Remove stale output from previous runs so append-mode print starts clean.
     if out_file.exists():
         out_file.unlink()
 
@@ -150,8 +151,9 @@ def run_elastic(
         return ElasticResult(structure_id=structure_id, error=str(exc))
 
     stresses = _parse_stress_output(out_file)
-    if len(stresses) < 6:
-        msg = f"only {len(stresses)}/6 stress states parsed"
+    # Expect reference (-1) + 6 strain states
+    if len(stresses) < 7 or -1 not in stresses:
+        msg = f"only {len(stresses)}/7 stress states parsed (missing reference?)"
         print(f"  [elastic] WARNING: {structure_id}: {msg}")
         return ElasticResult(structure_id=structure_id, error=msg)
 

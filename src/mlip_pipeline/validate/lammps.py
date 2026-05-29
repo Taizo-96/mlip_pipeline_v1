@@ -139,10 +139,25 @@ def write_elastic_input(
 ) -> Path:
     """Write a LAMMPS input script for elastic constants via finite-difference stress.
 
-    pxx, pyy, etc. are LAMMPS thermo keywords, NOT variables.  They cannot
-    be used as ${pxx} in a print command.  The fix is to declare them as
-    equal-style variables (e.g. 'variable v_pxx equal pxx') which wrap the
-    thermo keyword and ARE substitutable via ${v_pxx}.
+    Protocol
+    --------
+    After minimisation the reference (zero-strain) stress sigma_0 is recorded
+    as strain_id=-1.  Each deformation state is then recorded with its own
+    strain_id (0–5).  The Python extractor subtracts sigma_0 before dividing
+    by the strain amplitude.
+
+    Strain convention (engineering strains applied by change_box)
+    --------------------------------------------------------------
+    id 0: exx = delta          (x scale 1+delta)
+    id 1: eyy = delta          (y scale 1+delta)
+    id 2: ezz = delta          (z scale 1+delta)
+    id 3: exy = delta          (xy delta delta*ly  → engineering strain = delta*ly / ly = delta)
+    id 4: exz = delta          (xz delta delta*lz  → engineering strain = delta*lz / lz = delta)
+    id 5: eyz = delta          (yz delta delta*lz  → engineering strain = delta*lz / lz = delta)
+
+    Note: LAMMPS `change_box xy delta d` tilts xy by d Å; engineering shear
+    strain is d/ly (not d/lx).  We therefore set shear_d = delta*ly for xy,
+    and delta*lz for xz and yz so that epsilon = delta exactly.
     """
     script_path = out_file.parent / "elastic.in"
     abs_data  = Path(lammps_data).resolve()
@@ -171,14 +186,18 @@ def write_elastic_input(
         f"variable        delta        equal {delta}",
         "variable        sdelta       equal 1.0+v_delta",
         "variable        sinv_normal  equal 1.0/(1.0+v_delta)",
-        "variable        shear_d      equal v_delta*lx",
-        "variable        neg_shear_d  equal -v_delta*lx",
-        "variable        shear_dy     equal v_delta*ly",
-        "variable        neg_shear_dy equal -v_delta*ly",
+        # Shear displacements: engineering strain = displacement / L_perp
+        # xy: perp direction = y  -> d_xy = delta * ly
+        # xz: perp direction = z  -> d_xz = delta * lz
+        # yz: perp direction = z  -> d_yz = delta * lz
+        "variable        shear_dxy    equal v_delta*ly",
+        "variable        neg_shear_dxy equal -v_delta*ly",
+        "variable        shear_dxz    equal v_delta*lz",
+        "variable        neg_shear_dxz equal -v_delta*lz",
+        "variable        shear_dyz    equal v_delta*lz",
+        "variable        neg_shear_dyz equal -v_delta*lz",
         "",
         # Stress variables — wrap thermo keywords so they can be used in print
-        # pxx etc. are thermo keywords, NOT variables; ${pxx} is illegal.
-        # Declaring 'variable v_pxx equal pxx' makes them substitutable.
         "variable        v_pxx        equal pxx",
         "variable        v_pyy        equal pyy",
         "variable        v_pzz        equal pzz",
@@ -188,15 +207,21 @@ def write_elastic_input(
         "",
         f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {abs_out} screen no",
         "",
+        # Record reference (zero-strain) stress as id=-1
+        "run             0",
+        f"print           \"-1 ${{v_pxx}} ${{v_pyy}} ${{v_pzz}}"
+        f" ${{v_pxy}} ${{v_pxz}} ${{v_pyz}}\""
+        f" append {abs_out} screen no",
+        "",
     ]
 
     strains = [
-        ("0", "x scale ${sdelta} remap",        "x scale ${sinv_normal} remap"),
-        ("1", "y scale ${sdelta} remap",        "y scale ${sinv_normal} remap"),
-        ("2", "z scale ${sdelta} remap",        "z scale ${sinv_normal} remap"),
-        ("3", "xy delta ${shear_d} remap",      "xy delta ${neg_shear_d} remap"),
-        ("4", "xz delta ${shear_d} remap",      "xz delta ${neg_shear_d} remap"),
-        ("5", "yz delta ${shear_dy} remap",     "yz delta ${neg_shear_dy} remap"),
+        ("0", "x scale ${sdelta} remap",           "x scale ${sinv_normal} remap"),
+        ("1", "y scale ${sdelta} remap",           "y scale ${sinv_normal} remap"),
+        ("2", "z scale ${sdelta} remap",           "z scale ${sinv_normal} remap"),
+        ("3", "xy delta ${shear_dxy} remap",       "xy delta ${neg_shear_dxy} remap"),
+        ("4", "xz delta ${shear_dxz} remap",       "xz delta ${neg_shear_dxz} remap"),
+        ("5", "yz delta ${shear_dyz} remap",       "yz delta ${neg_shear_dyz} remap"),
     ]
 
     for sid, apply_strain, undo_strain in strains:
