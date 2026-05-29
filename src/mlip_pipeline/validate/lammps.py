@@ -42,6 +42,10 @@ def write_eos_input(
 
     The model path is passed via the ``load_from=`` keyword on the
     ``pair_style`` line; ``pair_coeff`` takes no element arguments.
+
+    The undo scale step uses a named variable ``sinv = 1/s`` rather than
+    the inline ``$(1/${s})`` expression, which is not valid in all LAMMPS
+    builds (triggers "Invalid syntax in variable formula").
     """
     script_path = out_file.parent / "eos.in"
     lines = [
@@ -67,12 +71,13 @@ def write_eos_input(
         "variable        i       loop 0 ${n_steps}",
         "label           loop_start",
         "  variable      s       equal v_s_min+v_i*v_ds",
+        "  variable      sinv    equal 1.0/v_s",
         "  change_box    all     x scale ${s} y scale ${s} z scale ${s} remap",
         "  run           0",
         "  variable      vpat    equal vol/atoms",
         "  variable      epat    equal pe/atoms",
         f" print         \"${{s}} ${{vpat}} ${{epat}}\" append {out_file} screen no",
-        "  change_box    all     x scale $(1/${s}) y scale $(1/${s}) z scale $(1/${s}) remap",
+        "  change_box    all     x scale ${sinv} y scale ${sinv} z scale ${sinv} remap",
         "next            i",
         "jump            SELF    loop_start",
     ]
@@ -108,11 +113,10 @@ def write_elastic_input(
         pair_style  mlip load_from=<path>
         pair_coeff  * *
 
-    The model path is passed via the ``load_from=`` keyword on the
-    ``pair_style`` line; ``pair_coeff`` takes no element arguments.
+    Inline ``$(1/(1+v_delta))`` is replaced by a named variable
+    ``sinv = 1/(1+delta)`` for the same reason as in write_eos_input.
     """
     script_path = out_file.parent / "elastic.in"
-    bars_per_gpa = 10000.0
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -129,17 +133,28 @@ def write_elastic_input(
         "thermo          1",
         "",
         f"variable        delta   equal {delta}",
+        "variable        sinv    equal 1.0/(1.0+v_delta)",
         f"print           \"# strain_id sxx syy szz sxy sxz syz\" file {out_file} screen no",
         "",
     ]
     # Six strain states: exx, eyy, ezz, exy, exz, eyz
+    # Shear strains (3-5) use +/- delta*lx/ly directly — no division needed.
     strains = [
-        ("0", "x scale $(1+v_delta) remap",   "x scale $(1/(1+v_delta)) remap"),
-        ("1", "y scale $(1+v_delta) remap",   "y scale $(1/(1+v_delta)) remap"),
-        ("2", "z scale $(1+v_delta) remap",   "z scale $(1/(1+v_delta)) remap"),
-        ("3", "xy delta $(v_delta*lx) remap", "xy delta $(-v_delta*lx) remap"),
-        ("4", "xz delta $(v_delta*lx) remap", "xz delta $(-v_delta*lx) remap"),
-        ("5", "yz delta $(v_delta*ly) remap", "yz delta $(-v_delta*ly) remap"),
+        ("0", "x scale ${sdelta} remap",        "x scale ${sinv} remap"),
+        ("1", "y scale ${sdelta} remap",        "y scale ${sinv} remap"),
+        ("2", "z scale ${sdelta} remap",        "z scale ${sinv} remap"),
+        ("3", "xy delta ${shear_d} remap",      "xy delta ${neg_shear_d} remap"),
+        ("4", "xz delta ${shear_d} remap",      "xz delta ${neg_shear_d} remap"),
+        ("5", "yz delta ${shear_dy} remap",     "yz delta ${neg_shear_dy} remap"),
+    ]
+    # Pre-compute helper variables before the strain loop
+    lines += [
+        "variable        sdelta       equal 1.0+v_delta",
+        "variable        shear_d      equal v_delta*lx",
+        "variable        neg_shear_d  equal -v_delta*lx",
+        "variable        shear_dy     equal v_delta*ly",
+        "variable        neg_shear_dy equal -v_delta*ly",
+        "",
     ]
     for sid, apply_strain, undo_strain in strains:
         lines += [
