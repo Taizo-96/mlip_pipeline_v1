@@ -43,13 +43,13 @@ def run_validation(
     print(f"  lammps:   {lammps_cmd}")
     print(f"  element:  {element}")
     if cutoff is not None:
-        print(f"  cutoff:   {cutoff} Å  (used for MPI safety cap)")
+        print(f"  cutoff:   {cutoff} \u00c5  (used for MPI safety cap)")
 
     eos_results: list[EosResult] = []
     elastic_results: list[ElasticResult] = []
     plot_paths: dict = {}
 
-    # ── EOS -----------------------------------------------------------------
+    # \u2500\u2500 EOS -----------------------------------------------------------------
     eos_cfg = val_cfg.get("eos", {})
     if eos_cfg.get("enabled", True):
         structures = eos_cfg.get("structures", [])
@@ -87,7 +87,7 @@ def run_validation(
     else:
         print("  [eos]     skipped (disabled in config)")
 
-    # ── Elastic constants ---------------------------------------------------
+    # \u2500\u2500 Elastic constants ---------------------------------------------------
     el_cfg = val_cfg.get("elastic", {})
     if el_cfg.get("enabled", True):
         structures = el_cfg.get("structures", [])
@@ -122,7 +122,7 @@ def run_validation(
             plot_paths["elastic_constants"] = p
             print(f"  [elastic] bar chart -> {p.name}")
 
-    # ── MP reference comparison ---------------------------------------------
+    # \u2500\u2500 MP reference comparison ---------------------------------------------
     ref_cfg = val_cfg.get("reference", {})
     mp_id   = ref_cfg.get("mp_id")
     ref     = None
@@ -134,7 +134,6 @@ def run_validation(
         )
 
     if ref:
-        # Collect MTP values from results
         mtp_vals: dict = {}
         for r in eos_results:
             if r.fit_ok and r.structure_id == "fcc":
@@ -143,15 +142,17 @@ def run_validation(
                 mtp_vals["B0"] = r.B0
                 break
         for r in elastic_results:
-            if r.structure_id == "fcc" and r.cij:
-                mtp_vals["C11"] = r.cij.get("C11")
-                mtp_vals["C12"] = r.cij.get("C12")
-                mtp_vals["C44"] = r.cij.get("C44")
+            # ElasticResult fields: .C (dict of Cij), .B_voigt, .G_voigt
+            if r.structure_id == "fcc" and r.C:
+                mtp_vals["C11"] = r.C.get("C11")
+                mtp_vals["C12"] = r.C.get("C12")
+                mtp_vals["C44"] = r.C.get("C44")
                 mtp_vals["G0"]  = r.G_voigt
+                mtp_vals["B0"]  = mtp_vals.get("B0") or r.B_voigt
                 break
         print_deviation_table(mtp_vals, ref)
 
-    # ── Manifest ------------------------------------------------------------
+    # \u2500\u2500 Manifest ------------------------------------------------------------
     result = ValidationResult(
         model_path=model_path,
         validate_dir=val_dir,
