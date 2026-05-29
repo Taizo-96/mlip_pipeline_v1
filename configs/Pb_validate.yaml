@@ -34,18 +34,19 @@ elastic:
 
 
 # ── Melting temperature (two-phase coexistence) ─────────────────────────────
-# Pb experimental T_melt = 600.61 K.  The bracket search scans T in steps
-# of T_step K; expect a few LAMMPS runs each taking ~1–2 min with 4 cores.
-# Set enabled: true to activate.
+# Pb experimental T_melt = 600.61 K.
+# Protocol: NxNx2N supercell, bottom half = solid, top half heated to 2*T
+# then full cell NPT at T_target.  Volume slope classifies phase stability.
+# Bracket search converges to within T_step K of the true T_melt.
 melting:
-  enabled:         false
-  T_start:         450.0   # K  – start of bracket scan
-  T_end:           750.0   # K  – end of bracket scan
-  T_step:          50.0    # K  – temperature step between candidates
-  supercell_repeat: 4      # replicate unit cell N x N x 2N for coexistence
-  n_equil:         5000    # steps to create liquid seed (NVT heating)
-  n_prod:          20000   # steps for NPT production (volume trend)
-  dt:              0.002   # ps
+  enabled:          true
+  T_start:          450.0   # K  – start of bracket scan (well below T_melt)
+  T_end:            750.0   # K  – end of bracket scan (well above T_melt)
+  T_step:           50.0    # K  – temperature increment between candidates
+  supercell_repeat: 4       # replicate unit cell N x N x 2N (4x4x8 = 128 atoms)
+  n_equil:          5000    # steps to create liquid seed (NVT ramp)
+  n_prod:           20000   # steps for NPT production (volume trend analysis)
+  dt:               0.002   # ps  (2 fs timestep)
 
   structures:
     - id:          fcc
@@ -53,12 +54,13 @@ melting:
 
 
 # ── Thermal expansion coefficient (NPT MD) ──────────────────────────────────
-# Pb experimental alpha ≈ 29e-6 K⁻¹ at 300 K.
-# Runs NPT MD at each temperature in the list, averages volume, fits linear.
+# Pb experimental linear α ≈ 29×10⁻⁶ K⁻¹ at 300 K.
+# Runs NPT MD at each temperature, records mean V/atom, fits linear slope:
+#   α = (1/V_ref) * dV/dT / 3   (volumetric → linear conversion)
 thermal_expansion:
-  enabled:      false
+  enabled:      true
   temperatures: [100.0, 200.0, 300.0, 400.0, 500.0]  # K
-  T_ref:        300.0   # K  – reference temperature for alpha definition
+  T_ref:        300.0   # K  – reference temperature for α definition
   n_equil:      5000    # equilibration steps at each T
   n_prod:       10000   # production steps (volume averaged at end)
   dt:           0.002   # ps
@@ -70,11 +72,11 @@ thermal_expansion:
 
 # ── Vacancy formation energy ─────────────────────────────────────────────────
 # Pb experimental E_vac ≈ 0.57 eV.
-# Minimises a perfect supercell and a supercell with one atom removed;
-# uses E_vac = E(N-1) - (N-1)/N * E(N).
+# Method: E_vac = E(N-1) - (N-1)/N * E(N) after minimisation of both cells.
+# supercell_repeat=3 → 3×3×3 = 108 atoms (perfect), 107 atoms (vacancy).
 vacancy:
-  enabled:          false
-  supercell_repeat: 3     # creates an N×N×N supercell (~108 atoms for fcc)
+  enabled:          true
+  supercell_repeat: 3     # N×N×N supercell (~108 atoms for fcc Pb)
 
   structures:
     - id:          fcc
@@ -82,17 +84,17 @@ vacancy:
 
 
 # ── Radial distribution function (NVT MD) ────────────────────────────────────
-# Structural fingerprint at 300 K.  Validates first NN distance vs. experiment.
-# Pb fcc: r_1 ≈ 3.49 Å  (a/√2, a ≈ 4.95 Å).
+# Structural fingerprint at 300 K.  Validates first NN distance vs experiment.
+# Pb FCC: r₁ ≈ 3.49 Å  (a/√2, a ≈ 4.95 Å).
 rdf:
-  enabled:          false
+  enabled:          true
   temperature:      300.0  # K
   r_max:            8.0    # Å  – cutoff for g(r) accumulation
   n_bins:           200
   n_equil:          5000
   n_prod:           20000
   dt:               0.002  # ps
-  supercell_repeat: 3
+  supercell_repeat: 3      # 3×3×3 → sufficient statistics for g(r)
 
   structures:
     - id:          fcc
@@ -101,10 +103,10 @@ rdf:
 
 # ── Materials Project reference ─────────────────────────────────────────────
 # Fetches DFT-computed V0, B0, Cij for the given mp_id and prints a
-# deviation table at the end of validation.
+# deviation table comparing MTP vs DFT at the end of validation.
+# Includes T_melt, E_vac, and α where available.
 # API key is read from the environment variable named in api_key_env.
-# The result is cached to validate_dir/mp_reference.json after the first
-# successful fetch so the API is not hit on every run.
+# The result is cached to validate_dir/mp_reference.json after first fetch.
 reference:
   mp_id:       "mp-20483"   # Pb FCC conventional cell
   api_key_env: "MP_API_KEY" # name of the env var holding your MP API key
