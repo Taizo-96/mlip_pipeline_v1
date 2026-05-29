@@ -34,58 +34,70 @@ def _birch_murnaghan(
 
 def _find_fit_range(
     vs: "np.ndarray", es: "np.ndarray",
-    window_ev: float = 0.8,
+    max_left_step_ev: float = 0.15,
 ) -> "np.ndarray":
     """Return a boolean mask selecting points suitable for BM fitting.
 
-    MTP potentials extrapolate badly outside the training volume range,
-    producing:
-      - catastrophically low energies under compression (-100 eV etc.)
-      - monotonically decreasing energies on the expansion side (no upturn)
+    MTP potentials extrapolate unphysically outside the training range:
+      - LEFT  (compression): energy drops catastrophically (-6, -15, -100 eV)
+      - RIGHT (expansion):   energy continues falling instead of rising back up,
+                             forming a second spurious minimum.
 
-    Both pathologies are handled by anchoring the fit window to the
-    *local* equilibrium minimum (dE/dV sign change), not the global argmin.
+    Strategy — walk outward from the local equilibrium minimum:
 
-    Strategy:
-    1. Sort by volume and compute finite-difference gradients dE/dV.
-    2. Find the first point where dE/dV changes from negative to positive
-       (i.e. the physical well bottom).  If no sign change is found, fall
-       back to the argmin in the central 40–80% volume percentile range.
-    3. Keep only points within `window_ev` eV/atom of e_min on each side:
-         E >= e_min - window_ev   (exclude catastrophic compression)
-         V <= V_min * 1.5         (exclude unphysical flat expansion tail)
+    1. Sort by volume; find the first dE/dV sign-change (negative->positive)
+       to locate the physical well bottom.  Fall back to the central argmin
+       if no sign change exists.
+
+    2. Walk LEFT from i_min: include each successive point only while the
+       energy is physically rising (E increases going left) and the per-step
+       jump is reasonable (< max_left_step_ev).  Stop immediately when the
+       energy drops or jumps too abruptly.
+
+    3. Walk RIGHT from i_min: include points while the energy is rising
+       (dE/dV > 0).  Stop at the first point where the energy turns back
+       down (onset of the unphysical second minimum).
     """
     import numpy as np  # type: ignore
 
-    # Ensure sorted by volume
     order = np.argsort(vs)
     vs_s = vs[order]
     es_s = es[order]
 
-    # Step 1: locate local minimum via dE/dV sign change
+    # --- Step 1: locate local minimum ---
     dE = np.diff(es_s)
     sign_changes = np.where((dE[:-1] < 0) & (dE[1:] > 0))[0]
 
     if len(sign_changes) > 0:
-        # Use the first (lowest-volume) local minimum — that is equilibrium
-        i_min_s = sign_changes[0] + 1
+        i_min = sign_changes[0] + 1
     else:
-        # Fallback: argmin in central 40–80% of volume range
         lo = float(np.percentile(vs_s, 40))
         hi = float(np.percentile(vs_s, 80))
         central = (vs_s >= lo) & (vs_s <= hi)
         if central.sum() == 0:
             central = np.ones(len(vs_s), dtype=bool)
         central_idx = np.where(central)[0]
-        i_min_s = central_idx[int(np.argmin(es_s[central]))]
+        i_min = central_idx[int(np.argmin(es_s[central]))]
 
-    e_min = es_s[i_min_s]
-    v_min = vs_s[i_min_s]
+    # --- Step 2: walk left ---
+    i_lo = i_min
+    while i_lo > 0:
+        step = es_s[i_lo - 1] - es_s[i_lo]  # >0 means energy rises going left (physical)
+        if step < 0 or step > max_left_step_ev:
+            break
+        i_lo -= 1
 
-    # Step 2: energy window + volume ceiling to exclude expansion artefacts
-    mask_s = (es_s >= e_min - window_ev) & (vs_s <= v_min * 1.5)
+    # --- Step 3: walk right ---
+    i_hi = i_min
+    while i_hi < len(es_s) - 1:
+        if es_s[i_hi + 1] < es_s[i_hi]:  # energy turns back down -> stop
+            break
+        i_hi += 1
 
-    # Map mask back to original (unsorted) order
+    mask_s = np.zeros(len(vs_s), dtype=bool)
+    mask_s[i_lo: i_hi + 1] = True
+
+    # Map back to original order
     mask = np.empty(len(vs), dtype=bool)
     mask[order] = mask_s
     return mask
