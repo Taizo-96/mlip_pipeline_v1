@@ -22,9 +22,13 @@ def _parse_stress_output(out_file: Path) -> dict[int, list[float]]:
 
     Each non-comment line: strain_id sxx syy szz sxy sxz syz (in bar)
 
+    LAMMPS pxx/pyy/... are pressures: pxx = -sigma_xx.
+    We store them as-is here and apply the sign correction in
+    _compute_elastic_constants.
+
     strain_id=-1 is the reference (zero-strain) state.
 
-    Returns dict mapping strain_id → [sxx, syy, szz, sxy, sxz, syz] in GPa.
+    Returns dict mapping strain_id -> [pxx, pyy, pzz, pxy, pxz, pyz] in GPa.
     """
     stresses: dict[int, list[float]] = {}
     for line in out_file.read_text().splitlines():
@@ -53,38 +57,42 @@ def _compute_elastic_constants(
 ) -> dict[str, float]:
     """Extract Cij from finite-difference stresses.
 
-    Cij = (sigma_i_strained - sigma_i_ref) / epsilon_j
+    LAMMPS reports pressure, not stress: pxx = -sigma_xx.
+    Therefore:
+
+        Cij = (sigma_i_strained - sigma_i_ref) / epsilon_j
+            = -(p_i_strained - p_i_ref) / epsilon_j
 
     Strain indices (as written by write_elastic_input):
-        id -1 → reference (no strain)
-        id  0 → exx = delta
-        id  1 → eyy = delta
-        id  2 → ezz = delta
-        id  3 → exy = delta  (engineering shear)
-        id  4 → exz = delta
-        id  5 → eyz = delta
+        id -1 -> reference (no strain)
+        id  0 -> exx = delta
+        id  1 -> eyy = delta
+        id  2 -> ezz = delta
+        id  3 -> exy = delta  (engineering shear)
+        id  4 -> exz = delta
+        id  5 -> eyz = delta
 
-    Stress vector components: [sxx, syy, szz, sxy, sxz, syz]
+    Pressure vector components: [pxx, pyy, pzz, pxy, pxz, pyz]
     """
     ref = stresses.get(-1, [0.0] * 6)
 
-    def _ds(strain_id: int, component: int) -> float:
-        """(sigma_strained - sigma_ref)[component] / delta."""
-        s = stresses.get(strain_id, [0.0] * 6)
-        return (s[component] - ref[component]) / delta
+    def _dc(strain_id: int, component: int) -> float:
+        """Cij = -(p_strained - p_ref)[component] / delta."""
+        p = stresses.get(strain_id, [0.0] * 6)
+        return -(p[component] - ref[component]) / delta
 
     C: dict[str, float] = {}
     # Normal strains
-    C["C11"] = _ds(0, 0)  # dsxx / dexx
-    C["C22"] = _ds(1, 1)  # dsyy / deyy
-    C["C33"] = _ds(2, 2)  # dszz / dezz
-    C["C12"] = _ds(0, 1)  # dsyy / dexx
-    C["C13"] = _ds(0, 2)  # dszz / dexx
-    C["C23"] = _ds(1, 2)  # dszz / deyy
+    C["C11"] = _dc(0, 0)  # -dpxx / dexx
+    C["C22"] = _dc(1, 1)  # -dpyy / deyy
+    C["C33"] = _dc(2, 2)  # -dpzz / dezz
+    C["C12"] = _dc(0, 1)  # -dpyy / dexx
+    C["C13"] = _dc(0, 2)  # -dpzz / dexx
+    C["C23"] = _dc(1, 2)  # -dpzz / deyy
     # Shear strains (engineering strain = delta exactly, by construction in lammps.py)
-    C["C44"] = _ds(5, 5)  # dsyz / deyz
-    C["C55"] = _ds(4, 4)  # dsxz / dexz
-    C["C66"] = _ds(3, 3)  # dsxy / dexy
+    C["C44"] = _dc(5, 5)  # -dpyz / deyz
+    C["C55"] = _dc(4, 4)  # -dpxz / dexz
+    C["C66"] = _dc(3, 3)  # -dpxy / dexy
 
     return C
 
