@@ -108,12 +108,6 @@ def _collect_deviations(
     ref_thexp: list[ThermalExpansionResult],
     ref_vacancy: list[VacancyResult],
 ) -> dict:
-    """Compare MTP results against classical reference results structure-by-structure.
-
-    Returns a flat dict of percentage deviations keyed as
-    ``<property>_<structure_id>``, e.g. ``V0_fcc``, ``C11_fcc``,
-    ``T_melt_fcc``, ``E_vac_fcc``, ``alpha_fcc``.
-    """
     devs: dict = {}
 
     # -- EOS --
@@ -139,7 +133,6 @@ def _collect_deviations(
             d = _pct(getattr(mtp, prop, None), getattr(ref, prop, None))
             if d is not None:
                 devs[f"{prop}_{sid}"] = round(d, 2)
-        # Individual Cij
         if ref.C and mtp.C:
             for cij in ("C11", "C12", "C44", "C22", "C33"):
                 ref_v = ref.C.get(cij)
@@ -195,7 +188,6 @@ def print_classical_deviation_table(
     """Print a formatted side-by-side comparison of MTP vs classical reference."""
     print(f"\n  ── vs. {result.label} (classical reference) ────────────────────")
 
-    # EOS
     for mtp_r in mtp_result.eos_results:
         sid = mtp_r.structure_id
         ref_r = next((r for r in result.eos_results if r.structure_id == sid), None)
@@ -214,7 +206,6 @@ def print_classical_deviation_table(
             d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
             print(f"  {prop:<8}  {mtp_v:>10.3f}  {ref_v:>16.3f}  {d_str}  {unit}{flag}")
 
-    # Elastic
     for mtp_r in mtp_result.elastic_results:
         sid = mtp_r.structure_id
         ref_r = next((r for r in result.elastic_results if r.structure_id == sid), None)
@@ -234,7 +225,6 @@ def print_classical_deviation_table(
             d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
             print(f"  {prop:<8}  {mtp_v:>10.1f}  {ref_v:>16.1f}  {d_str}  {unit}{flag}")
 
-    # Melting
     for mtp_r in mtp_result.melting_results:
         sid = mtp_r.structure_id
         ref_r = next((r for r in result.melting_results if r.structure_id == sid), None)
@@ -246,7 +236,6 @@ def print_classical_deviation_table(
         print(f"\n  [Melting] {sid}: MTP={mtp_r.T_melt:.0f} K  "
               f"{result.label}={ref_r.T_melt:.0f} K  Δ={d_str}{flag}")
 
-    # Vacancy
     for mtp_r in mtp_result.vacancy_results:
         sid = mtp_r.structure_id
         ref_r = next((r for r in result.vacancy_results if r.structure_id == sid), None)
@@ -258,7 +247,6 @@ def print_classical_deviation_table(
         print(f"\n  [Vacancy] {sid}: MTP={mtp_r.E_vac:.4f} eV  "
               f"{result.label}={ref_r.E_vac:.4f} eV  Δ={d_str}{flag}")
 
-    # Thermal expansion
     for mtp_r in mtp_result.thermal_expansion_results:
         sid = mtp_r.structure_id
         ref_r = next((r for r in result.thermal_expansion_results if r.structure_id == sid), None)
@@ -270,40 +258,6 @@ def print_classical_deviation_table(
         print(f"\n  [ThExp]   {sid}: MTP={mtp_r.alpha*1e6:.2f}e-6 K⁻¹  "
               f"{result.label}={ref_r.alpha*1e6:.2f}e-6 K⁻¹  Δ={d_str}{flag}")
     print()
-
-
-# ------------------------------------------------------------------ #
-# LAMMPS input patch                                                    #
-# ------------------------------------------------------------------ #
-
-def _patch_pair_style(
-    script: str,
-    pair_style: str,
-    pair_coeff: str,
-) -> str:
-    """Replace MTP pair_style/pair_coeff lines in a LAMMPS script with
-    classical potential lines.
-
-    Handles scripts that use:
-      pair_style  mlip  ...   (MLIP-2/3)
-      pair_style  mliap ...   (MLIAP interface)
-      pair_coeff  * *   ...
-    """
-    lines_out = []
-    skip_next_pair_coeff = False
-    for line in script.splitlines():
-        stripped = line.strip().lower()
-        if stripped.startswith("pair_style"):
-            lines_out.append(f"pair_style  {pair_style}")
-            skip_next_pair_coeff = False
-            continue
-        if stripped.startswith("pair_coeff"):
-            if not skip_next_pair_coeff:
-                lines_out.append(f"pair_coeff  {pair_coeff}")
-                skip_next_pair_coeff = True  # only replace first pair_coeff
-            continue
-        lines_out.append(line)
-    return "\n".join(lines_out)
 
 
 # ------------------------------------------------------------------ #
@@ -322,33 +276,15 @@ def run_classical_reference(
     mpi_np: Optional[int] = None,
     cutoff: Optional[float] = None,
 ) -> ClassicalReferenceResult:
-    """Run all enabled validation steps with a classical potential and
-    compare against the MTP *mtp_result*.
+    """Run all enabled validation steps with a classical potential.
 
-    Parameters
-    ----------
-    config
-        Pipeline config dict (same as passed to run_validation).
-    pair_style
-        LAMMPS pair_style string, e.g. ``"meam"``.
-    pair_coeff
-        LAMMPS pair_coeff string (everything after ``pair_coeff``),
-        e.g. ``"* * /path/library.meam Pb /path/Pb.meam Pb"``.
-    out_dir
-        Directory for classical reference outputs (separate from MTP outputs).
-    mtp_result
-        The ValidationResult from the MTP run to compare against.
-    label
-        Short name for the reference potential used in printed output and
-        the deviation keys, e.g. ``"Lee2003-MEAM"``.
-    lammps_cmd, mpi_command, mpi_np, cutoff
-        LAMMPS execution options. If None, taken from config.
+    pair_style and pair_coeff are passed verbatim to every LAMMPS writer
+    via the write_* functions in lammps.py.  No monkey-patching needed.
     """
     val_cfg = config.get("validate", config)
     ref_dir = ensure_dir(out_dir)
     element = val_cfg.get("element", "Pb")
 
-    # Resolve LAMMPS execution options from config if not explicitly supplied
     if lammps_cmd is None:
         lammps_cmd = val_cfg.get("lammps_command", "lmp_mpi")
     if mpi_command is None:
@@ -363,23 +299,16 @@ def run_classical_reference(
     print(f"  pair_coeff: {pair_coeff}")
     print(f"  out_dir:    {ref_dir}")
 
+    # model_path is unused when pair_style/pair_coeff are supplied;
+    # pass a sentinel so the writers' signature is satisfied.
+    _dummy_model = Path(".")
+
     def _resolve(s: dict) -> Path:
         data_path = Path(s["lammps_data"])
         if not data_path.is_absolute():
             root = Path(config.get("project_root", "."))
             data_path = (root / data_path).resolve()
         return data_path
-
-    # We monkey-patch pair style into lammps.py write functions by
-    # temporarily overriding the module-level PAIR_STYLE / PAIR_COEFF.
-    # Instead, we pass pair_style/pair_coeff via the classical_pair kwargs
-    # added to each write_* function. For now we use the env-var injection
-    # approach: set them in validate.lammps before calling runners.
-    import mlip_pipeline.validate.lammps as _lammps_mod
-    _orig_pair_style = getattr(_lammps_mod, "_CLASSICAL_PAIR_STYLE", None)
-    _orig_pair_coeff = getattr(_lammps_mod, "_CLASSICAL_PAIR_COEFF", None)
-    _lammps_mod._CLASSICAL_PAIR_STYLE = pair_style
-    _lammps_mod._CLASSICAL_PAIR_COEFF = pair_coeff
 
     eos_results:   list[EosResult]              = []
     elastic_results: list[ElasticResult]        = []
@@ -388,154 +317,140 @@ def run_classical_reference(
     vacancy_results: list[VacancyResult]        = []
     plot_paths: dict = {}
 
-    try:
-        # ── EOS ──────────────────────────────────────────────────────
-        eos_cfg = val_cfg.get("eos", {})
-        if eos_cfg.get("enabled", True):
-            for s in eos_cfg.get("structures", []):
-                sid = s["id"]
-                data_path = _resolve(s)
-                if not data_path.exists():
-                    print(f"  [ref-eos]     WARNING: data not found for {sid}")
-                    eos_results.append(EosResult(
-                        structure_id=sid, volumes=[], energies=[],
-                        fit_error=f"data file not found: {data_path}",
-                    ))
-                    continue
-                res = run_eos(
-                    sid, data_path,
-                    model_path=Path(pair_coeff.split()[2]) if len(pair_coeff.split()) > 2 else Path("."),
-                    validate_dir=ref_dir,
-                    element=element, lammps_cmd=lammps_cmd,
-                    mpi_command=mpi_command, mpi_np=mpi_np,
-                    scale_min=eos_cfg.get("scale_min", 0.90),
-                    scale_max=eos_cfg.get("scale_max", 1.10),
-                    n_points=eos_cfg.get("n_points", 21),
-                    cutoff=cutoff,
-                )
-                eos_results.append(res)
-                p = plots.plot_eos(res, ref_dir)
-                if p:
-                    plot_paths[f"eos_{sid}"] = p
+    # ── EOS ──────────────────────────────────────────────────────────
+    eos_cfg = val_cfg.get("eos", {})
+    if eos_cfg.get("enabled", True):
+        for s in eos_cfg.get("structures", []):
+            sid = s["id"]
+            data_path = _resolve(s)
+            if not data_path.exists():
+                print(f"  [ref-eos]     WARNING: data not found for {sid}")
+                eos_results.append(EosResult(
+                    structure_id=sid, volumes=[], energies=[],
+                    fit_error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_eos(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                scale_min=eos_cfg.get("scale_min", 0.90),
+                scale_max=eos_cfg.get("scale_max", 1.10),
+                n_points=eos_cfg.get("n_points", 21),
+                cutoff=cutoff,
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            eos_results.append(res)
+            p = plots.plot_eos(res, ref_dir)
+            if p:
+                plot_paths[f"eos_{sid}"] = p
 
-        # ── Elastic ───────────────────────────────────────────────────
-        el_cfg = val_cfg.get("elastic", {})
-        if el_cfg.get("enabled", True):
-            for s in el_cfg.get("structures", []):
-                sid = s["id"]
-                data_path = _resolve(s)
-                if not data_path.exists():
-                    print(f"  [ref-elastic] WARNING: data not found for {sid}")
-                    elastic_results.append(ElasticResult(
-                        structure_id=sid,
-                        error=f"data file not found: {data_path}",
-                    ))
-                    continue
-                res = run_elastic(
-                    sid, data_path,
-                    model_path=Path("."),
-                    validate_dir=ref_dir,
-                    element=element, lammps_cmd=lammps_cmd,
-                    mpi_command=mpi_command, mpi_np=mpi_np,
-                    delta=el_cfg.get("delta", 0.01),
-                    cutoff=cutoff,
-                )
-                elastic_results.append(res)
+    # ── Elastic ───────────────────────────────────────────────────────
+    el_cfg = val_cfg.get("elastic", {})
+    if el_cfg.get("enabled", True):
+        for s in el_cfg.get("structures", []):
+            sid = s["id"]
+            data_path = _resolve(s)
+            if not data_path.exists():
+                print(f"  [ref-elastic] WARNING: data not found for {sid}")
+                elastic_results.append(ElasticResult(
+                    structure_id=sid,
+                    error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_elastic(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                delta=el_cfg.get("delta", 0.01),
+                cutoff=cutoff,
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            elastic_results.append(res)
 
-        # ── Melting ───────────────────────────────────────────────────
-        melt_cfg = val_cfg.get("melting", {})
-        if melt_cfg.get("enabled", False):
-            for s in melt_cfg.get("structures", []):
-                sid = s["id"]
-                data_path = _resolve(s)
-                if not data_path.exists():
-                    print(f"  [ref-melting] WARNING: data not found for {sid}")
-                    melting_results.append(MeltingResult(
-                        structure_id=sid,
-                        error=f"data file not found: {data_path}",
-                    ))
-                    continue
-                res = run_melting(
-                    sid, data_path,
-                    model_path=Path("."),
-                    validate_dir=ref_dir,
-                    element=element, lammps_cmd=lammps_cmd,
-                    mpi_command=mpi_command, mpi_np=mpi_np,
-                    cutoff=cutoff,
-                    T_start=melt_cfg.get("T_start", 500.0),
-                    T_end=melt_cfg.get("T_end", 750.0),
-                    T_step=melt_cfg.get("T_step", 25.0),
-                    supercell_repeat=melt_cfg.get("supercell_repeat", 4),
-                    n_equil=melt_cfg.get("n_equil", 5000),
-                    n_prod=melt_cfg.get("n_prod", 20000),
-                    dt=melt_cfg.get("dt", 0.002),
-                )
-                melting_results.append(res)
+    # ── Melting ───────────────────────────────────────────────────────
+    melt_cfg = val_cfg.get("melting", {})
+    if melt_cfg.get("enabled", False):
+        for s in melt_cfg.get("structures", []):
+            sid = s["id"]
+            data_path = _resolve(s)
+            if not data_path.exists():
+                print(f"  [ref-melting] WARNING: data not found for {sid}")
+                melting_results.append(MeltingResult(
+                    structure_id=sid,
+                    error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_melting(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                cutoff=cutoff,
+                T_start=melt_cfg.get("T_start", 500.0),
+                T_end=melt_cfg.get("T_end", 750.0),
+                T_step=melt_cfg.get("T_step", 25.0),
+                supercell_repeat=melt_cfg.get("supercell_repeat", 4),
+                n_equil=melt_cfg.get("n_equil", 5000),
+                n_prod=melt_cfg.get("n_prod", 20000),
+                dt=melt_cfg.get("dt", 0.002),
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            melting_results.append(res)
 
-        # ── Thermal expansion ─────────────────────────────────────────
-        thexp_cfg = val_cfg.get("thermal_expansion", {})
-        if thexp_cfg.get("enabled", False):
-            for s in thexp_cfg.get("structures", []):
-                sid = s["id"]
-                data_path = _resolve(s)
-                if not data_path.exists():
-                    print(f"  [ref-thexp]   WARNING: data not found for {sid}")
-                    thexp_results.append(ThermalExpansionResult(
-                        structure_id=sid,
-                        error=f"data file not found: {data_path}",
-                    ))
-                    continue
-                res = run_thermal_expansion(
-                    sid, data_path,
-                    model_path=Path("."),
-                    validate_dir=ref_dir,
-                    element=element, lammps_cmd=lammps_cmd,
-                    mpi_command=mpi_command, mpi_np=mpi_np,
-                    cutoff=cutoff,
-                    temperatures=thexp_cfg.get("temperatures"),
-                    T_ref=thexp_cfg.get("T_ref", 300.0),
-                    n_equil=thexp_cfg.get("n_equil", 5000),
-                    n_prod=thexp_cfg.get("n_prod", 10000),
-                    dt=thexp_cfg.get("dt", 0.002),
-                )
-                thexp_results.append(res)
+    # ── Thermal expansion ─────────────────────────────────────────────
+    thexp_cfg = val_cfg.get("thermal_expansion", {})
+    if thexp_cfg.get("enabled", False):
+        for s in thexp_cfg.get("structures", []):
+            sid = s["id"]
+            data_path = _resolve(s)
+            if not data_path.exists():
+                print(f"  [ref-thexp]   WARNING: data not found for {sid}")
+                thexp_results.append(ThermalExpansionResult(
+                    structure_id=sid,
+                    error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_thermal_expansion(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                cutoff=cutoff,
+                temperatures=thexp_cfg.get("temperatures"),
+                T_ref=thexp_cfg.get("T_ref", 300.0),
+                n_equil=thexp_cfg.get("n_equil", 5000),
+                n_prod=thexp_cfg.get("n_prod", 10000),
+                dt=thexp_cfg.get("dt", 0.002),
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            thexp_results.append(res)
 
-        # ── Vacancy ───────────────────────────────────────────────────
-        vac_cfg = val_cfg.get("vacancy", {})
-        if vac_cfg.get("enabled", False):
-            for s in vac_cfg.get("structures", []):
-                sid = s["id"]
-                data_path = _resolve(s)
-                if not data_path.exists():
-                    print(f"  [ref-vacancy] WARNING: data not found for {sid}")
-                    vacancy_results.append(VacancyResult(
-                        structure_id=sid,
-                        error=f"data file not found: {data_path}",
-                    ))
-                    continue
-                res = run_vacancy(
-                    sid, data_path,
-                    model_path=Path("."),
-                    validate_dir=ref_dir,
-                    element=element, lammps_cmd=lammps_cmd,
-                    mpi_command=mpi_command, mpi_np=mpi_np,
-                    cutoff=cutoff,
-                    supercell_repeat=vac_cfg.get("supercell_repeat", 3),
-                )
-                vacancy_results.append(res)
-
-    finally:
-        # Always restore original lammps module state
-        if _orig_pair_style is None:
-            if hasattr(_lammps_mod, "_CLASSICAL_PAIR_STYLE"):
-                delattr(_lammps_mod, "_CLASSICAL_PAIR_STYLE")
-        else:
-            _lammps_mod._CLASSICAL_PAIR_STYLE = _orig_pair_style
-        if _orig_pair_coeff is None:
-            if hasattr(_lammps_mod, "_CLASSICAL_PAIR_COEFF"):
-                delattr(_lammps_mod, "_CLASSICAL_PAIR_COEFF")
-        else:
-            _lammps_mod._CLASSICAL_PAIR_COEFF = _orig_pair_coeff
+    # ── Vacancy ───────────────────────────────────────────────────────
+    vac_cfg = val_cfg.get("vacancy", {})
+    if vac_cfg.get("enabled", False):
+        for s in vac_cfg.get("structures", []):
+            sid = s["id"]
+            data_path = _resolve(s)
+            if not data_path.exists():
+                print(f"  [ref-vacancy] WARNING: data not found for {sid}")
+                vacancy_results.append(VacancyResult(
+                    structure_id=sid,
+                    error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_vacancy(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                cutoff=cutoff,
+                supercell_repeat=vac_cfg.get("supercell_repeat", 3),
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            vacancy_results.append(res)
 
     # Compute deviations
     devs = _collect_deviations(
