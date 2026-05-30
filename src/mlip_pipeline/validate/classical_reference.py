@@ -46,35 +46,7 @@ from mlip_pipeline.validate import plots
 
 @dataclass
 class ClassicalReferenceResult:
-    """Outcome of a classical potential reference validation run.
-
-    Attributes
-    ----------
-    label
-        Human-readable name of the reference potential (e.g. "Lee2003-MEAM").
-    pair_style
-        LAMMPS pair_style string used (e.g. "meam").
-    pair_coeff
-        LAMMPS pair_coeff string used.
-    eos_results
-        EOS results from the classical potential run.
-    elastic_results
-        Elastic constant results.
-    melting_results
-        Melting temperature bracket results.
-    thermal_expansion_results
-        Thermal expansion coefficient results.
-    vacancy_results
-        Vacancy formation energy results.
-    deviations
-        Flat dict of property deviations (MTP vs classical reference).
-        Keys follow the pattern ``<property>_<structure_id>`` where
-        property is one of: V0, E0, B0, C11, C12, C44, B_voigt, G_voigt,
-        T_melt, alpha, E_vac.
-        Values are percentage deviations: (MTP - REF) / |REF| * 100.
-    plot_paths
-        Dict of plot filenames written.
-    """
+    """Outcome of a classical potential reference validation run."""
     label: str
     pair_style: str
     pair_coeff: str
@@ -92,7 +64,6 @@ class ClassicalReferenceResult:
 # ------------------------------------------------------------------ #
 
 def _pct(mtp_val: Optional[float], ref_val: Optional[float]) -> Optional[float]:
-    """Return percentage deviation (MTP - REF) / |REF| * 100, or None."""
     if mtp_val is None or ref_val is None:
         return None
     if ref_val == 0.0:
@@ -110,9 +81,8 @@ def _collect_deviations(
 ) -> dict:
     devs: dict = {}
 
-    # -- EOS --
-    ref_eos_map  = {r.structure_id: r for r in ref_eos}
-    mtp_eos_map  = {r.structure_id: r for r in mtp_result.eos_results}
+    ref_eos_map = {r.structure_id: r for r in ref_eos}
+    mtp_eos_map = {r.structure_id: r for r in mtp_result.eos_results}
     for sid, ref in ref_eos_map.items():
         mtp = mtp_eos_map.get(sid)
         if mtp is None or not ref.fit_ok or not mtp.fit_ok:
@@ -122,7 +92,6 @@ def _collect_deviations(
             if d is not None:
                 devs[f"{prop}_{sid}"] = round(d, 2)
 
-    # -- Elastic --
     ref_el_map = {r.structure_id: r for r in ref_elastic}
     mtp_el_map = {r.structure_id: r for r in mtp_result.elastic_results}
     for sid, ref in ref_el_map.items():
@@ -141,7 +110,6 @@ def _collect_deviations(
                 if d is not None:
                     devs[f"{cij}_{sid}"] = round(d, 2)
 
-    # -- Melting --
     ref_melt_map = {r.structure_id: r for r in ref_melting}
     mtp_melt_map = {r.structure_id: r for r in mtp_result.melting_results}
     for sid, ref in ref_melt_map.items():
@@ -152,7 +120,6 @@ def _collect_deviations(
         if d is not None:
             devs[f"T_melt_{sid}"] = round(d, 2)
 
-    # -- Thermal expansion --
     ref_thexp_map = {r.structure_id: r for r in ref_thexp}
     mtp_thexp_map = {r.structure_id: r for r in mtp_result.thermal_expansion_results}
     for sid, ref in ref_thexp_map.items():
@@ -163,7 +130,6 @@ def _collect_deviations(
         if d is not None:
             devs[f"alpha_{sid}"] = round(d, 2)
 
-    # -- Vacancy --
     ref_vac_map = {r.structure_id: r for r in ref_vacancy}
     mtp_vac_map = {r.structure_id: r for r in mtp_result.vacancy_results}
     for sid, ref in ref_vac_map.items():
@@ -185,7 +151,6 @@ def print_classical_deviation_table(
     result: ClassicalReferenceResult,
     mtp_result: ValidationResult,
 ) -> None:
-    """Print a formatted side-by-side comparison of MTP vs classical reference."""
     print(f"\n  ── vs. {result.label} (classical reference) ────────────────────")
 
     for mtp_r in mtp_result.eos_results:
@@ -261,6 +226,29 @@ def print_classical_deviation_table(
 
 
 # ------------------------------------------------------------------ #
+# Structure resolver (mirrors runner.py logic)                         #
+# ------------------------------------------------------------------ #
+
+def _resolve_structures_cl(step_cfg: dict, val_cfg: dict) -> list[dict]:
+    """Return structure list, falling back to top-level structures block."""
+    if "structures" in step_cfg:
+        return step_cfg["structures"]
+    top = val_cfg.get("structures", {})
+    if isinstance(top, dict):
+        result = []
+        for sid, sdata in top.items():
+            entry = dict(sdata)
+            entry.setdefault("id", sid)
+            if "data_file" in entry and "lammps_data" not in entry:
+                entry["lammps_data"] = entry["data_file"]
+            result.append(entry)
+        return result
+    if isinstance(top, list):
+        return top
+    return []
+
+
+# ------------------------------------------------------------------ #
 # Public runner                                                         #
 # ------------------------------------------------------------------ #
 
@@ -276,17 +264,12 @@ def run_classical_reference(
     mpi_np: Optional[int] = None,
     cutoff: Optional[float] = None,
 ) -> ClassicalReferenceResult:
-    """Run all enabled validation steps with a classical potential.
-
-    pair_style and pair_coeff are passed verbatim to every LAMMPS writer
-    via the write_* functions in lammps.py.  No monkey-patching needed.
-    """
     val_cfg = config.get("validate", config)
     ref_dir = ensure_dir(out_dir)
     element = val_cfg.get("element", "Pb")
 
     if lammps_cmd is None:
-        lammps_cmd = val_cfg.get("lammps_command", "lmp_mpi")
+        lammps_cmd = val_cfg.get("lammps_cmd") or val_cfg.get("lammps_command", "lmp_mpi")
     if mpi_command is None:
         mpi_command = val_cfg.get("mpi_command") or val_cfg.get("mpi_prefix")
     if mpi_np is None:
@@ -299,29 +282,28 @@ def run_classical_reference(
     print(f"  pair_coeff: {pair_coeff}")
     print(f"  out_dir:    {ref_dir}")
 
-    # model_path is unused when pair_style/pair_coeff are supplied;
-    # pass a sentinel so the writers' signature is satisfied.
     _dummy_model = Path(".")
 
     def _resolve(s: dict) -> Path:
-        data_path = Path(s["lammps_data"])
+        key = "lammps_data" if "lammps_data" in s else "data_file"
+        data_path = Path(s[key])
         if not data_path.is_absolute():
             root = Path(config.get("project_root", "."))
             data_path = (root / data_path).resolve()
         return data_path
 
-    eos_results:   list[EosResult]              = []
-    elastic_results: list[ElasticResult]        = []
-    melting_results: list[MeltingResult]        = []
-    thexp_results: list[ThermalExpansionResult] = []
-    vacancy_results: list[VacancyResult]        = []
+    eos_results:     list[EosResult]              = []
+    elastic_results: list[ElasticResult]          = []
+    melting_results: list[MeltingResult]          = []
+    thexp_results:   list[ThermalExpansionResult] = []
+    vacancy_results: list[VacancyResult]          = []
     plot_paths: dict = {}
 
     # ── EOS ──────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
     if eos_cfg.get("enabled", True):
-        for s in eos_cfg.get("structures", []):
-            sid = s["id"]
+        for s in _resolve_structures_cl(eos_cfg, val_cfg):
+            sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
                 print(f"  [ref-eos]     WARNING: data not found for {sid}")
@@ -334,8 +316,8 @@ def run_classical_reference(
                 sid, data_path, _dummy_model, ref_dir,
                 element=element, lammps_cmd=lammps_cmd,
                 mpi_command=mpi_command, mpi_np=mpi_np,
-                scale_min=eos_cfg.get("scale_min", 0.90),
-                scale_max=eos_cfg.get("scale_max", 1.10),
+                scale_min=eos_cfg.get("scale_min", 0.85),
+                scale_max=eos_cfg.get("scale_max", 1.15),
                 n_points=eos_cfg.get("n_points", 21),
                 cutoff=cutoff,
                 pair_style=pair_style,
@@ -349,8 +331,8 @@ def run_classical_reference(
     # ── Elastic ───────────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
     if el_cfg.get("enabled", True):
-        for s in el_cfg.get("structures", []):
-            sid = s["id"]
+        for s in _resolve_structures_cl(el_cfg, val_cfg):
+            sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
                 print(f"  [ref-elastic] WARNING: data not found for {sid}")
@@ -372,9 +354,9 @@ def run_classical_reference(
 
     # ── Melting ───────────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
-    if melt_cfg.get("enabled", False):
-        for s in melt_cfg.get("structures", []):
-            sid = s["id"]
+    if melt_cfg.get("enabled", True):
+        for s in _resolve_structures_cl(melt_cfg, val_cfg):
+            sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
                 print(f"  [ref-melting] WARNING: data not found for {sid}")
@@ -388,10 +370,10 @@ def run_classical_reference(
                 element=element, lammps_cmd=lammps_cmd,
                 mpi_command=mpi_command, mpi_np=mpi_np,
                 cutoff=cutoff,
-                T_start=melt_cfg.get("T_start", 500.0),
-                T_end=melt_cfg.get("T_end", 750.0),
-                T_step=melt_cfg.get("T_step", 25.0),
-                supercell_repeat=melt_cfg.get("supercell_repeat", 4),
+                T_start=melt_cfg.get("T_start", 550.0),
+                T_end=melt_cfg.get("T_end", 700.0),
+                T_step=melt_cfg.get("T_step", 10.0),
+                supercell_repeat=melt_cfg.get("supercell_repeat", 5),
                 n_equil=melt_cfg.get("n_equil", 5000),
                 n_prod=melt_cfg.get("n_prod", 20000),
                 dt=melt_cfg.get("dt", 0.002),
@@ -401,10 +383,10 @@ def run_classical_reference(
             melting_results.append(res)
 
     # ── Thermal expansion ─────────────────────────────────────────────
-    thexp_cfg = val_cfg.get("thermal_expansion", {})
-    if thexp_cfg.get("enabled", False):
-        for s in thexp_cfg.get("structures", []):
-            sid = s["id"]
+    thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
+    if thexp_cfg.get("enabled", True):
+        for s in _resolve_structures_cl(thexp_cfg, val_cfg):
+            sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
                 print(f"  [ref-thexp]   WARNING: data not found for {sid}")
@@ -430,9 +412,9 @@ def run_classical_reference(
 
     # ── Vacancy ───────────────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
-    if vac_cfg.get("enabled", False):
-        for s in vac_cfg.get("structures", []):
-            sid = s["id"]
+    if vac_cfg.get("enabled", True):
+        for s in _resolve_structures_cl(vac_cfg, val_cfg):
+            sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
                 print(f"  [ref-vacancy] WARNING: data not found for {sid}")
