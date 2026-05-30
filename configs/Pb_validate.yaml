@@ -47,5 +47,5 @@ matproj_reference:
 
 classical_reference:
   name: Lee2003-MEAM
-  pair_style: "meam/c"
+  pair_style: "meam"
   pair_coeff: "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"
