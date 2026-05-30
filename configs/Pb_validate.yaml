@@ -20,8 +20,8 @@ elastic:
   delta: 0.005
 
 melting:
-  T_start: 550
-  T_end: 700
+  T_start: 590
+  T_end: 610
   T_step: 10
   supercell_repeat: 5
   n_equil: 5000
