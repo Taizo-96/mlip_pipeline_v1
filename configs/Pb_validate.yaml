@@ -3,6 +3,7 @@
 element: Pb
 
 lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
+classical_lammps_cmd: /home/saitto/lammps/src/lmp_mpi
 mpi_command: mpirun
 mpi_np: 4
 
@@ -19,8 +20,8 @@ elastic:
   delta: 0.005
 
 melting:
-  T_start: 590
-  T_end: 610
+  T_start: 550
+  T_end: 700
   T_step: 10
   supercell_repeat: 5
   n_equil: 5000
@@ -47,5 +48,5 @@ matproj_reference:
 
 classical_reference:
   name: Lee2003-MEAM
-  pair_style: "meam"
+  pair_style: "meam/c"
   pair_coeff: "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"
