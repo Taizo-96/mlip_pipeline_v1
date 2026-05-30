@@ -27,8 +27,41 @@ def _resolve_val_config(config: dict) -> dict:
     return config.get("validate", config)
 
 
+def _resolve_structures(step_cfg: dict, val_cfg: dict) -> list[dict]:
+    """Return structure list for a step.
+
+    Structures can be defined:
+      1. Inside the step block:  eos.structures / elastic.structures / ...
+      2. At the top level of the validate config under ``structures``
+         as a mapping {id: {data_file: ...}} or list [{id:..., data_file:...}].
+
+    The step-level definition takes precedence.
+    """
+    # Step-level list (old schema)
+    if "structures" in step_cfg:
+        return step_cfg["structures"]
+
+    # Top-level structures block (new simplified schema)
+    top = val_cfg.get("structures", {})
+    if isinstance(top, dict):
+        # mapping form: {fcc: {data_file: ...}, bcc: {...}}
+        result = []
+        for sid, sdata in top.items():
+            entry = dict(sdata)
+            entry.setdefault("id", sid)
+            # support both data_file and lammps_data as key names
+            if "data_file" in entry and "lammps_data" not in entry:
+                entry["lammps_data"] = entry["data_file"]
+            result.append(entry)
+        return result
+    if isinstance(top, list):
+        return top
+    return []
+
+
 def _resolve_data_path(s: dict, config: dict) -> Path:
-    data_path = Path(s["lammps_data"])
+    key = "lammps_data" if "lammps_data" in s else "data_file"
+    data_path = Path(s[key])
     if not data_path.is_absolute():
         root = Path(config.get("project_root", "."))
         data_path = (root / data_path).resolve()
@@ -41,13 +74,6 @@ def _step_enabled(
     only_steps: Optional[list[str]],
     skip_steps: list[str],
 ) -> bool:
-    """Return True when a validation step should run.
-
-    Priority order (highest first):
-      1. --only  → run *only* the listed steps (ignores config enabled flag)
-      2. --skip  → suppress listed steps (ignores config enabled flag)
-      3. config  → respect the ``enabled`` key in the step's config block
-    """
     if only_steps is not None:
         return name in only_steps
     if name in skip_steps:
@@ -70,7 +96,12 @@ def run_validation(
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    lammps_cmd  = val_cfg.get("lammps_command", "lmp_mpi")
+    # Support both 'lammps_cmd' and legacy 'lammps_command' key names
+    lammps_cmd  = (
+        val_cfg.get("lammps_cmd")
+        or val_cfg.get("lammps_command")
+        or "lmp_mpi"
+    )
     mpi_command = val_cfg.get("mpi_command") or val_cfg.get("mpi_prefix")
     mpi_np      = val_cfg.get("mpi_np")
     element     = val_cfg.get("element", "Fe")
@@ -86,19 +117,19 @@ def run_validation(
     if skip_steps:
         print(f"  skip:     {skip_steps}")
 
-    eos_results:    list[EosResult]              = []
-    elastic_results: list[ElasticResult]         = []
-    melting_results: list[MeltingResult]         = []
-    thexp_results:  list[ThermalExpansionResult] = []
-    vacancy_results: list[VacancyResult]         = []
-    rdf_results:    list[RdfResult]              = []
+    eos_results:     list[EosResult]              = []
+    elastic_results: list[ElasticResult]          = []
+    melting_results: list[MeltingResult]          = []
+    thexp_results:   list[ThermalExpansionResult] = []
+    vacancy_results: list[VacancyResult]          = []
+    rdf_results:     list[RdfResult]              = []
     plot_paths: dict = {}
 
     # ── EOS ──────────────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
     if _step_enabled("eos", eos_cfg.get("enabled", True), only_steps, skip_steps):
-        for s in eos_cfg.get("structures", []):
-            sid = s["id"]
+        for s in _resolve_structures(eos_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [eos]     WARNING: data not found for {sid}: {data_path}")
@@ -122,11 +153,11 @@ def run_validation(
                 plot_paths[f"eos_{sid}"] = p
                 print(f"  [eos]     {sid}: plot -> {p.name}")
 
-    # ── Elastic constants ──────────────────────────────────────────────────
+    # ── Elastic constants ─────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
     if _step_enabled("elastic", el_cfg.get("enabled", True), only_steps, skip_steps):
-        for s in el_cfg.get("structures", []):
-            sid = s["id"]
+        for s in _resolve_structures(el_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [elastic] WARNING: data not found for {sid}: {data_path}")
@@ -149,11 +180,11 @@ def run_validation(
                 plot_paths["elastic_constants"] = p
                 print(f"  [elastic] bar chart -> {p.name}")
 
-    # ── Melting temperature ────────────────────────────────────────────────
+    # ── Melting temperature ───────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
-    if _step_enabled("melting", melt_cfg.get("enabled", False), only_steps, skip_steps):
-        for s in melt_cfg.get("structures", []):
-            sid = s["id"]
+    if _step_enabled("melting", melt_cfg.get("enabled", True), only_steps, skip_steps):
+        for s in _resolve_structures(melt_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [melting] WARNING: data not found for {sid}: {data_path}")
@@ -183,10 +214,10 @@ def run_validation(
                 print(f"  [melting] bracket plot -> {p.name}")
 
     # ── Thermal expansion ─────────────────────────────────────────────────
-    thexp_cfg = val_cfg.get("thermal_expansion", {})
-    if _step_enabled("thermal_expansion", thexp_cfg.get("enabled", False), only_steps, skip_steps):
-        for s in thexp_cfg.get("structures", []):
-            sid = s["id"]
+    thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
+    if _step_enabled("thexp", thexp_cfg.get("enabled", True), only_steps, skip_steps):
+        for s in _resolve_structures(thexp_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [thexp]   WARNING: data not found for {sid}: {data_path}")
@@ -213,11 +244,11 @@ def run_validation(
                 plot_paths["thermal_expansion"] = p
                 print(f"  [thexp]   plot -> {p.name}")
 
-    # ── Vacancy formation energy ──────────────────────────────────────────────
+    # ── Vacancy formation energy ──────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
-    if _step_enabled("vacancy", vac_cfg.get("enabled", False), only_steps, skip_steps):
-        for s in vac_cfg.get("structures", []):
-            sid = s["id"]
+    if _step_enabled("vacancy", vac_cfg.get("enabled", True), only_steps, skip_steps):
+        for s in _resolve_structures(vac_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [vacancy] WARNING: data not found for {sid}: {data_path}")
@@ -242,9 +273,9 @@ def run_validation(
 
     # ── RDF ──────────────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
-    if _step_enabled("rdf", rdf_cfg.get("enabled", False), only_steps, skip_steps):
-        for s in rdf_cfg.get("structures", []):
-            sid = s["id"]
+    if _step_enabled("rdf", rdf_cfg.get("enabled", True), only_steps, skip_steps):
+        for s in _resolve_structures(rdf_cfg, val_cfg):
+            sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
                 print(f"  [rdf]     WARNING: data not found for {sid}: {data_path}")
@@ -273,7 +304,7 @@ def run_validation(
                 plot_paths["rdf"] = p
                 print(f"  [rdf]     plot -> {p.name}")
 
-    # ── Manifest ────────────────────────────────────────────────────────────────
+    # ── Manifest ──────────────────────────────────────────────────────────
     result = ValidationResult(
         model_path=model_path,
         validate_dir=val_dir,
@@ -287,13 +318,13 @@ def run_validation(
     )
     result.save_manifest()
 
-    # ── MP reference comparison ───────────────────────────────────────────────
-    ref_cfg = val_cfg.get("reference", {})
-    mp_id   = ref_cfg.get("mp_id")
+    # ── MP reference comparison ───────────────────────────────────────────
+    mp_ref_cfg = val_cfg.get("matproj_reference", val_cfg.get("reference", {}))
+    mp_id = mp_ref_cfg.get("mp_id")
     if mp_id:
         ref = fetch_mp_reference(
             mp_id, out_dir=val_dir,
-            api_key_env=ref_cfg.get("api_key_env", "MP_API_KEY"),
+            api_key_env=mp_ref_cfg.get("api_key_env", "MP_API_KEY"),
         )
         if ref:
             mtp_vals: dict = {}
@@ -323,14 +354,11 @@ def run_validation(
                     break
             print_deviation_table(mtp_vals, ref)
 
-    # ── Classical reference comparison ─────────────────────────────────────────
+    # ── Classical reference comparison ────────────────────────────────────
     cl_cfg = val_cfg.get("classical_reference", {})
-    if cl_cfg.get("enabled", False) and "pair_style" in cl_cfg:
+    if cl_cfg.get("enabled", True) and "pair_style" in cl_cfg:
         project_root = Path(config.get("project_root", "."))
-
-        # Resolve potential file paths relative to project_root
         pair_coeff_raw = cl_cfg["pair_coeff"]
-        # Replace the {project_root} placeholder if present in the YAML
         pair_coeff = pair_coeff_raw.replace("{project_root}", str(project_root))
 
         run_classical_reference(
@@ -339,7 +367,7 @@ def run_validation(
             pair_coeff=pair_coeff,
             out_dir=val_dir / "classical_ref",
             mtp_result=result,
-            label=cl_cfg.get("label", "classical"),
+            label=cl_cfg.get("name", cl_cfg.get("label", "classical")),
             lammps_cmd=lammps_cmd,
             mpi_command=mpi_command,
             mpi_np=mpi_np,
