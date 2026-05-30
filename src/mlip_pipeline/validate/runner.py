@@ -361,6 +361,12 @@ def run_validation(
         pair_coeff_raw = cl_cfg["pair_coeff"]
         pair_coeff = pair_coeff_raw.replace("{project_root}", str(project_root))
 
+        # Use classical_lammps_cmd if specified, otherwise fall back to lammps_cmd
+        classical_lammps_cmd = (
+            val_cfg.get("classical_lammps_cmd")
+            or lammps_cmd
+        )
+
         run_classical_reference(
             config=config,
             pair_style=cl_cfg["pair_style"],
@@ -368,7 +374,7 @@ def run_validation(
             out_dir=val_dir / "classical_ref",
             mtp_result=result,
             label=cl_cfg.get("name", cl_cfg.get("label", "classical")),
-            lammps_cmd=lammps_cmd,
+            lammps_cmd=classical_lammps_cmd,
             mpi_command=mpi_command,
             mpi_np=mpi_np,
             cutoff=cl_cfg.get("cutoff") or cutoff,
