@@ -39,9 +39,9 @@ elastic:
 # Set enabled: true to activate.
 melting:
   enabled:         true
-  T_start:         550.0   # K  – start of bracket scan
-  T_end:           650.0   # K  – end of bracket scan
-  T_step:          25.0    # K  – temperature step between candidates
+  T_start:         599.0   # K  – start of bracket scan
+  T_end:           600.0   # K  – end of bracket scan
+  T_step:          0.5    # K  – temperature step between candidates
   supercell_repeat: 4      # replicate unit cell N x N x 2N for coexistence
   n_equil:         5000    # steps to create liquid seed (NVT heating)
   n_prod:          20000   # steps for NPT production (volume trend)
