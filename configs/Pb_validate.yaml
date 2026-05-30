@@ -1,124 +1,48 @@
-# ════════════════════════════════════════════════════════════════════════════
-# Pb_validate.yaml  –  Standalone physics validation config for Pb MTP
-# ════════════════════════════════════════════════════════════════════════════
+# Validation config for Pb MTP potential
 
-project_root: "/home/saitto/mlip_pipeline_v1"
+element: Pb
 
-element: "Pb"
+lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
+mpi_command: mpirun
+mpi_np: 4
 
-lammps_command: "/home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi"
-mpi_command:    "mpirun"
-mpi_np:         4
+structures:
+  fcc:
+    data_file: reference_structures/fcc_Pb.lammps
 
-
-# ── Equation of State ───────────────────────────────────────────────────────────
 eos:
-  enabled:    true
-  scale_min:  0.80
-  scale_max:  1.20
-  n_points:   25
+  n_points: 25
+  scale_min: 0.85
+  scale_max: 1.15
 
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
-
-
-# ── Elastic constants ──────────────────────────────────────────────────────────
 elastic:
-  enabled:    true
-  delta:      0.005
+  delta: 0.005
 
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
-
-
-# ── Melting temperature (two-phase coexistence) ─────────────────────────────
-# Pb experimental T_melt = 600.61 K.  The bracket search scans T in steps
-# of T_step K; expect a few LAMMPS runs each taking ~1–2 min with 4 cores.
-# Set enabled: true to activate.
 melting:
-  enabled:         true
-  T_start:         599.0   # K  – start of bracket scan
-  T_end:           600.0   # K  – end of bracket scan
-  T_step:          0.5    # K  – temperature step between candidates
-  supercell_repeat: 4      # replicate unit cell N x N x 2N for coexistence
-  n_equil:         5000    # steps to create liquid seed (NVT heating)
-  n_prod:          20000   # steps for NPT production (volume trend)
-  dt:              0.002   # ps
+  supercell_repeat: 5
+  n_equil: 5000
+  n_prod: 20000
+  dt: 0.002
 
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
+thexp:
+  temperatures: [100, 200, 300, 400, 500]
+  n_equil: 5000
+  n_prod: 10000
+  dt: 0.002
 
-
-# ── Thermal expansion coefficient (NPT MD) ──────────────────────────────────
-# Pb experimental alpha ≈ 29e-6 K⁻¹ at 300 K.
-# Runs NPT MD at each temperature in the list, averages volume, fits linear.
-thermal_expansion:
-  enabled:      true
-  temperatures: [100.0, 200.0, 300.0, 400.0, 500.0]  # K
-  T_ref:        300.0   # K  – reference temperature for alpha definition
-  n_equil:      5000    # equilibration steps at each T
-  n_prod:       10000   # production steps (volume averaged at end)
-  dt:           0.002   # ps
-
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
-
-
-# ── Vacancy formation energy ──────────────────────────────────────────────────
-# Pb experimental E_vac ≈ 0.57 eV.
-# Minimises a perfect supercell and a supercell with one atom removed;
-# uses E_vac = E(N-1) - (N-1)/N * E(N).
 vacancy:
-  enabled:          true
-  supercell_repeat: 3     # creates an N×N×N supercell (~108 atoms for fcc)
-
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
-
-
-# ── Radial distribution function (NVT MD) ────────────────────────────────────
-# Structural fingerprint at 300 K.  Validates first NN distance vs. experiment.
-# Pb fcc: r_1 ≈ 3.49 Å  (a/√2, a ≈ 4.95 Å).
-rdf:
-  enabled:          true
-  temperature:      300.0  # K
-  r_max:            8.0    # Å  – cutoff for g(r) accumulation
-  n_bins:           200
-  n_equil:          5000
-  n_prod:           20000
-  dt:               0.002  # ps
   supercell_repeat: 3
 
-  structures:
-    - id:          fcc
-      lammps_data: structures/lammps_data/mp-20483.data
+rdf:
+  temperature: 300
+  supercell_repeat: 3
+  n_equil: 5000
+  n_prod: 20000
 
+matproj_reference:
+  mp_id: mp-20483
 
-# ── Materials Project reference ───────────────────────────────────────────────
-# Fetches DFT-computed V0, B0, Cij for the given mp_id and prints a
-# deviation table at the end of validation.
-# API key is read from the environment variable named in api_key_env.
-# The result is cached to validate_dir/mp_reference.json after the first
-# successful fetch so the API is not hit on every run.
-reference:
-  mp_id:       "mp-20483"   # Pb FCC conventional cell
-  api_key_env: "MP_API_KEY" # name of the env var holding your MP API key
-
-
-# ── Classical reference (Lee 2003 2NN-MEAM) ──────────────────────────────────
-# Runs the same validation steps with the Lee 2003 2NN-MEAM potential and
-# prints a side-by-side deviation table (MTP vs classical).
-# Uses the standard LAMMPS pair_style meam — no custom compilation needed.
-# Potential files are committed to reference_potentials/ in this repo.
-# The LAMMPS binary used is the same as above (must have MEAM package built in).
 classical_reference:
-  enabled:     true
-  label:       "Lee2003-MEAM"
-  pair_style:  "meam"
-  pair_coeff:  "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"
-  # cutoff: 5.5   # optional override; if omitted the global cutoff is used
+  name: Lee2003-MEAM
+  pair_style: "meam/c"
+  pair_coeff: "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"

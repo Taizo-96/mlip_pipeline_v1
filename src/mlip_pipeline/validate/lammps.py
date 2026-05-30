@@ -237,6 +237,9 @@ def write_melting_input(
     T_dis    = 1.5 * temperature
     n_dis    = max(2000, n_equil)
     n_eq     = max(1000, n_equil // 2)
+    # Explicit Nose-Hoover damping (100*dt and 1000*dt) computed in Python
+    tdamp    = round(100 * dt, 6)
+    pdamp    = round(1000 * dt, 6)
 
     pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
@@ -261,7 +264,7 @@ def write_melting_input(
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
-        f"timestep        {dt_heat}",
+        f"timestep        {dt}",
         "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
@@ -269,8 +272,8 @@ def write_melting_input(
         f"# Stage 1: Disorder liquid half at 1.5*T = {T_dis:.0f} K.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
-        f"fix             fxL liquid_atoms nvt temp {T_dis:.1f} {T_dis:.1f} $(100*dt)",
+        f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
+        f"fix             fxL liquid_atoms nvt temp {T_dis:.1f} {T_dis:.1f} {tdamp}",
         f"run             {n_dis}",
         "unfix           fxS",
         "unfix           fxL",
@@ -278,7 +281,7 @@ def write_melting_input(
         "# ----------------------------------------------------------------",
         f"# Stage 2: Quench + equilibrate whole cell at T = {temperature:.1f} K.",
         "# ----------------------------------------------------------------",
-        f"fix             fxEQ all nvt temp {T_dis:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxEQ all nvt temp {T_dis:.1f} {temperature:.1f} {tdamp}",
         f"run             {n_eq}",
         "unfix           fxEQ",
         "",
@@ -294,7 +297,7 @@ def write_melting_input(
         "thermo          50",
         "thermo_modify   flush yes lost warn",
         "",
-        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
@@ -327,6 +330,10 @@ def write_thermal_expansion_input(
     out_file  = (work_dir / "thexp_output.txt").resolve()
     script_path = work_dir / "thexp.in"
 
+    # Explicit damping constants: tdamp=100*dt, pdamp=1000*dt (ps)
+    tdamp = round(100 * dt, 6)
+    pdamp = round(1000 * dt, 6)
+
     pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
     lines = [
@@ -350,8 +357,8 @@ def write_thermal_expansion_input(
         lines += [
             f"# --- T = {T:.1f} K ---",
             f"velocity        all create {T:.1f} {seed + i} dist gaussian",
-            f"fix             fxNPT all npt temp {T:.1f} {T:.1f} $(100*dt) "
-            f"iso 0.0 0.0 $(1000*dt)",
+            f"fix             fxNPT all npt temp {T:.1f} {T:.1f} {tdamp} "
+            f"iso 0.0 0.0 {pdamp}",
             f"run             {n_equil}",
             f"run             {n_prod}",
             "variable        vpat equal vol/atoms",
@@ -433,6 +440,9 @@ def write_rdf_input(
     n_freq   = max(n_every * 2, n_prod // 10)
     n_repeat = n_freq // n_every
 
+    # Explicit damping
+    tdamp = round(100 * dt, 6)
+
     pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
     lines = [
@@ -451,7 +461,7 @@ def write_rdf_input(
         "thermo_modify   flush yes",
         "",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} $(100*dt)",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
         "",
         f"run             {n_equil}",
         "",
