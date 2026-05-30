@@ -71,7 +71,21 @@ def _safe_mpi_np(
 # LAMMPS input builders                                                #
 # ------------------------------------------------------------------ #
 
-def _pair_block(model_path: Path) -> list[str]:
+def _pair_block(
+    model_path: Path,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
+) -> list[str]:
+    """Return pair_style + pair_coeff lines.
+
+    When pair_style/pair_coeff are provided (classical reference mode),
+    they are used verbatim.  Otherwise the default MTP mlip block is used.
+    """
+    if pair_style is not None and pair_coeff is not None:
+        return [
+            f"pair_style      {pair_style}",
+            f"pair_coeff      {pair_coeff}",
+        ]
     return [
         f"pair_style      mlip load_from={model_path.resolve()}",
         "pair_coeff      * *",
@@ -82,6 +96,8 @@ def write_eos_input(
     lammps_data: Path, model_path: Path, out_file: Path,
     *, element: str, scale_min: float = 0.85, scale_max: float = 1.15,
     n_points: int = 21,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> Path:
     script_path = out_file.parent / "eos.in"
     abs_data  = Path(lammps_data).resolve()
@@ -93,7 +109,7 @@ def write_eos_input(
         "",
         f"read_data       {abs_data}",
         "",
-    ] + _pair_block(model_path) + [
+    ] + _pair_block(model_path, pair_style, pair_coeff) + [
         "",
         "thermo_style    custom step vol pe",
         "thermo          1",
@@ -125,6 +141,8 @@ def write_eos_input(
 def write_elastic_input(
     lammps_data: Path, model_path: Path, out_file: Path,
     *, element: str, delta: float = 0.01,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> Path:
     script_path = out_file.parent / "elastic.in"
     abs_data = Path(lammps_data).resolve()
@@ -136,7 +154,7 @@ def write_elastic_input(
         "",
         f"read_data       {abs_data}",
         "",
-    ] + _pair_block(model_path) + [
+    ] + _pair_block(model_path, pair_style, pair_coeff) + [
         "",
         "minimize        1e-10 1e-12 10000 100000",
         "",
@@ -205,44 +223,22 @@ def write_melting_input(
     n_equil: int = 5000,
     n_prod: int = 20000,
     seed: int = 12345,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> Path:
-    """Write a two-phase coexistence LAMMPS input script.
-
-    Protocol (Belonoshko-style two-phase coexistence)
-    -------------------------------------------------
-    Stage 1 — Liquid disordering at 1.5*T_target (NVT, liquid group only):
-      The liquid half is heated to 1.5*T_target.  This is hot enough to
-      disorder Pb at any scan temperature <= 900 K while keeping the atom
-      count stable (2*T was too aggressive and caused atoms to escape the
-      box, leaving non-consecutive IDs and crashing Stage 3).  The solid
-      half is held at T_target with its own NVT thermostat throughout.
-      A reduced timestep (dt/5) is used for stability during disordering.
-
-    Stage 2 — Quench and equilibrate at T_target (NVT, whole cell):
-      The liquid half is cooled back to T_target.  A whole-system NVT
-      equilibration allows the interface to form cleanly.
-
-    reset_atoms id — Restore consecutive atom IDs:
-      Any atoms lost during Stage 1 leave gaps in the ID sequence.
-      `reset_atoms id` renumbers all atoms consecutively so that
-      `velocity create loop all` in Stage 3 does not crash with
-      "Atom IDs must be consecutive".
-
-    Stage 3 — Production NVT at T_target:
-      The PE slope over the production run is the classifier signal.
-      Under NVT (constant volume), PE rises if liquid grows and falls
-      if solid grows.
-    """
+    """Write a two-phase coexistence LAMMPS input script."""
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     thermo_out  = (work_dir / "coex_thermo.txt").resolve()
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    dt_heat  = dt / 5.0            # 0.0004 ps — safe for high-T disordering
-    T_dis    = 1.5 * temperature   # hot enough to disorder; avoids atom escape
-    n_dis    = max(2000, n_equil)  # enough steps to fully disorder
-    n_eq     = max(1000, n_equil // 2)  # quench + interface equilibration
+    dt_heat  = dt / 5.0
+    T_dis    = 1.5 * temperature
+    n_dis    = max(2000, n_equil)
+    n_eq     = max(1000, n_equil // 2)
+
+    pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
     lines = [
         "units           metal",
@@ -252,8 +248,7 @@ def write_melting_input(
         f"read_data       {abs_data}",
         f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat * 2}",
         "",
-        f"pair_style      mlip load_from={abs_model}",
-        "pair_coeff      * *",
+    ] + pair_lines + [
         "",
         "neigh_modify    one 4000 page 100000",
         "",
@@ -267,8 +262,6 @@ def write_melting_input(
         "group           liquid_atoms  region liquid_region",
         "",
         f"timestep        {dt_heat}",
-        # Use 'lost warn' so escaping atoms are logged but the run continues.
-        # 'lost ignore' silently deleted atoms and left non-consecutive IDs.
         "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
@@ -289,11 +282,6 @@ def write_melting_input(
         f"run             {n_eq}",
         "unfix           fxEQ",
         "",
-        "# ----------------------------------------------------------------",
-        "# Restore consecutive atom IDs before Stage 3.",
-        "# Any atoms lost during the high-T melt leave gaps in the ID",
-        "# sequence; 'velocity create loop all' requires consecutive IDs.",
-        "# ----------------------------------------------------------------",
         "reset_atoms     id",
         "",
         "# ----------------------------------------------------------------",
@@ -331,11 +319,15 @@ def write_thermal_expansion_input(
     n_equil: int = 5000,
     n_prod: int = 10000,
     seed: int = 42,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> Path:
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     out_file  = (work_dir / "thexp_output.txt").resolve()
     script_path = work_dir / "thexp.in"
+
+    pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
     lines = [
         "units           metal",
@@ -344,8 +336,7 @@ def write_thermal_expansion_input(
         "",
         f"read_data       {abs_data}",
         "",
-        f"pair_style      mlip load_from={abs_model}",
-        "pair_coeff      * *",
+    ] + pair_lines + [
         "",
         "minimize        1e-10 1e-12 10000 100000",
         "",
@@ -378,6 +369,8 @@ def write_vacancy_inputs(
     work_dir: Path,
     *,
     supercell_repeat: int = 3,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> tuple[Path, Path]:
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -393,8 +386,7 @@ def write_vacancy_inputs(
             f"read_data       {abs_data}",
             f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat}",
             "",
-            f"pair_style      mlip load_from={abs_model}",
-            "pair_coeff      * *",
+        ] + _pair_block(abs_model, pair_style, pair_coeff) + [
             "",
         ]
         if remove_atom:
@@ -429,6 +421,8 @@ def write_rdf_input(
     n_bins: int = 200,
     seed: int = 99,
     supercell_repeat: int = 3,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> Path:
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -439,6 +433,8 @@ def write_rdf_input(
     n_freq   = max(n_every * 2, n_prod // 10)
     n_repeat = n_freq // n_every
 
+    pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
+
     lines = [
         "units           metal",
         "atom_style      atomic",
@@ -447,8 +443,7 @@ def write_rdf_input(
         f"read_data       {abs_data}",
         f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat}",
         "",
-        f"pair_style      mlip load_from={abs_model}",
-        "pair_coeff      * *",
+    ] + pair_lines + [
         "",
         "minimize        1e-10 1e-12 10000 100000",
         "",

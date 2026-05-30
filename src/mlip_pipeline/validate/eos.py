@@ -36,35 +36,13 @@ def _find_fit_range(
     vs: "np.ndarray", es: "np.ndarray",
     max_left_step_ev: float = 0.15,
 ) -> "np.ndarray":
-    """Return a boolean mask selecting points suitable for BM fitting.
-
-    MTP potentials extrapolate unphysically outside the training range:
-      - LEFT  (compression): energy drops catastrophically (-6, -15, -100 eV)
-      - RIGHT (expansion):   energy continues falling instead of rising back up,
-                             forming a second spurious minimum.
-
-    Strategy — walk outward from the local equilibrium minimum:
-
-    1. Sort by volume; find the first dE/dV sign-change (negative->positive)
-       to locate the physical well bottom.  Fall back to the central argmin
-       if no sign change exists.
-
-    2. Walk LEFT from i_min: include each successive point only while the
-       energy is physically rising (E increases going left) and the per-step
-       jump is reasonable (< max_left_step_ev).  Stop immediately when the
-       energy drops or jumps too abruptly.
-
-    3. Walk RIGHT from i_min: include points while the energy is rising
-       (dE/dV > 0).  Stop at the first point where the energy turns back
-       down (onset of the unphysical second minimum).
-    """
+    """Return a boolean mask selecting points suitable for BM fitting."""
     import numpy as np  # type: ignore
 
     order = np.argsort(vs)
     vs_s = vs[order]
     es_s = es[order]
 
-    # --- Step 1: locate local minimum ---
     dE = np.diff(es_s)
     sign_changes = np.where((dE[:-1] < 0) & (dE[1:] > 0))[0]
 
@@ -79,25 +57,22 @@ def _find_fit_range(
         central_idx = np.where(central)[0]
         i_min = central_idx[int(np.argmin(es_s[central]))]
 
-    # --- Step 2: walk left ---
     i_lo = i_min
     while i_lo > 0:
-        step = es_s[i_lo - 1] - es_s[i_lo]  # >0 means energy rises going left (physical)
+        step = es_s[i_lo - 1] - es_s[i_lo]
         if step < 0 or step > max_left_step_ev:
             break
         i_lo -= 1
 
-    # --- Step 3: walk right ---
     i_hi = i_min
     while i_hi < len(es_s) - 1:
-        if es_s[i_hi + 1] < es_s[i_hi]:  # energy turns back down -> stop
+        if es_s[i_hi + 1] < es_s[i_hi]:
             break
         i_hi += 1
 
     mask_s = np.zeros(len(vs_s), dtype=bool)
     mask_s[i_lo: i_hi + 1] = True
 
-    # Map back to original order
     mask = np.empty(len(vs), dtype=bool)
     mask[order] = mask_s
     return mask
@@ -159,12 +134,7 @@ def _fit_bm(
     return float(V0), float(E0), float(B0_gpa), float(B0p)
 
 
-# ------------------------------------------------------------------ #
-# Output parser                                                         #
-# ------------------------------------------------------------------ #
-
 def _parse_eos_output(out_file: Path) -> tuple[list[float], list[float]]:
-    """Parse LAMMPS EOS output: returns (volumes_per_atom, energies_per_atom)."""
     volumes: list[float] = []
     energies: list[float] = []
     for line in out_file.read_text().splitlines():
@@ -182,10 +152,6 @@ def _parse_eos_output(out_file: Path) -> tuple[list[float], list[float]]:
     return volumes, energies
 
 
-# ------------------------------------------------------------------ #
-# Public runner                                                         #
-# ------------------------------------------------------------------ #
-
 def run_eos(
     structure_id: str,
     lammps_data: Path,
@@ -200,6 +166,8 @@ def run_eos(
     scale_max: float = 1.15,
     n_points: int = 21,
     cutoff: Optional[float] = None,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> EosResult:
     """Run EOS calculation and return an EosResult."""
     work_dir = ensure_dir(validate_dir / "eos" / structure_id)
@@ -213,6 +181,7 @@ def run_eos(
         lammps_data, model_path, out_file,
         element=element,
         scale_min=scale_min, scale_max=scale_max, n_points=n_points,
+        pair_style=pair_style, pair_coeff=pair_coeff,
     )
 
     try:
