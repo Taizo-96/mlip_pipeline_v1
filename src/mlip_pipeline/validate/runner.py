@@ -320,4 +320,5 @@ def run_validation(
         rdf_results=rdf_results,
         plot_paths=plot_paths,
     )
-    manifest_path = result.save_manifest()
+    result.save_manifest()
+    return result
