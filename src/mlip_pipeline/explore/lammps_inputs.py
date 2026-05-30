@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mlip_pipeline.explore.resolve import resolve_structure_data_path
+from mlip_pipeline.explore.resolve import (
+    resolve_structure_data_path,
+    resolve_all_structure_data_paths,
+)
 from mlip_pipeline.utils.fs import ensure_dir, copy_if_exists
 from mlip_pipeline.models import FitResult
 
@@ -13,9 +16,13 @@ def build_lammps_input(
     temperature: int,
     potential_path: str,
     pressure: float = 0.0,
+    structure_data: Path | None = None,
 ) -> str:
     explore_cfg = config["explore"]
-    structure_data = resolve_structure_data_path(config, resolved_paths)
+    # Allow callers to pass a pre-resolved path; fall back to single-path resolver
+    # for backwards compatibility.
+    if structure_data is None:
+        structure_data = resolve_structure_data_path(config, resolved_paths)
 
     ensemble      = explore_cfg.get("ensemble", "npt").lower()
     timestep      = explore_cfg.get("timestep", 0.001)
@@ -160,31 +167,40 @@ def create_exploration_runs(
             f"Trained potential not found: {fit_result.model_path}"
         )
 
-    # Validate structure data exists before writing any LAMMPS inputs
-    structure_data = resolve_structure_data_path(config, resolved_paths)
-    if not structure_data.exists():
-        raise FileNotFoundError(
-            f"Structure data file not found: {structure_data}\n"
-            f"Run 'prepare-structures' or set explore.structure_data in config."
-        )
+    # Resolve ALL structure data files (one per material_id, or explicit list)
+    structure_data_paths = resolve_all_structure_data_paths(config, resolved_paths)
+    for sd in structure_data_paths:
+        if not sd.exists():
+            raise FileNotFoundError(
+                f"Structure data file not found: {sd}\n"
+                f"Run 'prepare-structures' or set explore.structure_data in config."
+            )
 
     temperatures  = explore_cfg["temperatures"]
     pressures_raw = explore_cfg.get("pressure_bar", 0.0)
     pressures     = pressures_raw if isinstance(pressures_raw, list) else [pressures_raw]
+    potential_name = fit_result.model_path.name
 
-    for temp in temperatures:
-        for pressure in pressures:
-            run_dir        = ensure_dir(explore_root / f"T{temp}K_P{int(pressure)}bar")
-            potential_name = fit_result.model_path.name
-            copy_if_exists(fit_result.model_path, run_dir / potential_name)
+    for structure_data in structure_data_paths:
+        # Use the stem (e.g. "mp-13") as a label in the run dir name so that
+        # every structure gets its own unambiguous subdirectory.
+        struct_label = structure_data.stem  # e.g. "mp-13"
 
-            lammps_input = build_lammps_input(
-                config=config,
-                resolved_paths=resolved_paths,
-                temperature=temp,
-                pressure=pressure,
-                potential_path=potential_name,
-            )
-            (run_dir / "in.mlip.pb").write_text(lammps_input)
+        for temp in temperatures:
+            for pressure in pressures:
+                run_dir = ensure_dir(
+                    explore_root / f"{struct_label}_T{temp}K_P{int(pressure)}bar"
+                )
+                copy_if_exists(fit_result.model_path, run_dir / potential_name)
+
+                lammps_input = build_lammps_input(
+                    config=config,
+                    resolved_paths=resolved_paths,
+                    temperature=temp,
+                    pressure=pressure,
+                    potential_path=potential_name,
+                    structure_data=structure_data,
+                )
+                (run_dir / "in.mlip.pb").write_text(lammps_input)
 
     return explore_root
