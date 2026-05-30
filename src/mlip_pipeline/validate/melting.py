@@ -30,16 +30,7 @@ from mlip_pipeline.utils.fs import ensure_dir
 # ------------------------------------------------------------------ #
 
 def _classify_pe_trend(thermo_file: Path) -> str:
-    """Return 'growing_liquid', 'growing_solid', or 'ambiguous'.
-
-    Reads the NVT production thermo file (coex_thermo.txt) and fits a
-    linear slope to the POTENTIAL ENERGY (col 3, 0-indexed) time series.
-    Under NVT the volume is fixed, so the PE signal is the correct
-    indicator of which phase is growing:
-      PE slope > 0  ->  liquid growing  (higher PE per atom)
-      PE slope < 0  ->  solid growing   (lower  PE per atom)
-      |slope| small ->  ambiguous; neither phase clearly winning
-    """
+    """Return 'growing_liquid', 'growing_solid', or 'ambiguous'."""
     pes: list[float] = []
     try:
         for line in thermo_file.read_text().splitlines():
@@ -49,7 +40,7 @@ def _classify_pe_trend(thermo_file: Path) -> str:
             parts = line.split()
             if len(parts) >= 4:
                 try:
-                    pes.append(float(parts[3]))  # col 3 = pe
+                    pes.append(float(parts[3]))
                 except ValueError:
                     continue
     except OSError:
@@ -58,7 +49,6 @@ def _classify_pe_trend(thermo_file: Path) -> str:
     if len(pes) < 4:
         return "ambiguous"
 
-    # Use last 50% of points for the slope (skip transient)
     mid = len(pes) // 2
     tail = pes[mid:]
     n = len(tail)
@@ -71,12 +61,10 @@ def _classify_pe_trend(thermo_file: Path) -> str:
         return "ambiguous"
     slope = num / den
 
-    # Normalise slope by |mean PE| to get fractional change per step.
-    # PE is negative for metals; use abs() to avoid sign flip.
     if mean_p == 0:
         return "ambiguous"
     rel_slope = slope / abs(mean_p)
-    THRESHOLD = 5e-8   # fractional PE change per timestep
+    THRESHOLD = 5e-8
     if rel_slope > THRESHOLD:
         return "growing_liquid"
     elif rel_slope < -THRESHOLD:
@@ -106,6 +94,8 @@ def run_melting(
     n_equil: int = 5000,
     n_prod: int = 20000,
     dt: float = 0.002,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> MeltingResult:
     """Bracket T_melt by scanning temperatures and classifying PE trend."""
     work_dir = ensure_dir(validate_dir / "melting" / structure_id)
@@ -118,8 +108,8 @@ def run_melting(
         candidates.append(round(T, 1))
         T += T_step
 
-    T_lo: Optional[float] = None   # highest T where solid grew (PE decreasing)
-    T_hi: Optional[float] = None   # lowest  T where liquid grew (PE increasing)
+    T_lo: Optional[float] = None
+    T_hi: Optional[float] = None
     trend_map: dict[float, str] = {}
 
     for T_cand in candidates:
@@ -133,6 +123,8 @@ def run_melting(
             dt=dt,
             n_equil=n_equil,
             n_prod=n_prod,
+            pair_style=pair_style,
+            pair_coeff=pair_coeff,
         )
         try:
             run_lammps(
@@ -155,31 +147,28 @@ def run_melting(
         print(f"  [melting]   T={T_cand:.0f} K -> {trend}")
 
         if trend == "growing_solid":
-            T_lo = T_cand          # update: keep highest solid-growing T
+            T_lo = T_cand
         elif trend == "growing_liquid":
             if T_hi is None:
-                T_hi = T_cand      # record: lowest liquid-growing T
-            # Early exit only once we have a proper bracket (both sides seen)
+                T_hi = T_cand
             if T_lo is not None and T_hi is not None and T_lo < T_hi:
                 break
-        # "ambiguous": continue scanning — do NOT update bracket or break
 
     if T_lo is None and T_hi is None:
         msg = "could not bracket T_melt in the given range"
         print(f"  [melting] WARNING: {structure_id}: {msg}")
         return MeltingResult(structure_id=structure_id, error=msg)
 
-    # Estimate T_melt as midpoint of bracket
     if T_lo is not None and T_hi is not None and T_lo < T_hi:
         T_melt = (T_lo + T_hi) / 2.0
     elif T_lo is not None and T_hi is not None and T_lo == T_hi:
         T_melt = T_lo
     elif T_lo is None:
-        T_melt = T_hi   # only upper bound known
+        T_melt = T_hi
     else:
-        T_melt = T_lo   # only lower bound known
+        T_melt = T_lo
 
-    print(f"  [melting] {structure_id}: T_melt ≈ {T_melt:.0f} K "
+    print(f"  [melting] {structure_id}: T_melt \u2248 {T_melt:.0f} K "
           f"(bracket [{T_lo}, {T_hi}] K)")
     return MeltingResult(
         structure_id=structure_id,

@@ -128,6 +128,8 @@ def run_elastic(
     mpi_np: Optional[int] = None,
     delta: float = 0.01,
     cutoff: Optional[float] = None,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> ElasticResult:
     """Compute elastic constants and return an ElasticResult."""
     work_dir = ensure_dir(validate_dir / "elastic" / structure_id)
@@ -141,6 +143,8 @@ def run_elastic(
         lammps_data, model_path, out_file,
         element=element,
         delta=delta,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
     )
 
     try:

@@ -1,17 +1,4 @@
-"""Linear thermal expansion coefficient from NPT MD.
-
-Physics
--------
-Run NPT MD at a series of temperatures T_i.  After equilibration, read the
-time-averaged volume per atom V(T).  Fit a linear regression:
-
-    V(T) = V_ref * (1 + 3*alpha*(T - T_ref))
-
-so the volumetric expansion coefficient beta = 3*alpha, and the *linear*
-thermal expansion coefficient alpha = (1/V_ref) * dV/dT / 3.
-
-For Pb the experimental value is alpha ≈ 29e-6 K^-1 at 300 K.
-"""
+"""Thermal expansion coefficient runner."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,50 +7,6 @@ from typing import Optional
 from mlip_pipeline.validate.models import ThermalExpansionResult
 from mlip_pipeline.validate.lammps import write_thermal_expansion_input, run_lammps
 from mlip_pipeline.utils.fs import ensure_dir
-
-
-def _parse_thexp_output(out_file: Path) -> tuple[list[float], list[float]]:
-    """Parse thexp_output.txt -> (temperatures, volumes_per_atom)."""
-    temps, vols = [], []
-    for line in out_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            try:
-                temps.append(float(parts[0]))
-                vols.append(float(parts[1]))
-            except ValueError:
-                continue
-    return temps, vols
-
-
-def _fit_alpha(
-    temps: list[float], vols: list[float], T_ref: float
-) -> tuple[float, float]:
-    """Linear least-squares fit of V vs T; return (alpha, V_ref).
-
-    alpha = (dV/dT) / (3 * V_ref)   [K^-1]
-    """
-    n = len(temps)
-    if n < 2:
-        return float("nan"), float("nan")
-
-    mean_T = sum(temps) / n
-    mean_V = sum(vols) / n
-    num = sum((t - mean_T) * (v - mean_V) for t, v in zip(temps, vols))
-    den = sum((t - mean_T) ** 2 for t in temps)
-    if den == 0:
-        return float("nan"), float("nan")
-
-    dV_dT = num / den
-    # V_ref = V at T_ref from the linear fit
-    V_ref = mean_V + dV_dT * (T_ref - mean_T)
-    if V_ref <= 0:
-        V_ref = mean_V
-    alpha = dV_dT / (3.0 * V_ref)
-    return alpha, V_ref
 
 
 def run_thermal_expansion(
@@ -82,17 +25,15 @@ def run_thermal_expansion(
     n_equil: int = 5000,
     n_prod: int = 10000,
     dt: float = 0.002,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> ThermalExpansionResult:
+    """Run NPT MD at multiple temperatures and fit linear thermal expansion coefficient."""
     if temperatures is None:
         temperatures = [100.0, 200.0, 300.0, 400.0, 500.0]
 
     work_dir = ensure_dir(validate_dir / "thexp" / structure_id)
-    out_file = work_dir / "thexp_output.txt"
-    if out_file.exists():
-        out_file.unlink()
-
-    print(f"  [thexp] {structure_id}: NPT MD at T = "
-          f"{[int(t) for t in temperatures]} K ...")
+    print(f"  [thexp] {structure_id}: NPT MD at T = {temperatures} K ...")
 
     script = write_thermal_expansion_input(
         lammps_data, model_path, work_dir,
@@ -100,7 +41,10 @@ def run_thermal_expansion(
         dt=dt,
         n_equil=n_equil,
         n_prod=n_prod,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
     )
+
     try:
         run_lammps(
             script, work_dir,
@@ -115,21 +59,42 @@ def run_thermal_expansion(
         print(f"  [thexp] WARNING: LAMMPS failed for {structure_id}: {exc}")
         return ThermalExpansionResult(structure_id=structure_id, error=str(exc))
 
-    temps, vols = _parse_thexp_output(out_file)
-    if len(temps) < 2:
-        msg = f"only {len(temps)} data points parsed"
+    out_file = work_dir / "thexp_output.txt"
+    Ts: list[float] = []
+    Vs: list[float] = []
+    for line in out_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                Ts.append(float(parts[0]))
+                Vs.append(float(parts[1]))
+            except ValueError:
+                continue
+
+    if len(Ts) < 3:
+        msg = f"too few T-V points parsed ({len(Ts)})"
         print(f"  [thexp] WARNING: {structure_id}: {msg}")
         return ThermalExpansionResult(structure_id=structure_id, error=msg)
 
-    alpha, V_ref = _fit_alpha(temps, vols, T_ref)
-    print(f"  [thexp] {structure_id}: alpha = {alpha*1e6:.2f} x10^-6 K^-1  "
-          f"V_ref({T_ref:.0f}K) = {V_ref:.4f} Å³/atom")
+    # Linear fit: V(T) = V_ref * (1 + alpha*(T - T_ref))
+    # => alpha = slope / V_ref
+    import numpy as np  # type: ignore
+    Ts_arr = np.array(Ts)
+    Vs_arr = np.array(Vs)
+    coeffs = np.polyfit(Ts_arr, Vs_arr, 1)
+    slope = float(coeffs[0])
+    V_ref_fit = float(np.polyval(coeffs, T_ref))
+    alpha = slope / V_ref_fit if V_ref_fit != 0 else 0.0
+
+    print(f"  [thexp] {structure_id}: alpha = {alpha*1e6:.2f}e-6 K\u207b\u00b9")
     return ThermalExpansionResult(
         structure_id=structure_id,
-        temperatures=temps,
-        volumes=vols,
+        temperatures=Ts,
+        volumes=Vs,
         alpha=alpha,
-        V_ref=V_ref,
         T_ref=T_ref,
         compute_ok=True,
     )
