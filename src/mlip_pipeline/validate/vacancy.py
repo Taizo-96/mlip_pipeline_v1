@@ -89,7 +89,7 @@ def run_vacancy(
     return VacancyResult(
         structure_id=structure_id,
         E_vac=E_vac,
-        N_perfect=N_perf,
-        N_vacancy=N_vac,
+        n_atoms_perfect=N_perf,
+        n_atoms_vacancy=N_vac,
         compute_ok=True,
     )
