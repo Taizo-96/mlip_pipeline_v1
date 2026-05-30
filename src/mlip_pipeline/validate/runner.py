@@ -20,6 +20,7 @@ from mlip_pipeline.validate.vacancy import run_vacancy
 from mlip_pipeline.validate.rdf import run_rdf
 from mlip_pipeline.validate import plots
 from mlip_pipeline.integrations.mp_reference import fetch_mp_reference, print_deviation_table
+from mlip_pipeline.validate.classical_reference import run_classical_reference
 
 
 def _resolve_val_config(config: dict) -> dict:
@@ -93,7 +94,7 @@ def run_validation(
     rdf_results:    list[RdfResult]              = []
     plot_paths: dict = {}
 
-    # ── EOS ──────────────────────────────────────────────────────────────
+    # ── EOS ──────────────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
     if _step_enabled("eos", eos_cfg.get("enabled", True), only_steps, skip_steps):
         for s in eos_cfg.get("structures", []):
@@ -121,7 +122,7 @@ def run_validation(
                 plot_paths[f"eos_{sid}"] = p
                 print(f"  [eos]     {sid}: plot -> {p.name}")
 
-    # ── Elastic constants ─────────────────────────────────────────────────
+    # ── Elastic constants ──────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
     if _step_enabled("elastic", el_cfg.get("enabled", True), only_steps, skip_steps):
         for s in el_cfg.get("structures", []):
@@ -148,7 +149,7 @@ def run_validation(
                 plot_paths["elastic_constants"] = p
                 print(f"  [elastic] bar chart -> {p.name}")
 
-    # ── Melting temperature ───────────────────────────────────────────────
+    # ── Melting temperature ────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
     if _step_enabled("melting", melt_cfg.get("enabled", False), only_steps, skip_steps):
         for s in melt_cfg.get("structures", []):
@@ -212,7 +213,7 @@ def run_validation(
                 plot_paths["thermal_expansion"] = p
                 print(f"  [thexp]   plot -> {p.name}")
 
-    # ── Vacancy formation energy ──────────────────────────────────────────
+    # ── Vacancy formation energy ──────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
     if _step_enabled("vacancy", vac_cfg.get("enabled", False), only_steps, skip_steps):
         for s in vac_cfg.get("structures", []):
@@ -239,7 +240,7 @@ def run_validation(
                 plot_paths["vacancy_formation"] = p
                 print(f"  [vacancy] bar chart -> {p.name}")
 
-    # ── RDF ───────────────────────────────────────────────────────────────
+    # ── RDF ──────────────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
     if _step_enabled("rdf", rdf_cfg.get("enabled", False), only_steps, skip_steps):
         for s in rdf_cfg.get("structures", []):
@@ -272,7 +273,21 @@ def run_validation(
                 plot_paths["rdf"] = p
                 print(f"  [rdf]     plot -> {p.name}")
 
-    # ── MP reference comparison ───────────────────────────────────────────
+    # ── Manifest ────────────────────────────────────────────────────────────────
+    result = ValidationResult(
+        model_path=model_path,
+        validate_dir=val_dir,
+        eos_results=eos_results,
+        elastic_results=elastic_results,
+        melting_results=melting_results,
+        thermal_expansion_results=thexp_results,
+        vacancy_results=vacancy_results,
+        rdf_results=rdf_results,
+        plot_paths=plot_paths,
+    )
+    result.save_manifest()
+
+    # ── MP reference comparison ───────────────────────────────────────────────
     ref_cfg = val_cfg.get("reference", {})
     mp_id   = ref_cfg.get("mp_id")
     if mp_id:
@@ -308,17 +323,27 @@ def run_validation(
                     break
             print_deviation_table(mtp_vals, ref)
 
-    # ── Manifest ──────────────────────────────────────────────────────────
-    result = ValidationResult(
-        model_path=model_path,
-        validate_dir=val_dir,
-        eos_results=eos_results,
-        elastic_results=elastic_results,
-        melting_results=melting_results,
-        thermal_expansion_results=thexp_results,
-        vacancy_results=vacancy_results,
-        rdf_results=rdf_results,
-        plot_paths=plot_paths,
-    )
-    result.save_manifest()
+    # ── Classical reference comparison ─────────────────────────────────────────
+    cl_cfg = val_cfg.get("classical_reference", {})
+    if cl_cfg.get("enabled", False) and "pair_style" in cl_cfg:
+        project_root = Path(config.get("project_root", "."))
+
+        # Resolve potential file paths relative to project_root
+        pair_coeff_raw = cl_cfg["pair_coeff"]
+        # Replace the {project_root} placeholder if present in the YAML
+        pair_coeff = pair_coeff_raw.replace("{project_root}", str(project_root))
+
+        run_classical_reference(
+            config=config,
+            pair_style=cl_cfg["pair_style"],
+            pair_coeff=pair_coeff,
+            out_dir=val_dir / "classical_ref",
+            mtp_result=result,
+            label=cl_cfg.get("label", "classical"),
+            lammps_cmd=lammps_cmd,
+            mpi_command=mpi_command,
+            mpi_np=mpi_np,
+            cutoff=cl_cfg.get("cutoff") or cutoff,
+        )
+
     return result

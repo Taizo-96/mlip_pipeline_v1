@@ -1,6 +1,6 @@
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # Pb_validate.yaml  –  Standalone physics validation config for Pb MTP
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 project_root: "/home/saitto/mlip_pipeline_v1"
 
@@ -11,7 +11,7 @@ mpi_command:    "mpirun"
 mpi_np:         4
 
 
-# ── Equation of State ──────────────────────────────────────────────────────
+# ── Equation of State ───────────────────────────────────────────────────────────
 eos:
   enabled:    true
   scale_min:  0.80
@@ -23,7 +23,7 @@ eos:
       lammps_data: structures/lammps_data/mp-20483.data
 
 
-# ── Elastic constants ───────────────────────────────────────────────────────
+# ── Elastic constants ──────────────────────────────────────────────────────────
 elastic:
   enabled:    true
   delta:      0.005
@@ -68,7 +68,7 @@ thermal_expansion:
       lammps_data: structures/lammps_data/mp-20483.data
 
 
-# ── Vacancy formation energy ─────────────────────────────────────────────────
+# ── Vacancy formation energy ──────────────────────────────────────────────────
 # Pb experimental E_vac ≈ 0.57 eV.
 # Minimises a perfect supercell and a supercell with one atom removed;
 # uses E_vac = E(N-1) - (N-1)/N * E(N).
@@ -99,7 +99,7 @@ rdf:
       lammps_data: structures/lammps_data/mp-20483.data
 
 
-# ── Materials Project reference ─────────────────────────────────────────────
+# ── Materials Project reference ───────────────────────────────────────────────
 # Fetches DFT-computed V0, B0, Cij for the given mp_id and prints a
 # deviation table at the end of validation.
 # API key is read from the environment variable named in api_key_env.
@@ -108,3 +108,17 @@ rdf:
 reference:
   mp_id:       "mp-20483"   # Pb FCC conventional cell
   api_key_env: "MP_API_KEY" # name of the env var holding your MP API key
+
+
+# ── Classical reference (Lee 2003 2NN-MEAM) ──────────────────────────────────
+# Runs the same validation steps with the Lee 2003 2NN-MEAM potential and
+# prints a side-by-side deviation table (MTP vs classical).
+# Uses the standard LAMMPS pair_style meam — no custom compilation needed.
+# Potential files are committed to reference_potentials/ in this repo.
+# The LAMMPS binary used is the same as above (must have MEAM package built in).
+classical_reference:
+  enabled:     true
+  label:       "Lee2003-MEAM"
+  pair_style:  "meam"
+  pair_coeff:  "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"
+  # cutoff: 5.5   # optional override; if omitted the global cutoff is used
