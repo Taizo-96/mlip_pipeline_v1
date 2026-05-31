@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from mlip_pipeline.utils.fs import ensure_dir
-from mlip_pipeline.validate.models import (
+from mlip_pipeline.models import (
     EosResult, ElasticResult, MeltingResult,
     ThermalExpansionResult, VacancyResult, ValidationResult,
 )
@@ -38,6 +38,28 @@ from mlip_pipeline.validate.melting import run_melting
 from mlip_pipeline.validate.thermal_expansion import run_thermal_expansion
 from mlip_pipeline.validate.vacancy import run_vacancy
 from mlip_pipeline.validate import plots
+
+
+# ── CLI helpers ──────────────────────────────────────────────────────────────
+
+_W = 60
+
+
+def _banner(title: str) -> None:
+    pad = (_W - len(title) - 2) // 2
+    print(f"\n{'─' * pad} {title} {'─' * (_W - pad - len(title) - 2)}")
+
+
+def _step(tag: str, msg: str) -> None:
+    print(f"  [{tag:<8}]  {msg}")
+
+
+def _ok(tag: str, msg: str) -> None:
+    print(f"  [{tag:<8}]  ✓  {msg}")
+
+
+def _warn(tag: str, msg: str) -> None:
+    print(f"  [{tag:<8}]  ⚠  {msg}")
 
 
 # ------------------------------------------------------------------ #
@@ -134,7 +156,7 @@ def _collect_deviations(
     mtp_vac_map = {r.structure_id: r for r in mtp_result.vacancy_results}
     for sid, ref in ref_vac_map.items():
         mtp = mtp_vac_map.get(sid)
-        if mtp is None or not ref.compute_ok or not mtp.compute_ok:
+        if mtp is None or not ref.compute_ok or not ref.compute_ok:
             continue
         d = _pct(mtp.E_vac, ref.E_vac)
         if d is not None:
@@ -151,77 +173,91 @@ def print_classical_deviation_table(
     result: ClassicalReferenceResult,
     mtp_result: ValidationResult,
 ) -> None:
-    print(f"\n  ── vs. {result.label} (classical reference) ────────────────────")
+    """Print a clean MTP vs classical reference comparison table."""
+    _banner(f"MTP vs {result.label}")
 
+    ref_lbl = result.label
+    col_w   = max(len(ref_lbl), 12)  # min width for reference column
+
+    def _row(prop: str, mtp_v: float, ref_v: float, unit: str, dev_key: str) -> None:
+        d    = result.deviations.get(dev_key)
+        flag = "" if d is None else ("✓" if abs(d) < 10 else ("!" if abs(d) < 25 else "✗"))
+        d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
+        print(f"  {prop:<8}  {mtp_v:>10.3f}  {ref_v:{col_w}.3f}  {d_str}  {unit}  {flag}")
+
+    def _header(section: str) -> None:
+        print(f"\n  ── {section} ")
+        print(f"  {'Property':<8}  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}  Unit")
+        print("  " + "─" * (10 + col_w + 32))
+
+    # EOS
     for mtp_r in mtp_result.eos_results:
-        sid = mtp_r.structure_id
+        sid   = mtp_r.structure_id
         ref_r = next((r for r in result.eos_results if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.fit_ok or not ref_r.fit_ok:
             continue
-        print(f"\n  [EOS] {sid}")
-        print(f"  {'Property':<8}  {'MTP':>10}  {result.label:>16}  {'Δ%':>8}  Unit")
-        print("  " + "-" * 52)
+        _header(f"EOS [{sid}]")
         for prop, unit in [("V0", "Å³/atom"), ("E0", "eV/atom"), ("B0", "GPa")]:
             mtp_v = getattr(mtp_r, prop, None)
             ref_v = getattr(ref_r, prop, None)
-            if mtp_v is None or ref_v is None:
-                continue
-            d = result.deviations.get(f"{prop}_{sid}")
-            flag = "" if d is None else ("  ✓" if abs(d) < 10 else ("  !" if abs(d) < 25 else "  ✗"))
-            d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
-            print(f"  {prop:<8}  {mtp_v:>10.3f}  {ref_v:>16.3f}  {d_str}  {unit}{flag}")
+            if mtp_v is not None and ref_v is not None:
+                _row(prop, mtp_v, ref_v, unit, f"{prop}_{sid}")
 
+    # Elastic
     for mtp_r in mtp_result.elastic_results:
-        sid = mtp_r.structure_id
+        sid   = mtp_r.structure_id
         ref_r = next((r for r in result.elastic_results if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
-        print(f"\n  [Elastic] {sid}")
-        print(f"  {'Property':<8}  {'MTP':>10}  {result.label:>16}  {'Δ%':>8}  Unit")
-        print("  " + "-" * 52)
-        props = [(k, "GPa") for k in ("C11", "C12", "C44", "B_voigt", "G_voigt")]
-        for prop, unit in props:
+        _header(f"Elastic [{sid}]")
+        for prop, unit in [
+            ("C11", "GPa"), ("C12", "GPa"), ("C44", "GPa"),
+            ("B_voigt", "GPa"), ("G_voigt", "GPa"),
+        ]:
             mtp_v = (mtp_r.C or {}).get(prop) if prop.startswith("C") else getattr(mtp_r, prop, None)
             ref_v = (ref_r.C or {}).get(prop) if prop.startswith("C") else getattr(ref_r, prop, None)
-            if mtp_v is None or ref_v is None:
-                continue
-            d = result.deviations.get(f"{prop}_{sid}")
-            flag = "" if d is None else ("  ✓" if abs(d) < 10 else ("  !" if abs(d) < 25 else "  ✗"))
-            d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
-            print(f"  {prop:<8}  {mtp_v:>10.1f}  {ref_v:>16.1f}  {d_str}  {unit}{flag}")
+            if mtp_v is not None and ref_v is not None:
+                _row(prop, mtp_v, ref_v, unit, f"{prop}_{sid}")
 
+    # Melting
     for mtp_r in mtp_result.melting_results:
-        sid = mtp_r.structure_id
+        sid   = mtp_r.structure_id
         ref_r = next((r for r in result.melting_results if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
-        d = result.deviations.get(f"T_melt_{sid}")
-        flag = "" if d is None else ("  ✓" if abs(d) < 5 else ("  !" if abs(d) < 15 else "  ✗"))
-        d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
-        print(f"\n  [Melting] {sid}: MTP={mtp_r.T_melt:.0f} K  "
-              f"{result.label}={ref_r.T_melt:.0f} K  Δ={d_str}{flag}")
+        d     = result.deviations.get(f"T_melt_{sid}")
+        flag  = "" if d is None else ("✓" if abs(d) < 5 else ("!" if abs(d) < 15 else "✗"))
+        d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
+        print(f"\n  ── Melting [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
+        print(f"  {mtp_r.T_melt:>10.0f}  {ref_r.T_melt:{col_w}.0f}  {d_str}  K  {flag}")
 
+    # Vacancy
     for mtp_r in mtp_result.vacancy_results:
-        sid = mtp_r.structure_id
+        sid   = mtp_r.structure_id
         ref_r = next((r for r in result.vacancy_results if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
-        d = result.deviations.get(f"E_vac_{sid}")
-        flag = "" if d is None else ("  ✓" if abs(d) < 15 else ("  !" if abs(d) < 30 else "  ✗"))
-        d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
-        print(f"\n  [Vacancy] {sid}: MTP={mtp_r.E_vac:.4f} eV  "
-              f"{result.label}={ref_r.E_vac:.4f} eV  Δ={d_str}{flag}")
+        d     = result.deviations.get(f"E_vac_{sid}")
+        flag  = "" if d is None else ("✓" if abs(d) < 15 else ("!" if abs(d) < 30 else "✗"))
+        d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
+        print(f"\n  ── Vacancy [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
+        print(f"  {mtp_r.E_vac:>10.4f}  {ref_r.E_vac:{col_w}.4f}  {d_str}  eV  {flag}")
 
+    # Thermal expansion
     for mtp_r in mtp_result.thermal_expansion_results:
-        sid = mtp_r.structure_id
+        sid   = mtp_r.structure_id
         ref_r = next((r for r in result.thermal_expansion_results if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
-        d = result.deviations.get(f"alpha_{sid}")
-        flag = "" if d is None else ("  ✓" if abs(d) < 15 else ("  !" if abs(d) < 30 else "  ✗"))
-        d_str = f"{d:>+7.1f}%" if d is not None else "       N/A"
-        print(f"\n  [ThExp]   {sid}: MTP={mtp_r.alpha*1e6:.2f}e-6 K⁻¹  "
-              f"{result.label}={ref_r.alpha*1e6:.2f}e-6 K⁻¹  Δ={d_str}{flag}")
+        d     = result.deviations.get(f"alpha_{sid}")
+        flag  = "" if d is None else ("✓" if abs(d) < 15 else ("!" if abs(d) < 30 else "✗"))
+        d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
+        print(f"\n  ── Thermal expansion [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
+        print(f"  {mtp_r.alpha*1e6:>10.2f}  {ref_r.alpha*1e6:{col_w}.2f}  {d_str}  ×10⁻⁶ K⁻¹  {flag}")
+
     print()
 
 
@@ -277,10 +313,10 @@ def run_classical_reference(
     if cutoff is None:
         cutoff = val_cfg.get("cutoff") or val_cfg.get("lammps_cutoff")
 
-    print(f"\n=== Classical Reference: {label} ===")
-    print(f"  pair_style: {pair_style}")
-    print(f"  pair_coeff: {pair_coeff}")
-    print(f"  out_dir:    {ref_dir}")
+    _banner(f"Classical Reference: {label}")
+    _step("setup", f"pair_style : {pair_style}")
+    _step("setup", f"pair_coeff : {pair_coeff}")
+    _step("setup", f"out_dir    : {ref_dir}")
 
     _dummy_model = Path(".")
 
@@ -306,7 +342,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                print(f"  [ref-eos]     WARNING: data not found for {sid}")
+                _warn("ref-eos", f"{sid}: data not found")
                 eos_results.append(EosResult(
                     structure_id=sid, volumes=[], energies=[],
                     fit_error=f"data file not found: {data_path}",
@@ -327,6 +363,8 @@ def run_classical_reference(
             p = plots.plot_eos(res, ref_dir)
             if p:
                 plot_paths[f"eos_{sid}"] = p
+            if res.fit_ok:
+                _ok("ref-eos", f"{sid}: B₀={res.B0:.1f} GPa  V₀={res.V0:.3f} Å³")
 
     # ── Elastic ───────────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
@@ -335,7 +373,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                print(f"  [ref-elastic] WARNING: data not found for {sid}")
+                _warn("ref-el", f"{sid}: data not found")
                 elastic_results.append(ElasticResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -351,6 +389,8 @@ def run_classical_reference(
                 pair_coeff=pair_coeff,
             )
             elastic_results.append(res)
+            if res.compute_ok:
+                _ok("ref-el", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
 
     # ── Melting ───────────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
@@ -359,7 +399,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                print(f"  [ref-melting] WARNING: data not found for {sid}")
+                _warn("ref-melt", f"{sid}: data not found")
                 melting_results.append(MeltingResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -381,6 +421,8 @@ def run_classical_reference(
                 pair_coeff=pair_coeff,
             )
             melting_results.append(res)
+            if res.compute_ok:
+                _ok("ref-melt", f"{sid}: T_melt = {res.T_melt:.0f} K")
 
     # ── Thermal expansion ─────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
@@ -389,7 +431,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                print(f"  [ref-thexp]   WARNING: data not found for {sid}")
+                _warn("ref-thexp", f"{sid}: data not found")
                 thexp_results.append(ThermalExpansionResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -409,6 +451,8 @@ def run_classical_reference(
                 pair_coeff=pair_coeff,
             )
             thexp_results.append(res)
+            if res.compute_ok:
+                _ok("ref-thexp", f"{sid}: α = {res.alpha*1e6:.2f}×10⁻⁶ K⁻¹")
 
     # ── Vacancy ───────────────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
@@ -417,7 +461,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                print(f"  [ref-vacancy] WARNING: data not found for {sid}")
+                _warn("ref-vac", f"{sid}: data not found")
                 vacancy_results.append(VacancyResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -433,6 +477,8 @@ def run_classical_reference(
                 pair_coeff=pair_coeff,
             )
             vacancy_results.append(res)
+            if res.compute_ok:
+                _ok("ref-vac", f"{sid}: E_vac = {res.E_vac:.4f} eV")
 
     # Compute deviations
     devs = _collect_deviations(
