@@ -693,6 +693,65 @@ def validate(
         typer.echo(f"  Plot [{name}]: {p}")
 
 
+@app.command("plot-validate")
+def plot_validate(
+    validate_dir: Annotated[str, typer.Argument(
+        help=(
+            "Path to the validate/ output directory produced by a previous "
+            "'validate' run. Must contain validate_manifest.json and at least "
+            "one classical_ref_*/ref_manifest.json."
+        )
+    )],
+    outdir: Annotated[Optional[str], typer.Option(
+        "--outdir",
+        help="Where to write new plots. Defaults to validate_dir (overwrites previous plots).",
+    )] = None,
+):
+    """
+    Regenerate MTP-vs-reference comparison plots from cached manifests WITHOUT
+    re-running any LAMMPS calculations.
+
+    Requires a prior 'validate' run that produced:
+      <validate_dir>/validate_manifest.json
+      <validate_dir>/classical_ref_<label>/ref_manifest.json   (one per reference)
+
+    Examples
+    --------
+    # Replot in-place (overwrites previous PNGs):
+        mlip-pipeline plot-validate runs/gen_16/fit/validate/
+
+    # Write plots to a separate directory:
+        mlip-pipeline plot-validate runs/gen_16/fit/validate/ --outdir /tmp/plots
+    """
+    from mlip_pipeline.validate.replot import replot_validation
+
+    vdir = Path(validate_dir)
+    if not vdir.exists():
+        typer.echo(f"Directory not found: {vdir}", err=True)
+        raise typer.Exit(1)
+
+    manifest = vdir / "validate_manifest.json"
+    if not manifest.exists():
+        typer.echo(
+            f"validate_manifest.json not found in {vdir}\n"
+            "Run 'validate' first to generate the cache.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    out_path = Path(outdir) if outdir else None
+
+    plot_paths = replot_validation(vdir, out_path)
+
+    if not plot_paths:
+        typer.echo("No plots produced — check that ref_manifest.json files exist.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"\n{len(plot_paths)} plot file(s) written.")
+    for key, p in sorted(plot_paths.items()):
+        typer.echo(f"  {key}: {p}")
+
+
 # ---------------------------------------------------------------------------
 # STATE MANAGEMENT
 # ---------------------------------------------------------------------------
