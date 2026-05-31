@@ -40,9 +40,6 @@ class ElasticResult:
 class MeltingResult:
     structure_id: str
     T_melt: float = 0.0
-    # Bracket endpoints stored as explicit fields so callers can pass them
-    # as keyword arguments.  T_bracket is kept as a convenience property
-    # for any code that reads the tuple form.
     T_bracket_lo: float = field(default_factory=lambda: float("nan"))
     T_bracket_hi: float = field(default_factory=lambda: float("nan"))
     compute_ok: bool = False
@@ -169,6 +166,102 @@ class ValidationResult:
         path.write_text(json.dumps(manifest, indent=2))
         return path
 
+    @classmethod
+    def load_manifest(cls, manifest_path: Path) -> "ValidationResult":
+        """Reconstruct a ValidationResult from a saved validate_manifest.json.
+
+        No LAMMPS calls are made — all data is read from the JSON file.
+        """
+        data = json.loads(manifest_path.read_text())
+        validate_dir = Path(data["validate_dir"])
+        model_path   = Path(data["model_path"])
+
+        eos_results = [
+            EosResult(
+                structure_id=r["structure_id"],
+                volumes=r.get("volumes", []),
+                energies=r.get("energies", []),
+                V0=r.get("V0", 0.0),
+                E0=r.get("E0", 0.0),
+                B0=r.get("B0", 0.0),
+                B0p=r.get("B0p", 0.0),
+                fit_ok=r.get("fit_ok", False),
+                fit_error=r.get("fit_error"),
+            )
+            for r in data.get("eos", [])
+        ]
+        elastic_results = [
+            ElasticResult(
+                structure_id=r["structure_id"],
+                C=r.get("C") or {},
+                B_voigt=r.get("B_voigt", 0.0),
+                G_voigt=r.get("G_voigt", 0.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("elastic", [])
+        ]
+        melting_results = [
+            MeltingResult(
+                structure_id=r["structure_id"],
+                T_melt=r.get("T_melt", 0.0),
+                T_bracket_lo=r.get("T_bracket_lo", float("nan")),
+                T_bracket_hi=r.get("T_bracket_hi", float("nan")),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("melting", [])
+        ]
+        thexp_results = [
+            ThermalExpansionResult(
+                structure_id=r["structure_id"],
+                temperatures=r.get("temperatures", []),
+                volumes=r.get("volumes", []),
+                alpha=r.get("alpha", 0.0),
+                T_ref=r.get("T_ref", 300.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("thermal_expansion", [])
+        ]
+        vacancy_results = [
+            VacancyResult(
+                structure_id=r["structure_id"],
+                E_vac=r.get("E_vac", 0.0),
+                n_atoms_perfect=r.get("n_atoms_perfect", 0),
+                n_atoms_vacancy=r.get("n_atoms_vacancy", 0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("vacancy", [])
+        ]
+        rdf_results = [
+            RdfResult(
+                structure_id=r["structure_id"],
+                r=r.get("r", []),
+                g_r=r.get("g_r", []),
+                first_peak_r=r.get("first_peak_r", 0.0),
+                first_peak_g=r.get("first_peak_g", 0.0),
+                temperature=r.get("temperature", 300.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("rdf", [])
+        ]
+        plot_paths = {k: Path(v) for k, v in data.get("plots", {}).items()}
+
+        return cls(
+            model_path=model_path,
+            validate_dir=validate_dir,
+            eos_results=eos_results,
+            elastic_results=elastic_results,
+            melting_results=melting_results,
+            thermal_expansion_results=thexp_results,
+            vacancy_results=vacancy_results,
+            rdf_results=rdf_results,
+            plot_paths=plot_paths,
+        )
+
 
 # ── Execution plan ────────────────────────────────────────────────────────────
 
@@ -195,7 +288,6 @@ class RunPlan:
     ref_configs: list[dict]
     skip_mtp: bool = False
 
-    # convenience ------------------------------------------------------------------
     def will_run_step(self, name: str) -> bool:
         return name in self.mtp_steps
 
@@ -213,28 +305,10 @@ def build_run_plan(
     only_refs: Optional[list[str]] = None,
     skip_ref: Optional[list[str]] = None,
 ) -> RunPlan:
-    """Compute a :class:`RunPlan` from flags + config.
-
-    Parameters
-    ----------
-    val_cfg:
-        The ``validate:`` sub-dict from the YAML config.
-    all_mtp_steps:
-        Canonical ordered tuple of all valid step names.
-    only_steps / skip_steps:
-        CLI ``--only`` / ``--skip`` for MTP steps (mutually exclusive).
-    skip_mtp:
-        CLI ``--skip-mtp``: bypass all MTP computation.
-    skip_refs:
-        CLI ``--skip-refs``: bypass all reference computations.
-    only_refs / skip_ref:
-        CLI ``--only-ref`` / ``--skip-ref``: filter references by label
-        (mutually exclusive; case-insensitive substring match).
-    """
+    """Compute a :class:`RunPlan` from flags + config."""
     skip_steps = list(skip_steps or [])
     skip_ref = list(skip_ref or [])
 
-    # ── MTP steps ─────────────────────────────────────────────────────────────
     if skip_mtp:
         mtp_steps: list[str] = []
     elif only_steps is not None:
@@ -246,9 +320,7 @@ def build_run_plan(
             and val_cfg.get(s, {}).get("enabled", True)
         ]
 
-    # ── Reference configs ─────────────────────────────────────────────────────
     raw_refs = _resolve_reference_configs(val_cfg)
-    # always filter out disabled entries first
     refs = [r for r in raw_refs if r.get("enabled", False)]
 
     if skip_refs:

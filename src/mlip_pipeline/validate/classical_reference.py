@@ -29,6 +29,7 @@ Typical usage
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -64,6 +65,171 @@ class ClassicalReferenceResult:
     vacancy_results:           list[VacancyResult]          = field(default_factory=list)
     rdf_results:               list[RdfResult]              = field(default_factory=list)
     deviations: dict = field(default_factory=dict)
+
+    # ── Persistence ───────────────────────────────────────────────────────
+
+    def save_manifest(self, out_dir: Path) -> Path:
+        """Serialise all result data to ``<out_dir>/ref_manifest.json``.
+
+        Saves enough data to reconstruct the object via :meth:`load_manifest`
+        without re-running any LAMMPS calculations.
+        """
+        manifest = {
+            "label":      self.label,
+            "pair_style": self.pair_style,
+            "pair_coeff": self.pair_coeff,
+            "deviations": self.deviations,
+            "eos": [
+                {
+                    "structure_id": r.structure_id,
+                    "V0": r.V0, "E0": r.E0, "B0": r.B0, "B0p": r.B0p,
+                    "volumes": r.volumes, "energies": r.energies,
+                    "fit_ok": r.fit_ok, "fit_error": r.fit_error,
+                }
+                for r in self.eos_results
+            ],
+            "elastic": [
+                {
+                    "structure_id": r.structure_id,
+                    "C": r.C, "B_voigt": r.B_voigt, "G_voigt": r.G_voigt,
+                    "compute_ok": r.compute_ok, "error": r.error,
+                }
+                for r in self.elastic_results
+            ],
+            "melting": [
+                {
+                    "structure_id": r.structure_id,
+                    "T_melt": r.T_melt,
+                    "T_bracket_lo": r.T_bracket_lo,
+                    "T_bracket_hi": r.T_bracket_hi,
+                    "compute_ok": r.compute_ok, "error": r.error,
+                }
+                for r in self.melting_results
+            ],
+            "thermal_expansion": [
+                {
+                    "structure_id": r.structure_id,
+                    "temperatures": r.temperatures, "volumes": r.volumes,
+                    "alpha": r.alpha, "T_ref": r.T_ref,
+                    "compute_ok": r.compute_ok, "error": r.error,
+                }
+                for r in self.thermal_expansion_results
+            ],
+            "vacancy": [
+                {
+                    "structure_id": r.structure_id,
+                    "E_vac": r.E_vac,
+                    "n_atoms_perfect": r.n_atoms_perfect,
+                    "n_atoms_vacancy": r.n_atoms_vacancy,
+                    "compute_ok": r.compute_ok, "error": r.error,
+                }
+                for r in self.vacancy_results
+            ],
+            "rdf": [
+                {
+                    "structure_id": r.structure_id,
+                    "r": r.r, "g_r": r.g_r,
+                    "first_peak_r": r.first_peak_r, "first_peak_g": r.first_peak_g,
+                    "temperature": r.temperature,
+                    "compute_ok": r.compute_ok, "error": r.error,
+                }
+                for r in self.rdf_results
+            ],
+        }
+        path = out_dir / "ref_manifest.json"
+        path.write_text(json.dumps(manifest, indent=2))
+        return path
+
+    @classmethod
+    def load_manifest(cls, manifest_path: Path) -> "ClassicalReferenceResult":
+        """Reconstruct a ClassicalReferenceResult from a saved ref_manifest.json."""
+        data = json.loads(manifest_path.read_text())
+
+        eos_results = [
+            EosResult(
+                structure_id=r["structure_id"],
+                volumes=r.get("volumes", []),
+                energies=r.get("energies", []),
+                V0=r.get("V0", 0.0),
+                E0=r.get("E0", 0.0),
+                B0=r.get("B0", 0.0),
+                B0p=r.get("B0p", 0.0),
+                fit_ok=r.get("fit_ok", False),
+                fit_error=r.get("fit_error"),
+            )
+            for r in data.get("eos", [])
+        ]
+        elastic_results = [
+            ElasticResult(
+                structure_id=r["structure_id"],
+                C=r.get("C") or {},
+                B_voigt=r.get("B_voigt", 0.0),
+                G_voigt=r.get("G_voigt", 0.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("elastic", [])
+        ]
+        melting_results = [
+            MeltingResult(
+                structure_id=r["structure_id"],
+                T_melt=r.get("T_melt", 0.0),
+                T_bracket_lo=r.get("T_bracket_lo", float("nan")),
+                T_bracket_hi=r.get("T_bracket_hi", float("nan")),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("melting", [])
+        ]
+        thexp_results = [
+            ThermalExpansionResult(
+                structure_id=r["structure_id"],
+                temperatures=r.get("temperatures", []),
+                volumes=r.get("volumes", []),
+                alpha=r.get("alpha", 0.0),
+                T_ref=r.get("T_ref", 300.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("thermal_expansion", [])
+        ]
+        vacancy_results = [
+            VacancyResult(
+                structure_id=r["structure_id"],
+                E_vac=r.get("E_vac", 0.0),
+                n_atoms_perfect=r.get("n_atoms_perfect", 0),
+                n_atoms_vacancy=r.get("n_atoms_vacancy", 0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("vacancy", [])
+        ]
+        rdf_results = [
+            RdfResult(
+                structure_id=r["structure_id"],
+                r=r.get("r", []),
+                g_r=r.get("g_r", []),
+                first_peak_r=r.get("first_peak_r", 0.0),
+                first_peak_g=r.get("first_peak_g", 0.0),
+                temperature=r.get("temperature", 300.0),
+                compute_ok=r.get("compute_ok", False),
+                error=r.get("error"),
+            )
+            for r in data.get("rdf", [])
+        ]
+
+        return cls(
+            label=data["label"],
+            pair_style=data["pair_style"],
+            pair_coeff=data["pair_coeff"],
+            eos_results=eos_results,
+            elastic_results=elastic_results,
+            melting_results=melting_results,
+            thermal_expansion_results=thexp_results,
+            vacancy_results=vacancy_results,
+            rdf_results=rdf_results,
+            deviations=data.get("deviations", {}),
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -173,7 +339,6 @@ def print_classical_deviation_table(
         print(f"  {'Property':<8}  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}  Unit")
         print("  " + "\u2500" * (10 + col_w + 32))
 
-    # EOS
     for mtp_r in mtp_result.eos_results:
         sid   = mtp_r.structure_id
         ref_r = next((r for r in result.eos_results if r.structure_id == sid), None)
@@ -186,7 +351,6 @@ def print_classical_deviation_table(
             if mtp_v is not None and ref_v is not None:
                 _row(prop, mtp_v, ref_v, unit, f"{prop}_{sid}")
 
-    # Elastic
     for mtp_r in mtp_result.elastic_results:
         sid   = mtp_r.structure_id
         ref_r = next((r for r in result.elastic_results if r.structure_id == sid), None)
@@ -204,7 +368,6 @@ def print_classical_deviation_table(
             if mtp_v is not None and ref_v is not None:
                 _row(prop, mtp_v, ref_v, unit, f"{prop}_{sid}")
 
-    # Melting
     for mtp_r in mtp_result.melting_results:
         sid   = mtp_r.structure_id
         ref_r = next((r for r in result.melting_results if r.structure_id == sid), None)
@@ -217,7 +380,6 @@ def print_classical_deviation_table(
         print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}")
         print(f"  {mtp_r.T_melt:>10.0f}  {ref_r.T_melt:{col_w}.0f}  {d_str}  K  {flag}")
 
-    # Vacancy
     for mtp_r in mtp_result.vacancy_results:
         sid   = mtp_r.structure_id
         ref_r = next((r for r in result.vacancy_results if r.structure_id == sid), None)
@@ -230,7 +392,6 @@ def print_classical_deviation_table(
         print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}")
         print(f"  {mtp_r.E_vac:>10.4f}  {ref_r.E_vac:{col_w}.4f}  {d_str}  eV  {flag}")
 
-    # Thermal expansion
     for mtp_r in mtp_result.thermal_expansion_results:
         sid   = mtp_r.structure_id
         ref_r = next((r for r in result.thermal_expansion_results
@@ -349,7 +510,7 @@ def run_classical_reference(
             if res.fit_ok:
                 ok("ref-eos", f"{sid}: B\u2080={res.B0:.1f} GPa  V\u2080={res.V0:.3f} \u00c5\u00b3")
             else:
-                warn("ref-eos", f"{sid}: fit failed — {res.fit_error}")
+                warn("ref-eos", f"{sid}: fit failed \u2014 {res.fit_error}")
 
     # ── Elastic ───────────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
@@ -377,7 +538,7 @@ def run_classical_reference(
             if res.compute_ok:
                 ok("ref-el", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
             else:
-                warn("ref-el", f"{sid}: failed — {res.error}")
+                warn("ref-el", f"{sid}: failed \u2014 {res.error}")
 
     # ── Melting ───────────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
@@ -411,7 +572,7 @@ def run_classical_reference(
             if res.compute_ok:
                 ok("ref-melt", f"{sid}: T_melt = {res.T_melt:.0f} K")
             else:
-                warn("ref-melt", f"{sid}: failed — {res.error}")
+                warn("ref-melt", f"{sid}: failed \u2014 {res.error}")
 
     # ── Thermal expansion ─────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
@@ -443,7 +604,7 @@ def run_classical_reference(
             if res.compute_ok:
                 ok("ref-thexp", f"{sid}: \u03b1 = {res.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9")
             else:
-                warn("ref-thexp", f"{sid}: failed — {res.error}")
+                warn("ref-thexp", f"{sid}: failed \u2014 {res.error}")
 
     # ── Vacancy ───────────────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
@@ -471,7 +632,7 @@ def run_classical_reference(
             if res.compute_ok:
                 ok("ref-vac", f"{sid}: E_vac = {res.E_vac:.4f} eV")
             else:
-                warn("ref-vac", f"{sid}: failed — {res.error}")
+                warn("ref-vac", f"{sid}: failed \u2014 {res.error}")
 
     # ── RDF ──────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
@@ -505,9 +666,8 @@ def run_classical_reference(
             if res.compute_ok:
                 ok("ref-rdf", f"{sid}: first peak at {res.first_peak_r:.3f} \u00c5")
             else:
-                warn("ref-rdf", f"{sid}: failed — {res.error}")
+                warn("ref-rdf", f"{sid}: failed \u2014 {res.error}")
 
-    # Compute scalar deviations (used by the CLI table)
     devs = _collect_deviations(
         mtp_result,
         eos_results, elastic_results,
@@ -528,4 +688,5 @@ def run_classical_reference(
     )
 
     print_classical_deviation_table(result, mtp_result)
+    result.save_manifest(ref_dir)
     return result
