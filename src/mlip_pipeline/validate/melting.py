@@ -16,8 +16,8 @@ T_target under NPH (the physically correct ensemble for TPC):
 Trend classification uses a two-sample Welch t-test comparing the
 first and last quartile of the PE series.
 
-A linear bracket scan across candidate temperatures locates T_melt
-to within T_step K; the reported uncertainty is ±T_step/2.
+All candidate temperatures are run concurrently (ThreadPoolExecutor).
+Bracket detection is applied after all futures resolve.
 
 Preparation protocol (splice approach)
 ---------------------------------------
@@ -27,15 +27,16 @@ entirely avoids the MPI ghost-atom double-integration failure that
 affects all dual-thermostat approaches with 4+ MPI ranks.
 
   Step 1 — solid_eq.in:
-    Whole supercell NVT at T_target.  Final snapshot -> solid_final.dump.
+    NPT ramp 1 K → T_target, then NPT hold at T_target.
+    Final snapshot → solid_final.dump.
 
   Step 2 — liquid_eq.in:
-    Whole supercell NVT/heat to T_dis = min(1.3*T, T+300).  Equilibrate
-    as liquid.  Final snapshot -> liquid_final.dump.
+    NPT ramp 1 K → T_dis = min(1.3*T, T+300), then NPT hold.
+    Final snapshot → liquid_final.dump.
 
   Step 3 — Python splice (splice_tpc_cell):
     Read both dumps.  lo-z atoms from solid dump, hi-z atoms from
-    liquid dump -> tpc_start.lammps.
+    liquid dump → tpc_start.lammps.
 
   Step 4 — coex.in:
     Read tpc_start.lammps.  NVT interface relax (Stage A), then NPH
@@ -44,6 +45,7 @@ affects all dual-thermostat approaches with 4+ MPI ranks.
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -147,15 +149,11 @@ def _run_tpc_temperature(
         lammps_cmd=lammps_cmd,
         mpi_command=mpi_command,
         mpi_np=mpi_np,
-        log_file=None,
         lammps_data=lammps_data,
         cutoff=cutoff,
         supercell_repeat=supercell_repeat,
     )
 
-    # -------------------------------------------------------------- #
-    # Step 1: equilibrate solid                                        #
-    # -------------------------------------------------------------- #
     solid_script = write_solid_eq_input(
         lammps_data, model_path, T_dir,
         temperature=T_cand,
@@ -166,15 +164,11 @@ def _run_tpc_temperature(
         pair_coeff=pair_coeff,
     )
     try:
-        run_lammps(solid_script, T_dir,
-                   log_file=T_dir / "solid_eq.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+        run_lammps(solid_script, T_dir, log_file=T_dir / "solid_eq.log", **run_kw)
     except RuntimeError as exc:
         print(f"  [melting] WARNING: solid_eq failed at T={T_cand}: {exc}")
         return "error"
 
-    # -------------------------------------------------------------- #
-    # Step 2: equilibrate liquid                                       #
-    # -------------------------------------------------------------- #
     liquid_script = write_liquid_eq_input(
         lammps_data, model_path, T_dir,
         temperature=T_cand,
@@ -185,15 +179,11 @@ def _run_tpc_temperature(
         pair_coeff=pair_coeff,
     )
     try:
-        run_lammps(liquid_script, T_dir,
-                   log_file=T_dir / "liquid_eq.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+        run_lammps(liquid_script, T_dir, log_file=T_dir / "liquid_eq.log", **run_kw)
     except RuntimeError as exc:
         print(f"  [melting] WARNING: liquid_eq failed at T={T_cand}: {exc}")
         return "error"
 
-    # -------------------------------------------------------------- #
-    # Step 3: Python splice                                            #
-    # -------------------------------------------------------------- #
     solid_dump  = T_dir / "solid_final.dump"
     liquid_dump = T_dir / "liquid_final.dump"
     tpc_data    = T_dir / "tpc_start.lammps"
@@ -203,9 +193,6 @@ def _run_tpc_temperature(
         print(f"  [melting] WARNING: splice failed at T={T_cand}: {exc}")
         return "error"
 
-    # -------------------------------------------------------------- #
-    # Step 4: coexistence run                                          #
-    # -------------------------------------------------------------- #
     coex_script = write_coex_input(
         tpc_data, model_path, T_dir,
         temperature=T_cand,
@@ -216,8 +203,7 @@ def _run_tpc_temperature(
         pair_coeff=pair_coeff,
     )
     try:
-        run_lammps(coex_script, T_dir,
-                   log_file=T_dir / "coex.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+        run_lammps(coex_script, T_dir, log_file=T_dir / "coex.log", **run_kw)
     except RuntimeError as exc:
         print(f"  [melting] WARNING: coex failed at T={T_cand}: {exc}")
         return "error"
@@ -247,23 +233,29 @@ def run_melting(
     n_equil: int = 5000,
     n_prod: int = 20000,
     dt: float = 0.002,
+    max_workers: Optional[int] = None,
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> MeltingResult:
-    """Bracket T_melt by scanning temperatures and classifying PE trend.
+    """Bracket T_melt by scanning temperatures concurrently.
 
-    Each temperature uses the splice TPC protocol:
-      solid_eq -> liquid_eq -> Python splice -> coex (NVT + NPH).
-    No LAMMPS region/group commands are used at any point.
+    All candidate temperatures are submitted to a ThreadPoolExecutor
+    and run in parallel.  Each temperature writes to its own T<N>/
+    subdirectory, so there are no file-system races.
 
-    The reported T_melt is the midpoint of the bracket [T_lo, T_hi].
-    The inherent resolution is ±T_step/2 K, stored as T_melt_uncertainty
-    in the result.  One-sided brackets (scan range too narrow) produce
-    a warning and still return the best available bound.
+    Bracket detection (T_lo / T_hi) is applied after all futures
+    resolve.  The reported T_melt is the midpoint of [T_lo, T_hi];
+    uncertainty = (T_hi - T_lo) / 2, or T_step / 2 for one-sided
+    brackets.
+
+    Parameters
+    ----------
+    max_workers:
+        Maximum number of concurrent temperature runs.  Defaults to
+        len(candidates) (all at once).  Set in config as
+        ``melting.max_workers`` to cap concurrent MPI jobs.
     """
     work_dir = ensure_dir(validate_dir / "melting" / structure_id)
-    print(f"  [melting] {structure_id}: scanning T = {T_start:.0f}..{T_end:.0f} K "
-          f"in steps of {T_step:.0f} K (splice protocol) ...")
 
     candidates: list[float] = []
     T = T_start
@@ -271,36 +263,63 @@ def run_melting(
         candidates.append(round(T, 1))
         T += T_step
 
-    T_lo: Optional[float] = None
-    T_hi: Optional[float] = None
+    _workers = max_workers or len(candidates)
+    print(
+        f"  [melting] {structure_id}: scanning {len(candidates)} temperatures "
+        f"({T_start:.0f}–{T_end:.0f} K, step {T_step:.0f} K) "
+        f"with {_workers} concurrent worker(s) ..."
+    )
+
+    common_kw = dict(
+        lammps_data=lammps_data,
+        model_path=model_path,
+        supercell_repeat=supercell_repeat,
+        dt=dt,
+        n_equil=n_equil,
+        n_prod=n_prod,
+        lammps_cmd=lammps_cmd,
+        mpi_command=mpi_command,
+        mpi_np=mpi_np,
+        cutoff=cutoff,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
+    )
+
     trend_map: dict[float, str] = {}
 
-    for T_cand in candidates:
-        T_dir = ensure_dir(work_dir / f"T{T_cand:.0f}")
-        trend = _run_tpc_temperature(
-            T_cand, T_dir,
-            lammps_data, model_path,
-            supercell_repeat=supercell_repeat,
-            dt=dt,
-            n_equil=n_equil,
-            n_prod=n_prod,
-            lammps_cmd=lammps_cmd,
-            mpi_command=mpi_command,
-            mpi_np=mpi_np,
-            cutoff=cutoff,
-            pair_style=pair_style,
-            pair_coeff=pair_coeff,
-        )
-        trend_map[T_cand] = trend
-        print(f"  [melting]   T={T_cand:.0f} K -> {trend}")
+    with ThreadPoolExecutor(max_workers=_workers) as pool:
+        future_to_T = {
+            pool.submit(
+                _run_tpc_temperature,
+                T_cand,
+                ensure_dir(work_dir / f"T{T_cand:.0f}"),
+                **common_kw,
+            ): T_cand
+            for T_cand in candidates
+        }
+        for f in as_completed(future_to_T):
+            T_cand = future_to_T[f]
+            try:
+                trend = f.result()
+            except Exception as exc:  # noqa: BLE001
+                trend = "error"
+                print(f"  [melting] WARNING: T={T_cand:.0f} K raised exception: {exc}")
+            trend_map[T_cand] = trend
+            print(f"  [melting]   T={T_cand:.0f} K -> {trend}")
 
+    # ------------------------------------------------------------------ #
+    # Bracket detection — applied to the full sorted result set           #
+    # ------------------------------------------------------------------ #
+    T_lo: Optional[float] = None
+    T_hi: Optional[float] = None
+
+    for T_cand in sorted(trend_map):
+        trend = trend_map[T_cand]
         if trend == "growing_solid":
             T_lo = T_cand
         elif trend == "growing_liquid":
             if T_hi is None:
                 T_hi = T_cand
-            if T_lo is not None and T_hi is not None and T_lo < T_hi:
-                break
 
     if T_lo is None and T_hi is None:
         msg = "could not bracket T_melt in the given range"
