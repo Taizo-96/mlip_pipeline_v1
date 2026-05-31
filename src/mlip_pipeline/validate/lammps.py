@@ -113,22 +113,30 @@ def write_solid_eq_input(
 ) -> Path:
     """Equilibrate the whole supercell as solid at T_target, P=0.
 
-    Uses NPT (iso 0 0) so the cell expands to the correct equilibrium
-    volume for this MTP at T_target before the dump is written.
-    The reference data file typically has 0 K DFT lattice parameters;
-    without NPT the initial pressure is ~20 kbar and atoms are lost
-    within the first few hundred NVT steps.
+    The reference data file has 0 K DFT lattice parameters.  After
+    replicate the MTP pressure is ~20 kbar.  Assigning velocities at
+    T_target and immediately running NPT causes a violent volume
+    overshoot that makes the pressure NaN within ~500 steps.
 
-    Dumps the final snapshot to solid_final.dump.
-    No groups, no regions.
+    Safe three-stage protocol
+    -------------------------
+    Stage 0  near-0 K NPT (1 K, 500 steps, dt/5):
+             Barostat decompresses the cell with negligible kinetic
+             energy; P drops from ~20 kbar to ~0 before any real
+             thermal dynamics.
+    Stage 1  NPT slow heat 1 K -> T_target (2000 steps, dt/5):
+             Gradual ramp avoids a sudden pressure kick.
+    Stage 2  NPT equilibration at T_target (n_equil steps, dt):
+             Fully thermalised solid at P~0; dump written here.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     dump_out  = (work_dir / "solid_final.dump").resolve()
     script_path = work_dir / "solid_eq.in"
 
-    tdamp = round(100 * dt, 6)
-    pdamp = round(1000 * dt, 6)
+    dt_slow = round(dt / 5.0, 6)
+    tdamp   = round(100 * dt, 6)
+    pdamp   = round(1000 * dt, 6)
 
     lines = [
         "units           metal",
@@ -144,16 +152,33 @@ def write_solid_eq_input(
         "",
         "minimize        1e-8 1e-10 5000 50000",
         "",
-        f"timestep        {dt}",
         "thermo          500",
         "thermo_modify   flush yes",
         "",
-        f"# NPT: cell relaxes to correct volume at T_target before dump.",
-        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} {tdamp} "
-        f"iso 0.0 0.0 {pdamp}",
+        "# ---------------------------------------------------------------",
+        "# Stage 0: near-0 K NPT — decompress cell before adding heat.",
+        "# Assigns 1 K velocities so the barostat acts on a cold system.",
+        "# ---------------------------------------------------------------",
+        f"timestep        {dt_slow}",
+        f"velocity        all create 1.0 {seed} dist gaussian",
+        f"fix             fxS0 all npt temp 1.0 1.0 {tdamp} iso 0.0 0.0 {pdamp}",
+        "run             500",
+        "unfix           fxS0",
+        "",
+        "# ---------------------------------------------------------------",
+        f"# Stage 1: NPT slow heat 1 K -> {temperature:.1f} K.",
+        "# ---------------------------------------------------------------",
+        f"fix             fxS1 all npt temp 1.0 {temperature:.1f} {tdamp} iso 0.0 0.0 {pdamp}",
+        "run             2000",
+        "unfix           fxS1",
+        "",
+        "# ---------------------------------------------------------------",
+        f"# Stage 2: NPT equilibration at T_target = {temperature:.1f} K.",
+        "# ---------------------------------------------------------------",
+        f"timestep        {dt}",
+        f"fix             fxS2 all npt temp {temperature:.1f} {temperature:.1f} {tdamp} iso 0.0 0.0 {pdamp}",
         f"run             {n_equil}",
-        "unfix           fxNPT",
+        "unfix           fxS2",
         "",
         f"write_dump      all custom {dump_out} id type x y z modify sort id",
     ]
@@ -179,18 +204,12 @@ def write_liquid_eq_input(
 
     T_dis = min(1.3 * T_target, T_target + 300).
 
-    Protocol:
-      1. Short NPT at T_target to relax cell volume (avoids the 20 kbar
-         pressure spike from the 0 K reference lattice parameter).
-      2. NPT heat from T_target to T_dis with reduced timestep.
-      3. NPT equilibration at T_dis.
+    Same near-0 K decompression trick as write_solid_eq_input, then
+    a controlled heat ramp to T_dis, then NPT equilibration.
 
-    Using NPT throughout ensures P ≈ 0 at every stage and the box
-    dimensions in liquid_final.dump are consistent with the solid_final.dump
-    box (both relaxed at their respective temperatures).
-
-    Dumps the final snapshot to liquid_final.dump.
-    No groups, no regions.
+    Stage 0  near-0 K NPT (1 K, 500 steps, dt/5)  — decompress cell.
+    Stage 1  NPT slow heat 1 K -> T_dis (n_heat steps, dt_heat)
+    Stage 2  NPT equilibration at T_dis (n_equil steps, dt)
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -198,11 +217,10 @@ def write_liquid_eq_input(
     script_path = work_dir / "liquid_eq.in"
 
     T_dis    = min(1.3 * temperature, temperature + 300.0)
-    _dt_heat = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
+    dt_slow  = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
     tdamp    = round(100 * dt, 6)
     pdamp    = round(1000 * dt, 6)
-    n_pre    = max(1000, n_equil // 5)   # short NPT pre-relax at T_target
-    n_heat   = max(2000, n_equil // 2)   # heat ramp T_target -> T_dis
+    n_heat   = max(2000, n_equil // 2)
 
     lines = [
         "units           metal",
@@ -218,29 +236,32 @@ def write_liquid_eq_input(
         "",
         "minimize        1e-8 1e-10 5000 50000",
         "",
-        "# --- Pre-relax: NPT at T_target to remove 0K pressure spike ---",
-        f"timestep        {dt}",
         "thermo          500",
         "thermo_modify   flush yes",
-        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxPre all npt temp {temperature:.1f} {temperature:.1f} {tdamp} "
-        f"iso 0.0 0.0 {pdamp}",
-        f"run             {n_pre}",
-        "unfix           fxPre",
         "",
-        f"# --- Heat ramp: NPT T_target -> T_dis at reduced timestep ---",
-        f"timestep        {_dt_heat}",
-        f"fix             fxHeat all npt temp {temperature:.1f} {T_dis:.1f} {tdamp} "
-        f"iso 0.0 0.0 {pdamp}",
+        "# ---------------------------------------------------------------",
+        "# Stage 0: near-0 K NPT — decompress cell before adding heat.",
+        "# ---------------------------------------------------------------",
+        f"timestep        {dt_slow}",
+        f"velocity        all create 1.0 {seed} dist gaussian",
+        f"fix             fxL0 all npt temp 1.0 1.0 {tdamp} iso 0.0 0.0 {pdamp}",
+        "run             500",
+        "unfix           fxL0",
+        "",
+        "# ---------------------------------------------------------------",
+        f"# Stage 1: NPT heat ramp 1 K -> T_dis = {T_dis:.1f} K.",
+        "# ---------------------------------------------------------------",
+        f"fix             fxL1 all npt temp 1.0 {T_dis:.1f} {tdamp} iso 0.0 0.0 {pdamp}",
         f"run             {n_heat}",
-        "unfix           fxHeat",
+        "unfix           fxL1",
         "",
-        f"# --- Equilibrate liquid at T_dis ---",
+        "# ---------------------------------------------------------------",
+        f"# Stage 2: NPT equilibration at T_dis = {T_dis:.1f} K.",
+        "# ---------------------------------------------------------------",
         f"timestep        {dt}",
-        f"fix             fxLiq all npt temp {T_dis:.1f} {T_dis:.1f} {tdamp} "
-        f"iso 0.0 0.0 {pdamp}",
+        f"fix             fxL2 all npt temp {T_dis:.1f} {T_dis:.1f} {tdamp} iso 0.0 0.0 {pdamp}",
         f"run             {n_equil}",
-        "unfix           fxLiq",
+        "unfix           fxL2",
         "",
         f"write_dump      all custom {dump_out} id type x y z modify sort id",
     ]
@@ -303,27 +324,25 @@ def splice_tpc_cell(
         )
 
     # Solid box is the reference (NPT-relaxed solid at T_target).
-    # Liquid box may differ slightly in volume; we rescale liquid hi-z
-    # atom z-coordinates into the solid box to avoid a seam discontinuity.
+    # Liquid box may differ slightly in volume; rescale liquid hi-z
+    # atom coordinates into the solid box to avoid a seam discontinuity.
     xlo, xhi = box_s["x"]
     ylo, yhi = box_s["y"]
     zlo, zhi = box_s["z"]
     zmid = (zlo + zhi) / 2.0
 
-    # Rescale factors: map liquid box -> solid box
     lx_scale = (xhi - xlo) / (box_l["x"][1] - box_l["x"][0])
     ly_scale = (yhi - ylo) / (box_l["y"][1] - box_l["y"][0])
     lz_scale = (zhi - zlo) / (box_l["z"][1] - box_l["z"][0])
-    lxlo, lxhi = box_l["x"]
-    lylo, lyhi = box_l["y"]
-    lzlo, lzhi = box_l["z"]
+    lxlo = box_l["x"][0]
+    lylo = box_l["y"][0]
+    lzlo = box_l["z"][0]
 
     combined: list[tuple[float, float, float]] = []
-    for (sid, sx, sy, sz), (_, lx, ly, lz) in zip(solid_atoms, liquid_atoms):
+    for (_, sx, sy, sz), (_, lx, ly, lz) in zip(solid_atoms, liquid_atoms):
         if sz <= zmid:
             combined.append((sx, sy, sz))
         else:
-            # Rescale liquid coords into solid box
             rx = xlo + (lx - lxlo) * lx_scale
             ry = ylo + (ly - lylo) * ly_scale
             rz = zlo + (lz - lzlo) * lz_scale
