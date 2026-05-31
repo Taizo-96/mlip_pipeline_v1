@@ -255,10 +255,23 @@ def write_melting_input(
 
     Ensemble choices
     ----------------
-    - Stage 1 (liquid disordering): NVT with a reduced timestep (dt/5).
-      The liquid half is heated to min(1.3*T, T+300) K to avoid excessive
-      over-disordering in low-melting-point systems (Pb, K, Na, ...).
-    - Stage 2 (quench + equilibration): NVT ramp back to T_target.
+    - Stage 1 (liquid disordering): a single NVT thermostat on ALL atoms,
+      combined with ``fix setforce 0 0 0`` on the solid half.
+      setforce zeroes the forces on solid atoms every step so they cannot
+      move, while the single NVT drives the liquid half to T_dis.
+      This is the correct approach: only ONE fix integrates equations of
+      motion at any time, so the "time integrated more than once" error
+      (and the associated unphysical pressure spike) is completely avoided.
+
+      The previous dual-NVT approach (separate fix nvt on solid_atoms and
+      liquid_atoms) fails when running with multiple MPI ranks because the
+      split plane at z=zmid falls on an MPI domain boundary.  Ghost atoms
+      straddling that boundary are assigned to BOTH groups regardless of
+      the ``open 5/6`` region flags, causing every atom to be integrated
+      twice.  MEAM is robust enough to survive; MTP diverges.
+
+    - Stage 2 (quench + equilibration): single NVT ramp T_dis → T_target
+      on all atoms.
     - Stage 3 (production / phase classification): NPH at P=0 (iso).
       NPH is the physically correct ensemble for two-phase coexistence:
       it allows the cell volume to relax, removing the artificial pressure
@@ -267,15 +280,9 @@ def write_melting_input(
 
     Group partitioning
     ------------------
-    The solid (lo-z) and liquid (hi-z) halves are defined with open-face
-    regions so that every atom belongs to exactly one group:
-
-      solid_region : open 6  (z-hi face is open/exclusive)
-      liquid_region: open 5  (z-lo face is open/exclusive)
-
-    This guarantees no atom is double-counted regardless of its z position,
-    eliminating the "time integrated more than once" crash that would occur
-    with the default closed regions where atoms at z=zmid fall into both.
+    The solid (lo-z) group is still defined for the setforce fix.
+    open-face regions are kept for consistency but are not critical for
+    setforce correctness (double-zeroing a force is a no-op).
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -311,31 +318,32 @@ def write_melting_input(
         "minimize        1e-8 1e-10 5000 50000",
         "",
         "# ----------------------------------------------------------------",
-        "# Split into solid (lo-z) and liquid (hi-z) halves.",
-        "# open 6 = z-hi face exclusive on solid_region",
-        "# open 5 = z-lo face exclusive on liquid_region",
-        "# Together these guarantee every atom belongs to exactly one group.",
+        "# Define solid (lo-z) group for the setforce freeze in Stage 1.",
+        "# open 6 = z-hi face exclusive so atoms at z=zmid go to liquid.",
         "# ----------------------------------------------------------------",
         "variable        zmid   equal (zlo+zhi)/2.0",
         "region          solid_region  block INF INF INF INF INF ${zmid} units box open 6",
-        "region          liquid_region block INF INF INF INF ${zmid} INF  units box open 5",
         "group           solid_atoms   region solid_region",
-        "group           liquid_atoms  region liquid_region",
         "",
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
         "# ----------------------------------------------------------------",
-        f"# Stage 1: Disorder liquid half at {T_dis:.0f} K (= min(1.3*T, T+300)).",
+        f"# Stage 1: Disorder liquid half at {T_dis:.1f} K (= min(1.3*T, T+300)).",
         f"#          Reduced timestep {dt_heat} ps used for stability.",
+        "#",
+        "#  fix fxFreeze zeroes forces on solid atoms every step → they",
+        "#  cannot move.  A single NVT on ALL atoms drives the liquid half",
+        "#  to T_dis.  Only one fix integrates equations of motion, so",
+        "#  there is no double-integration and no competing thermostats.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
-        f"fix             fxL liquid_atoms nvt temp {T_dis:.1f} {T_dis:.1f} {tdamp}",
+        "fix             fxFreeze solid_atoms setforce 0.0 0.0 0.0",
+        f"fix             fxDis    all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
         f"run             {n_dis}",
-        "unfix           fxS",
-        "unfix           fxL",
+        "unfix           fxFreeze",
+        "unfix           fxDis",
         "",
         "# ----------------------------------------------------------------",
         f"# Stage 2: Quench + equilibrate whole cell at T = {temperature:.1f} K.",
