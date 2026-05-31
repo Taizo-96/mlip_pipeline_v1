@@ -5,6 +5,7 @@ All public symbols are re-exported via ``mlip_pipeline.models``.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -39,9 +40,19 @@ class ElasticResult:
 class MeltingResult:
     structure_id: str
     T_melt: float = 0.0
-    T_bracket: tuple = field(default_factory=tuple)
+    # Bracket endpoints stored as explicit fields so callers can pass them
+    # as keyword arguments.  T_bracket is kept as a convenience property
+    # for any code that reads the tuple form.
+    T_bracket_lo: float = field(default_factory=lambda: float("nan"))
+    T_bracket_hi: float = field(default_factory=lambda: float("nan"))
     compute_ok: bool = False
     error: Optional[str] = None
+
+    @property
+    def T_bracket(self) -> tuple:
+        lo = None if math.isnan(self.T_bracket_lo) else self.T_bracket_lo
+        hi = None if math.isnan(self.T_bracket_hi) else self.T_bracket_hi
+        return (lo, hi)
 
 
 @dataclass
@@ -115,7 +126,10 @@ class ValidationResult:
             "melting": [
                 {
                     "structure_id": r.structure_id,
-                    "T_melt": r.T_melt, "T_bracket": list(r.T_bracket),
+                    "T_melt": r.T_melt,
+                    "T_bracket": list(r.T_bracket),
+                    "T_bracket_lo": r.T_bracket_lo,
+                    "T_bracket_hi": r.T_bracket_hi,
                     "compute_ok": r.compute_ok, "error": r.error,
                 }
                 for r in self.melting_results
