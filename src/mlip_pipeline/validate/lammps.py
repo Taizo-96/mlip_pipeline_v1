@@ -251,18 +251,34 @@ def write_melting_input(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> Path:
-    """Write a two-phase coexistence LAMMPS input script."""
+    """Write a two-phase coexistence LAMMPS input script.
+
+    Ensemble choices
+    ----------------
+    - Stage 1 (liquid disordering): NVT with a reduced timestep (dt/5).
+      The liquid half is heated to min(1.3*T, T+300) K to avoid excessive
+      over-disordering in low-melting-point systems (Pb, K, Na, ...).
+    - Stage 2 (quench + equilibration): NVT ramp back to T_target.
+    - Stage 3 (production / phase classification): NPH at P=0 (iso).
+      NPH is the physically correct ensemble for two-phase coexistence:
+      it allows the cell volume to relax, removing the artificial pressure
+      build-up that NVT would introduce as one phase grows into the other.
+      Velocities are carried forward from Stage 2 (no velocity reset).
+    """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     thermo_out  = (work_dir / "coex_thermo.txt").resolve()
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    dt_heat  = dt / 5.0
-    T_dis    = 1.5 * temperature
+    # Reduced timestep for the disordering stage (avoids instabilities).
+    dt_heat  = round(dt / 5.0, 6)
+    # Cap disordering temperature: aggressive heating can cause instabilities
+    # for low-Tm systems (Pb ~600 K, K ~336 K).  Use min(1.3*T, T+300) K.
+    T_dis    = min(1.3 * temperature, temperature + 300.0)
     n_dis    = max(2000, n_equil)
     n_eq     = max(1000, n_equil // 2)
-    # Explicit Nose-Hoover damping (100*dt and 1000*dt) computed in Python
+    # Explicit Nose-Hoover damping: tdamp=100*dt, pdamp=1000*dt (ps)
     tdamp    = round(100 * dt, 6)
     pdamp    = round(1000 * dt, 6)
 
@@ -289,12 +305,13 @@ def write_melting_input(
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
-        f"timestep        {dt}",
+        f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
         "# ----------------------------------------------------------------",
-        f"# Stage 1: Disorder liquid half at 1.5*T = {T_dis:.0f} K.",
+        f"# Stage 1: Disorder liquid half at {T_dis:.0f} K (= min(1.3*T, T+300)).",
+        f"#          Reduced timestep {dt_heat} ps used for stability.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
         f"fix             fxS solid_atoms nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
@@ -305,7 +322,9 @@ def write_melting_input(
         "",
         "# ----------------------------------------------------------------",
         f"# Stage 2: Quench + equilibrate whole cell at T = {temperature:.1f} K.",
+        f"#          Switch back to production timestep {dt} ps.",
         "# ----------------------------------------------------------------",
+        f"timestep        {dt}",
         f"fix             fxEQ all nvt temp {T_dis:.1f} {temperature:.1f} {tdamp}",
         f"run             {n_eq}",
         "unfix           fxEQ",
@@ -313,22 +332,23 @@ def write_melting_input(
         "reset_atoms     id",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 3: Production NVT. Classify via PE slope.",
+        "# Stage 3: Production NPH (iso, P=0).  Correct ensemble for TPC:",
+        "#          constant pressure allows the cell to adjust as one phase",
+        "#          grows into the other, avoiding artificial pressure buildup.",
+        "#          Velocities are inherited from Stage 2 (no velocity reset).",
         "# ----------------------------------------------------------------",
-        f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
-        "",
         f"timestep        {dt}",
         "thermo_style    custom step temp vol pe atoms",
         "thermo          50",
         "thermo_modify   flush yes lost warn",
         "",
-        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
+        f"fix             fxNPH all nph iso 0.0 0.0 {pdamp}",
         f"print           \"# step temp vol pe\" file {thermo_out} screen no",
         f"fix             fxPrint all print 50 "
         f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
         "",
         f"run             {n_prod}",
-        "unfix           fxNVT",
+        "unfix           fxNPH",
         "unfix           fxPrint",
         "",
         f"print           \"$(atoms)\" file {natom_out} screen no",

@@ -3,20 +3,26 @@
 Physics
 -------
 A supercell is split into solid (bottom half) and liquid (top half) by z.
-The liquid seed is created by briefly heating that half to ~T+50 K in NVT.
-The full cell is then run in NVT at T_target.
+The liquid seed is created by briefly heating that half to min(1.3*T, T+300) K
+in NVT at a reduced timestep, while the solid half is held at T_target.
+The full cell is then run in NPH (constant enthalpy/pressure) at P=0.
 
 The potential energy time series reveals which phase is stable at T_target
-under NVT (constant volume):
+under NPH (constant pressure — the physically correct ensemble for TPC):
   - PE increasing  ->  liquid growing  ->  T > T_melt
   - PE decreasing  ->  solid growing   ->  T < T_melt
   - PE flat        ->  ambiguous; scan continues
 
-A bracket search across candidate temperatures is performed to locate T_melt
-to within `T_step` K.
+Trend classification uses a two-sample Welch t-test comparing the first
+and last quartile of the PE series, which is more robust than a simple
+linear slope threshold.
+
+A linear bracket scan across candidate temperatures locates T_melt
+to within `T_step` K; the reported uncertainty is ±T_step/2.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -29,8 +35,30 @@ from mlip_pipeline.utils.fs import ensure_dir
 # PE trend classifier                                                  #
 # ------------------------------------------------------------------ #
 
+def _welch_t_statistic(a: list[float], b: list[float]) -> float:
+    """Return Welch t-statistic for two independent samples (b - a direction)."""
+    n_a, n_b = len(a), len(b)
+    if n_a < 2 or n_b < 2:
+        return 0.0
+    mean_a = sum(a) / n_a
+    mean_b = sum(b) / n_b
+    var_a = sum((x - mean_a) ** 2 for x in a) / (n_a - 1)
+    var_b = sum((x - mean_b) ** 2 for x in b) / (n_b - 1)
+    se2 = var_a / n_a + var_b / n_b
+    if se2 <= 0:
+        return 0.0
+    return (mean_b - mean_a) / math.sqrt(se2)
+
+
 def _classify_pe_trend(thermo_file: Path) -> str:
-    """Return 'growing_liquid', 'growing_solid', or 'ambiguous'."""
+    """Return 'growing_liquid', 'growing_solid', or 'ambiguous'.
+
+    Uses a two-sample Welch t-test comparing the first quartile (early
+    production) vs the last quartile (late production) of the PE series.
+    A |t| >= 2.0 threshold (roughly p < 0.05 for n >= 30) avoids the
+    arbitrary relative-slope magic number and gives a statistically
+    grounded classification.
+    """
     pes: list[float] = []
     try:
         for line in thermo_file.read_text().splitlines():
@@ -46,28 +74,21 @@ def _classify_pe_trend(thermo_file: Path) -> str:
     except OSError:
         return "ambiguous"
 
-    if len(pes) < 4:
+    if len(pes) < 8:
         return "ambiguous"
 
-    mid = len(pes) // 2
-    tail = pes[mid:]
-    n = len(tail)
-    xs = list(range(n))
-    mean_x = sum(xs) / n
-    mean_p = sum(tail) / n
-    num = sum((x - mean_x) * (p - mean_p) for x, p in zip(xs, tail))
-    den = sum((x - mean_x) ** 2 for x in xs)
-    if den == 0:
-        return "ambiguous"
-    slope = num / den
+    n = len(pes)
+    q = max(2, n // 4)
+    first_q = pes[:q]
+    last_q  = pes[n - q:]
 
-    if mean_p == 0:
-        return "ambiguous"
-    rel_slope = slope / abs(mean_p)
-    THRESHOLD = 5e-8
-    if rel_slope > THRESHOLD:
+    # t > 0 means PE increased => liquid growing => T > T_melt
+    t_stat = _welch_t_statistic(first_q, last_q)
+
+    T_THRESHOLD = 2.0  # |t| >= 2 ~ p < 0.05
+    if t_stat > T_THRESHOLD:
         return "growing_liquid"
-    elif rel_slope < -THRESHOLD:
+    elif t_stat < -T_THRESHOLD:
         return "growing_solid"
     return "ambiguous"
 
@@ -97,7 +118,14 @@ def run_melting(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> MeltingResult:
-    """Bracket T_melt by scanning temperatures and classifying PE trend."""
+    """Bracket T_melt by scanning temperatures and classifying PE trend.
+
+    The reported T_melt is the midpoint of the bracket [T_lo, T_hi].
+    The inherent resolution is ±T_step/2 K, stored as T_melt_uncertainty
+    in the result.  One-sided brackets (scan range too narrow) produce
+    a warning and still return the best available bound, but with a
+    NaN on the missing side so callers can detect the issue.
+    """
     work_dir = ensure_dir(validate_dir / "melting" / structure_id)
     print(f"  [melting] {structure_id}: scanning T = {T_start:.0f}..{T_end:.0f} K "
           f"in steps of {T_step:.0f} K ...")
@@ -159,20 +187,44 @@ def run_melting(
         print(f"  [melting] WARNING: {structure_id}: {msg}")
         return MeltingResult(structure_id=structure_id, error=msg)
 
+    # Warn if only one side of the bracket was found — scan range is likely
+    # too narrow and T_melt may lie outside the tested interval.
+    if T_lo is None:
+        print(
+            f"  [melting] WARNING: {structure_id}: only upper bound found "
+            f"(T_hi={T_hi:.0f} K). T_melt may be below T_start={T_start:.0f} K. "
+            f"Consider re-running with a lower T_start."
+        )
+    if T_hi is None:
+        print(
+            f"  [melting] WARNING: {structure_id}: only lower bound found "
+            f"(T_lo={T_lo:.0f} K). T_melt may be above T_end={T_end:.0f} K. "
+            f"Consider re-running with a higher T_end."
+        )
+
     if T_lo is not None and T_hi is not None and T_lo < T_hi:
         T_melt = (T_lo + T_hi) / 2.0
+        # Actual bracket width may be larger than T_step if ambiguous temps
+        # fell in between; use half the actual bracket as the uncertainty.
+        uncertainty = (T_hi - T_lo) / 2.0
     elif T_lo is not None and T_hi is not None and T_lo == T_hi:
         T_melt = T_lo
+        uncertainty = T_step / 2.0
     elif T_lo is None:
         T_melt = T_hi
+        uncertainty = T_step / 2.0
     else:
         T_melt = T_lo
+        uncertainty = T_step / 2.0
 
-    print(f"  [melting] {structure_id}: T_melt \u2248 {T_melt:.0f} K "
-          f"(bracket [{T_lo}, {T_hi}] K)")
+    print(
+        f"  [melting] {structure_id}: T_melt \u2248 {T_melt:.0f} \u00b1 {uncertainty:.0f} K "
+        f"(bracket [{T_lo}, {T_hi}] K)"
+    )
     return MeltingResult(
         structure_id=structure_id,
         T_melt=T_melt,
+        T_melt_uncertainty=uncertainty,
         T_bracket_lo=T_lo if T_lo is not None else float("nan"),
         T_bracket_hi=T_hi if T_hi is not None else float("nan"),
         compute_ok=True,
