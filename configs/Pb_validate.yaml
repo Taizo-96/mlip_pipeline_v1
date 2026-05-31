@@ -43,10 +43,8 @@ rdf:
   n_equil: 5000
   n_prod: 20000
 
-matproj_reference:
-  mp_id: mp-20483
-
 classical_reference:
-  name: Lee2003-MEAM
+  enabled: true
+  label: Lee2003-MEAM
   pair_style: "meam"
   pair_coeff: "* * /home/saitto/mlip_pipeline_v1/reference_potentials/library.meam Pb /home/saitto/mlip_pipeline_v1/reference_potentials/Pb.meam Pb"
