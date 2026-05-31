@@ -67,6 +67,28 @@ def _safe_mpi_np(
     return max(1, cap)
 
 
+def _resolve_pair_coeff(pair_coeff: str) -> str:
+    """Resolve any relative file paths inside a pair_coeff string to absolute.
+
+    LAMMPS is always launched from a per-run subdirectory, so relative paths
+    embedded in pair_coeff (common for EAM/MEAM potential files) would fail.
+    Any token that looks like an existing file path is replaced with its
+    resolved absolute equivalent; all other tokens (wildcards, element names,
+    numbers) are left untouched.
+    """
+    tokens = pair_coeff.split()
+    resolved = []
+    for tok in tokens:
+        p = Path(tok)
+        # Only resolve tokens that are neither a wildcard nor a bare word/number
+        # and that point to an existing file on disk.
+        if not p.is_absolute() and p.suffix and p.exists():
+            resolved.append(str(p.resolve()))
+        else:
+            resolved.append(tok)
+    return " ".join(resolved)
+
+
 # ------------------------------------------------------------------ #
 # LAMMPS input builders                                                #
 # ------------------------------------------------------------------ #
@@ -79,12 +101,15 @@ def _pair_block(
     """Return pair_style + pair_coeff lines.
 
     When pair_style/pair_coeff are provided (classical reference mode),
-    they are used verbatim.  Otherwise the default MTP mlip block is used.
+    they are used verbatim — except that any relative file paths inside
+    pair_coeff are resolved to absolute so LAMMPS can find them regardless
+    of the working directory it is launched from.
+    Otherwise the default MTP mlip block is used.
     """
     if pair_style is not None and pair_coeff is not None:
         return [
             f"pair_style      {pair_style}",
-            f"pair_coeff      {pair_coeff}",
+            f"pair_coeff      {_resolve_pair_coeff(pair_coeff)}",
         ]
     return [
         f"pair_style      mlip load_from={model_path.resolve()}",
