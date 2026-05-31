@@ -4,10 +4,11 @@ Entry point:  run_validation(config, model_path, out_dir)
 
 Design principle
 ----------------
-Computation and plotting are kept strictly separate:
+Computation and reporting are kept strictly separate:
   1. All ``run_*`` calls collect result dataclasses.
   2. If a classical reference is configured, ``plot_comparison()`` produces
-     side-by-side MTP vs reference PNG files.
+     side-by-side MTP vs reference PNG files and ``write_report()`` writes
+     a Markdown report and CSV summary.
   No standalone MTP-only plots are generated.
 """
 from __future__ import annotations
@@ -27,6 +28,7 @@ from mlip_pipeline.validate.thermal_expansion import run_thermal_expansion
 from mlip_pipeline.validate.vacancy import run_vacancy
 from mlip_pipeline.validate.rdf import run_rdf
 from mlip_pipeline.validate import plots
+from mlip_pipeline.validate.report import write_report
 from mlip_pipeline.validate._cli import banner, step, ok, warn
 from mlip_pipeline.validate.classical_reference import run_classical_reference
 
@@ -131,7 +133,7 @@ def run_validation(
     vacancy_results: list[VacancyResult]          = []
     rdf_results:     list[RdfResult]              = []
 
-    # ── Computation ──────────────────────────────────────────────────────────
+    # ── Computation ─────────────────────────────────────────────────────────
     banner("Computation")
 
     # EOS
@@ -308,7 +310,7 @@ def run_validation(
             else:
                 warn("rdf", f"{sid}: failed \u2014 {res.error}")
 
-    # ── Manifest (computation results only, no standalone plots) ─────────────
+    # ── Manifest (computation results only) ────────────────────────────────
     result = ValidationResult(
         model_path=model_path,
         validate_dir=val_dir,
@@ -322,7 +324,7 @@ def run_validation(
     )
     result.save_manifest()
 
-    # ── Classical reference: compute + comparison plots ───────────────────────
+    # ── Classical reference: compute + comparison plots + report ─────────────
     plot_paths: dict[str, Path] = {}
     cl_ref_cfg = val_cfg.get("classical_reference", {})
     if cl_ref_cfg.get("enabled", False):
@@ -343,10 +345,16 @@ def run_validation(
                 mpi_np=mpi_np,
                 cutoff=cutoff,
             )
+
             banner(f"Comparison plots (MTP vs {ref_label})")
             plot_paths = plots.plot_comparison(result, ref_result, val_dir)
             for k, p in plot_paths.items():
                 ok("compare", f"{k} \u2192 {p.name}")
+
+            banner("Summary report")
+            md_path, csv_path = write_report(result, ref_result, val_dir)
+            ok("report", f"Markdown \u2192 {md_path.name}")
+            ok("report", f"CSV      \u2192 {csv_path.name}")
         else:
             warn("compare", "classical_reference enabled but pair_style/pair_coeff missing")
 
