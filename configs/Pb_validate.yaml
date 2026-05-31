@@ -3,7 +3,7 @@
 element: Pb
 
 lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
-classical_lammps_cmd: /home/saitto/lammps/src/lmp_mpi
+classical_lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
 mpi_command: mpirun
 mpi_np: 4
 
