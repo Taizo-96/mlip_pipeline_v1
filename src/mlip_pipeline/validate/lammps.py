@@ -264,6 +264,18 @@ def write_melting_input(
       it allows the cell volume to relax, removing the artificial pressure
       build-up that NVT would introduce as one phase grows into the other.
       Velocities are carried forward from Stage 2 (no velocity reset).
+
+    Group partitioning
+    ------------------
+    The solid (lo-z) and liquid (hi-z) halves are defined with open-face
+    regions so that every atom belongs to exactly one group:
+
+      solid_region : open 6  (z-hi face is open/exclusive)
+      liquid_region: open 5  (z-lo face is open/exclusive)
+
+    This guarantees no atom is double-counted regardless of its z position,
+    eliminating the "time integrated more than once" crash that would occur
+    with the default closed regions where atoms at z=zmid fall into both.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -298,10 +310,15 @@ def write_melting_input(
         "",
         "minimize        1e-8 1e-10 5000 50000",
         "",
+        "# ----------------------------------------------------------------",
         "# Split into solid (lo-z) and liquid (hi-z) halves.",
+        "# open 6 = z-hi face exclusive on solid_region",
+        "# open 5 = z-lo face exclusive on liquid_region",
+        "# Together these guarantee every atom belongs to exactly one group.",
+        "# ----------------------------------------------------------------",
         "variable        zmid   equal (zlo+zhi)/2.0",
-        "region          solid_region  block INF INF INF INF INF ${zmid} units box",
-        "region          liquid_region block INF INF INF INF ${zmid} INF units box",
+        "region          solid_region  block INF INF INF INF INF ${zmid} units box open 6",
+        "region          liquid_region block INF INF INF INF ${zmid} INF  units box open 5",
         "group           solid_atoms   region solid_region",
         "group           liquid_atoms  region liquid_region",
         "",
