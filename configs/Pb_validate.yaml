@@ -20,9 +20,9 @@ elastic:
   delta: 0.005
 
 melting:
-  T_start: 590
-  T_end: 610
-  T_step: 10
+  T_start: 585
+  T_end: 615
+  T_step: 5
   supercell_repeat: 5
   n_equil: 5000
   n_prod: 20000
@@ -43,8 +43,13 @@ rdf:
   n_equil: 5000
   n_prod: 20000
 
-classical_reference:
-  enabled: true
-  label: Lee2003-MEAM
-  pair_style: "meam"
-  pair_coeff: "* * /home/saitto/mlip_pipeline_v1/reference_potentials/library.meam Pb /home/saitto/mlip_pipeline_v1/reference_potentials/Pb.meam Pb"
+classical_references:
+  - label: Lee2003-MEAM
+    enabled: true
+    pair_style: "meam"
+    pair_coeff: "* * /home/saitto/mlip_pipeline_v1/reference_potentials/library.meam Pb /home/saitto/mlip_pipeline_v1/reference_potentials/Pb.meam Pb"
+
+  - label: Zhou2004-EAM
+    enabled: true
+    pair_style: "eam/alloy"
+    pair_coeff: "* * reference_potentials/Pb_Zhou04.eam.alloy Pb"
