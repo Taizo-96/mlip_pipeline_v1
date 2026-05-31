@@ -1,24 +1,45 @@
-"""Melting temperature estimation via two-phase coexistence.
+"""Melting temperature estimation via two-phase coexistence (TPC).
 
 Physics
 -------
-A supercell is split into solid (bottom half) and liquid (top half) by z.
-The liquid seed is created by briefly heating that half to min(1.3*T, T+300) K
-in NVT at a reduced timestep, while the solid half is held at T_target.
-The full cell is then run in NPH (constant enthalpy/pressure) at P=0.
+A supercell is split into solid (bottom half, z < zmid) and liquid
+(top half, z > zmid) by assembling two independently equilibrated
+single-phase snapshots.  The combined cell is then run in NPH
+(constant enthalpy / pressure) at P = 0.
 
-The potential energy time series reveals which phase is stable at T_target
-under NPH (constant pressure — the physically correct ensemble for TPC):
+The potential energy time series reveals which phase is stable at
+T_target under NPH (the physically correct ensemble for TPC):
   - PE increasing  ->  liquid growing  ->  T > T_melt
   - PE decreasing  ->  solid growing   ->  T < T_melt
   - PE flat        ->  ambiguous; scan continues
 
-Trend classification uses a two-sample Welch t-test comparing the first
-and last quartile of the PE series, which is more robust than a simple
-linear slope threshold.
+Trend classification uses a two-sample Welch t-test comparing the
+first and last quartile of the PE series.
 
 A linear bracket scan across candidate temperatures locates T_melt
-to within `T_step` K; the reported uncertainty is ±T_step/2.
+to within T_step K; the reported uncertainty is ±T_step/2.
+
+Preparation protocol (splice approach)
+---------------------------------------
+All three LAMMPS scripts run only ONE thermostat on ALL atoms at a
+time — there are no region/group commands in any of them.  This
+entirely avoids the MPI ghost-atom double-integration failure that
+affects all dual-thermostat approaches with 4+ MPI ranks.
+
+  Step 1 — solid_eq.in:
+    Whole supercell NVT at T_target.  Final snapshot -> solid_final.dump.
+
+  Step 2 — liquid_eq.in:
+    Whole supercell NVT/heat to T_dis = min(1.3*T, T+300).  Equilibrate
+    as liquid.  Final snapshot -> liquid_final.dump.
+
+  Step 3 — Python splice (splice_tpc_cell):
+    Read both dumps.  lo-z atoms from solid dump, hi-z atoms from
+    liquid dump -> tpc_start.lammps.
+
+  Step 4 — coex.in:
+    Read tpc_start.lammps.  NVT interface relax (Stage A), then NPH
+    production (Stage B).  No groups.  Velocities inherited.
 """
 from __future__ import annotations
 
@@ -27,7 +48,13 @@ from pathlib import Path
 from typing import Optional
 
 from mlip_pipeline.validate.models import MeltingResult
-from mlip_pipeline.validate.lammps import write_melting_input, run_lammps
+from mlip_pipeline.validate.lammps import (
+    write_solid_eq_input,
+    write_liquid_eq_input,
+    splice_tpc_cell,
+    write_coex_input,
+    run_lammps,
+)
 from mlip_pipeline.utils.fs import ensure_dir
 
 
@@ -55,9 +82,7 @@ def _classify_pe_trend(thermo_file: Path) -> str:
 
     Uses a two-sample Welch t-test comparing the first quartile (early
     production) vs the last quartile (late production) of the PE series.
-    A |t| >= 2.0 threshold (roughly p < 0.05 for n >= 30) avoids the
-    arbitrary relative-slope magic number and gives a statistically
-    grounded classification.
+    |t| >= 2.0 threshold (roughly p < 0.05 for n >= 30 per group).
     """
     pes: list[float] = []
     try:
@@ -82,15 +107,122 @@ def _classify_pe_trend(thermo_file: Path) -> str:
     first_q = pes[:q]
     last_q  = pes[n - q:]
 
-    # t > 0 means PE increased => liquid growing => T > T_melt
     t_stat = _welch_t_statistic(first_q, last_q)
 
-    T_THRESHOLD = 2.0  # |t| >= 2 ~ p < 0.05
+    T_THRESHOLD = 2.0
     if t_stat > T_THRESHOLD:
         return "growing_liquid"
     elif t_stat < -T_THRESHOLD:
         return "growing_solid"
     return "ambiguous"
+
+
+# ------------------------------------------------------------------ #
+# Single-temperature TPC run                                           #
+# ------------------------------------------------------------------ #
+
+def _run_tpc_temperature(
+    T_cand: float,
+    T_dir: Path,
+    lammps_data: Path,
+    model_path: Path,
+    *,
+    supercell_repeat: int,
+    dt: float,
+    n_equil: int,
+    n_prod: int,
+    lammps_cmd: str,
+    mpi_command: Optional[str],
+    mpi_np: Optional[int],
+    cutoff: Optional[float],
+    pair_style: Optional[str],
+    pair_coeff: Optional[str],
+) -> str:
+    """Run the full splice TPC protocol for one temperature.
+
+    Returns the PE trend string: 'growing_liquid', 'growing_solid',
+    'ambiguous', or 'error'.
+    """
+    run_kw = dict(
+        lammps_cmd=lammps_cmd,
+        mpi_command=mpi_command,
+        mpi_np=mpi_np,
+        log_file=None,
+        lammps_data=lammps_data,
+        cutoff=cutoff,
+        supercell_repeat=supercell_repeat,
+    )
+
+    # -------------------------------------------------------------- #
+    # Step 1: equilibrate solid                                        #
+    # -------------------------------------------------------------- #
+    solid_script = write_solid_eq_input(
+        lammps_data, model_path, T_dir,
+        temperature=T_cand,
+        supercell_repeat=supercell_repeat,
+        dt=dt,
+        n_equil=n_equil,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
+    )
+    try:
+        run_lammps(solid_script, T_dir,
+                   log_file=T_dir / "solid_eq.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+    except RuntimeError as exc:
+        print(f"  [melting] WARNING: solid_eq failed at T={T_cand}: {exc}")
+        return "error"
+
+    # -------------------------------------------------------------- #
+    # Step 2: equilibrate liquid                                       #
+    # -------------------------------------------------------------- #
+    liquid_script = write_liquid_eq_input(
+        lammps_data, model_path, T_dir,
+        temperature=T_cand,
+        supercell_repeat=supercell_repeat,
+        dt=dt,
+        n_equil=n_equil,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
+    )
+    try:
+        run_lammps(liquid_script, T_dir,
+                   log_file=T_dir / "liquid_eq.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+    except RuntimeError as exc:
+        print(f"  [melting] WARNING: liquid_eq failed at T={T_cand}: {exc}")
+        return "error"
+
+    # -------------------------------------------------------------- #
+    # Step 3: Python splice                                            #
+    # -------------------------------------------------------------- #
+    solid_dump  = T_dir / "solid_final.dump"
+    liquid_dump = T_dir / "liquid_final.dump"
+    tpc_data    = T_dir / "tpc_start.lammps"
+    try:
+        splice_tpc_cell(solid_dump, liquid_dump, tpc_data)
+    except Exception as exc:
+        print(f"  [melting] WARNING: splice failed at T={T_cand}: {exc}")
+        return "error"
+
+    # -------------------------------------------------------------- #
+    # Step 4: coexistence run                                          #
+    # -------------------------------------------------------------- #
+    coex_script = write_coex_input(
+        tpc_data, model_path, T_dir,
+        temperature=T_cand,
+        dt=dt,
+        n_equil=n_equil,
+        n_prod=n_prod,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
+    )
+    try:
+        run_lammps(coex_script, T_dir,
+                   log_file=T_dir / "coex.log", **{k: v for k, v in run_kw.items() if k != 'log_file'})
+    except RuntimeError as exc:
+        print(f"  [melting] WARNING: coex failed at T={T_cand}: {exc}")
+        return "error"
+
+    return _classify_pe_trend(T_dir / "coex_thermo.txt")
 
 
 # ------------------------------------------------------------------ #
@@ -120,17 +252,20 @@ def run_melting(
 ) -> MeltingResult:
     """Bracket T_melt by scanning temperatures and classifying PE trend.
 
+    Each temperature uses the splice TPC protocol:
+      solid_eq -> liquid_eq -> Python splice -> coex (NVT + NPH).
+    No LAMMPS region/group commands are used at any point.
+
     The reported T_melt is the midpoint of the bracket [T_lo, T_hi].
     The inherent resolution is ±T_step/2 K, stored as T_melt_uncertainty
     in the result.  One-sided brackets (scan range too narrow) produce
-    a warning and still return the best available bound, but with a
-    NaN on the missing side so callers can detect the issue.
+    a warning and still return the best available bound.
     """
     work_dir = ensure_dir(validate_dir / "melting" / structure_id)
     print(f"  [melting] {structure_id}: scanning T = {T_start:.0f}..{T_end:.0f} K "
-          f"in steps of {T_step:.0f} K ...")
+          f"in steps of {T_step:.0f} K (splice protocol) ...")
 
-    candidates = []
+    candidates: list[float] = []
     T = T_start
     while T <= T_end + 1e-3:
         candidates.append(round(T, 1))
@@ -142,35 +277,20 @@ def run_melting(
 
     for T_cand in candidates:
         T_dir = ensure_dir(work_dir / f"T{T_cand:.0f}")
-        script = write_melting_input(
-            lammps_data, model_path, T_dir,
-            temperature=T_cand,
-            n_solid=supercell_repeat,
-            n_liquid=supercell_repeat,
+        trend = _run_tpc_temperature(
+            T_cand, T_dir,
+            lammps_data, model_path,
             supercell_repeat=supercell_repeat,
             dt=dt,
             n_equil=n_equil,
             n_prod=n_prod,
+            lammps_cmd=lammps_cmd,
+            mpi_command=mpi_command,
+            mpi_np=mpi_np,
+            cutoff=cutoff,
             pair_style=pair_style,
             pair_coeff=pair_coeff,
         )
-        try:
-            run_lammps(
-                script, T_dir,
-                lammps_cmd=lammps_cmd,
-                mpi_command=mpi_command,
-                mpi_np=mpi_np,
-                log_file=T_dir / "lammps.log",
-                lammps_data=lammps_data,
-                cutoff=cutoff,
-            )
-        except RuntimeError as exc:
-            print(f"  [melting] WARNING: LAMMPS failed at T={T_cand}: {exc}")
-            trend_map[T_cand] = "error"
-            continue
-
-        thermo_file = T_dir / "coex_thermo.txt"
-        trend = _classify_pe_trend(thermo_file)
         trend_map[T_cand] = trend
         print(f"  [melting]   T={T_cand:.0f} K -> {trend}")
 
@@ -187,8 +307,6 @@ def run_melting(
         print(f"  [melting] WARNING: {structure_id}: {msg}")
         return MeltingResult(structure_id=structure_id, error=msg)
 
-    # Warn if only one side of the bracket was found — scan range is likely
-    # too narrow and T_melt may lie outside the tested interval.
     if T_lo is None:
         print(
             f"  [melting] WARNING: {structure_id}: only upper bound found "
@@ -204,8 +322,6 @@ def run_melting(
 
     if T_lo is not None and T_hi is not None and T_lo < T_hi:
         T_melt = (T_lo + T_hi) / 2.0
-        # Actual bracket width may be larger than T_step if ambiguous temps
-        # fell in between; use half the actual bracket as the uncertainty.
         uncertainty = (T_hi - T_lo) / 2.0
     elif T_lo is not None and T_hi is not None and T_lo == T_hi:
         T_melt = T_lo

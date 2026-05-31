@@ -48,7 +48,6 @@ def _safe_mpi_np(
     cutoff: Optional[float] = None,
     supercell_repeat: int = 1,
 ) -> int:
-    """Return safe MPI rank count, accounting for supercell replication."""
     if requested is None or requested <= 1:
         return requested if requested is not None else 1
     cap = requested
@@ -68,14 +67,6 @@ def _safe_mpi_np(
 
 
 def _resolve_pair_coeff(pair_coeff: str) -> str:
-    """Resolve any relative file paths inside a pair_coeff string to absolute.
-
-    LAMMPS is always launched from a per-run subdirectory, so relative paths
-    embedded in pair_coeff (common for EAM/MEAM potential files) would fail.
-    Any token that looks like an existing file path is replaced with its
-    resolved absolute equivalent; all other tokens (wildcards, element names,
-    numbers) are left untouched.
-    """
     tokens = pair_coeff.split()
     resolved = []
     for tok in tokens:
@@ -87,16 +78,11 @@ def _resolve_pair_coeff(pair_coeff: str) -> str:
     return " ".join(resolved)
 
 
-# ------------------------------------------------------------------ #
-# LAMMPS input builders                                                #
-# ------------------------------------------------------------------ #
-
 def _pair_block(
     model_path: Path,
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> list[str]:
-    """Return pair_style + pair_coeff lines."""
     if pair_style is not None and pair_coeff is not None:
         return [
             f"pair_style      {pair_style}",
@@ -107,6 +93,350 @@ def _pair_block(
         "pair_coeff      * *",
     ]
 
+
+# ------------------------------------------------------------------ #
+# TPC preparation scripts                                              #
+# ------------------------------------------------------------------ #
+
+def write_solid_eq_input(
+    lammps_data: Path,
+    model_path: Path,
+    work_dir: Path,
+    *,
+    temperature: float,
+    supercell_repeat: int = 5,
+    dt: float = 0.002,
+    n_equil: int = 5000,
+    seed: int = 12345,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
+) -> Path:
+    """Equilibrate the whole supercell as solid at T_target.
+
+    Dumps the final snapshot to solid_final.dump.
+    No groups, no regions — one NVT thermostat on all atoms.
+    """
+    abs_data  = Path(lammps_data).resolve()
+    abs_model = Path(model_path).resolve()
+    dump_out  = (work_dir / "solid_final.dump").resolve()
+    script_path = work_dir / "solid_eq.in"
+
+    tdamp = round(100 * dt, 6)
+
+    lines = [
+        "units           metal",
+        "atom_style      atomic",
+        "boundary        p p p",
+        "",
+        f"read_data       {abs_data}",
+        f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat * 2}",
+        "",
+    ] + _pair_block(abs_model, pair_style, pair_coeff) + [
+        "",
+        "neigh_modify    one 4000 page 100000",
+        "",
+        "minimize        1e-8 1e-10 5000 50000",
+        "",
+        f"timestep        {dt}",
+        "thermo          500",
+        "thermo_modify   flush yes",
+        "",
+        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
+        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
+        f"run             {n_equil}",
+        "unfix           fxNVT",
+        "",
+        f"write_dump      all custom {dump_out} id type x y z modify sort id",
+    ]
+    script_path.write_text("\n".join(lines) + "\n")
+    return script_path
+
+
+def write_liquid_eq_input(
+    lammps_data: Path,
+    model_path: Path,
+    work_dir: Path,
+    *,
+    temperature: float,
+    supercell_repeat: int = 5,
+    dt: float = 0.002,
+    dt_heat: Optional[float] = None,
+    n_equil: int = 5000,
+    seed: int = 54321,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
+) -> Path:
+    """Melt the whole supercell to T_dis and equilibrate as liquid.
+
+    T_dis = min(1.3 * T_target, T_target + 300).
+    Heats gradually from T_target to T_dis with a reduced timestep,
+    then equilibrates.  Dumps the final snapshot to liquid_final.dump.
+    No groups, no regions.
+    """
+    abs_data  = Path(lammps_data).resolve()
+    abs_model = Path(model_path).resolve()
+    dump_out  = (work_dir / "liquid_final.dump").resolve()
+    script_path = work_dir / "liquid_eq.in"
+
+    T_dis   = min(1.3 * temperature, temperature + 300.0)
+    _dt_heat = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
+    tdamp   = round(100 * dt, 6)
+    n_heat  = max(2000, n_equil // 2)
+
+    lines = [
+        "units           metal",
+        "atom_style      atomic",
+        "boundary        p p p",
+        "",
+        f"read_data       {abs_data}",
+        f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat * 2}",
+        "",
+    ] + _pair_block(abs_model, pair_style, pair_coeff) + [
+        "",
+        "neigh_modify    one 4000 page 100000",
+        "",
+        "minimize        1e-8 1e-10 5000 50000",
+        "",
+        f"timestep        {_dt_heat}",
+        "thermo          500",
+        "thermo_modify   flush yes",
+        "",
+        f"# Heat gradually from T_target={temperature:.1f} K to T_dis={T_dis:.1f} K",
+        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
+        f"fix             fxHeat all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
+        f"run             {n_heat}",
+        "unfix           fxHeat",
+        "",
+        f"# Equilibrate at T_dis",
+        f"fix             fxLiq all nvt temp {T_dis:.1f} {T_dis:.1f} {tdamp}",
+        f"run             {n_equil}",
+        "unfix           fxLiq",
+        "",
+        f"write_dump      all custom {dump_out} id type x y z modify sort id",
+    ]
+    script_path.write_text("\n".join(lines) + "\n")
+    return script_path
+
+
+def splice_tpc_cell(
+    solid_dump: Path,
+    liquid_dump: Path,
+    out_data: Path,
+    atom_type: int = 1,
+) -> None:
+    """Assemble a two-phase cell from two single-phase LAMMPS dump files.
+
+    Takes the lo-z half of *solid_dump* and the hi-z half of *liquid_dump*
+    and writes a combined LAMMPS data file to *out_data*.
+
+    Both dumps must have the same box dimensions and atom count (guaranteed
+    when generated by write_solid_eq_input / write_liquid_eq_input with
+    identical supercell_repeat and lammps_data arguments).
+
+    The split plane is z = (zlo + zhi) / 2.  Atoms exactly on the plane go
+    to the solid half (consistent with the ``open 6`` convention).
+    """
+    def _read_dump(path: Path) -> tuple[dict, list[tuple[float, float, float]]]:
+        """Return (box_bounds, [(x, y, z), ...]) sorted by atom id."""
+        box: dict[str, tuple[float, float]] = {}
+        atoms: list[tuple[int, float, float, float]] = []
+        with path.open() as fh:
+            lines = fh.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line == "ITEM: BOX BOUNDS pp pp pp":
+                for key in ("x", "y", "z"):
+                    lo, hi = map(float, lines[i + 1].split())
+                    box[key] = (lo, hi)
+                    i += 1
+            elif line.startswith("ITEM: ATOMS"):
+                i += 1
+                while i < len(lines) and not lines[i].startswith("ITEM:"):
+                    parts = lines[i].split()
+                    # columns: id type x y z
+                    atoms.append((int(parts[0]), float(parts[2]),
+                                  float(parts[3]), float(parts[4])))
+                    i += 1
+                continue
+            i += 1
+        atoms.sort(key=lambda a: a[0])
+        coords = [(x, y, z) for _, x, y, z in atoms]
+        return box, coords
+
+    box_s, solid_coords  = _read_dump(solid_dump)
+    box_l, liquid_coords = _read_dump(liquid_dump)
+
+    if len(solid_coords) != len(liquid_coords):
+        raise ValueError(
+            f"splice_tpc_cell: atom count mismatch "
+            f"({len(solid_coords)} solid vs {len(liquid_coords)} liquid). "
+            f"Both equilibration runs must use identical supercell_repeat."
+        )
+
+    # Use solid box (both should be identical; solid is the reference)
+    xlo, xhi = box_s["x"]
+    ylo, yhi = box_s["y"]
+    zlo, zhi = box_s["z"]
+    zmid = (zlo + zhi) / 2.0
+
+    combined: list[tuple[float, float, float]] = []
+    for (sx, sy, sz), (lx, ly, lz) in zip(solid_coords, liquid_coords):
+        if sz <= zmid:
+            combined.append((sx, sy, sz))
+        else:
+            combined.append((lx, ly, lz))
+
+    n_atoms = len(combined)
+    lines = [
+        "LAMMPS data file — TPC splice\n",
+        f"{n_atoms} atoms",
+        "",
+        "1 atom types",
+        "",
+        f"{xlo:.6f} {xhi:.6f} xlo xhi",
+        f"{ylo:.6f} {yhi:.6f} ylo yhi",
+        f"{zlo:.6f} {zhi:.6f} zlo zhi",
+        "",
+        "Masses",
+        "",
+        f"{atom_type} 1.0",  # mass placeholder; LAMMPS pair_coeff sets real masses
+        "",
+        "Atoms  # atomic",
+        "",
+    ]
+    for i, (x, y, z) in enumerate(combined, start=1):
+        lines.append(f"{i} {atom_type} {x:.6f} {y:.6f} {z:.6f}")
+
+    out_data.write_text("\n".join(lines) + "\n")
+
+
+def write_coex_input(
+    tpc_data: Path,
+    model_path: Path,
+    work_dir: Path,
+    *,
+    temperature: float,
+    dt: float = 0.002,
+    n_equil: int = 5000,
+    n_prod: int = 20000,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
+) -> Path:
+    """Write the interface equilibration + NPH production script.
+
+    Reads the pre-assembled TPC data file *tpc_data*.
+
+    Stage A — NVT at T_target: relaxes the solid/liquid interface.
+               No groups.  Single thermostat on all atoms.
+    Stage B — NPH iso 0 0 pdamp: production run.
+               Correct ensemble for TPC — constant pressure allows
+               the cell volume to relax as one phase grows/shrinks.
+               Velocities inherited from Stage A.
+    """
+    abs_data  = Path(tpc_data).resolve()
+    abs_model = Path(model_path).resolve()
+    thermo_out = (work_dir / "coex_thermo.txt").resolve()
+    natom_out  = (work_dir / "atom_count.txt").resolve()
+    script_path = work_dir / "coex.in"
+
+    tdamp = round(100 * dt, 6)
+    pdamp = round(1000 * dt, 6)
+
+    lines = [
+        "units           metal",
+        "atom_style      atomic",
+        "boundary        p p p",
+        "",
+        f"read_data       {abs_data}",
+        "",
+    ] + _pair_block(abs_model, pair_style, pair_coeff) + [
+        "",
+        "neigh_modify    one 4000 page 100000",
+        "",
+        f"timestep        {dt}",
+        "thermo          500",
+        "thermo_modify   flush yes lost warn",
+        "",
+        "# ----------------------------------------------------------------",
+        f"# Stage A: NVT interface relaxation at T = {temperature:.1f} K.",
+        "#          No groups. Single thermostat on all atoms.",
+        "# ----------------------------------------------------------------",
+        f"velocity        all create {temperature:.1f} 99999 dist gaussian",
+        f"fix             fxEQ all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
+        f"run             {n_equil}",
+        "unfix           fxEQ",
+        "",
+        "reset_atoms     id",
+        "",
+        "# ----------------------------------------------------------------",
+        f"# Stage B: NPH production at P = 0 bar.",
+        "#          NPH is the correct ensemble for TPC: constant pressure",
+        "#          lets the cell relax as one phase grows into the other.",
+        "#          Velocities are inherited from Stage A (no reset).",
+        "# ----------------------------------------------------------------",
+        "thermo_style    custom step temp vol pe atoms",
+        "thermo          50",
+        "thermo_modify   flush yes lost warn",
+        "",
+        f"fix             fxNPH all nph iso 0.0 0.0 {pdamp}",
+        f"print           \"# step temp vol pe\" file {thermo_out} screen no",
+        f"fix             fxPrint all print 50 "
+        f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
+        "",
+        f"run             {n_prod}",
+        "unfix           fxNPH",
+        "unfix           fxPrint",
+        "",
+        f"print           \"$(atoms)\" file {natom_out} screen no",
+    ]
+    script_path.write_text("\n".join(lines) + "\n")
+    return script_path
+
+
+# ------------------------------------------------------------------ #
+# Legacy single-script entry point (kept for non-melting callers)     #
+# ------------------------------------------------------------------ #
+
+def write_melting_input(
+    lammps_data: Path,
+    model_path: Path,
+    work_dir: Path,
+    *,
+    temperature: float,
+    n_solid: int,
+    n_liquid: int,
+    supercell_repeat: int = 5,
+    dt: float = 0.002,
+    n_equil: int = 5000,
+    n_prod: int = 20000,
+    seed: int = 12345,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
+) -> Path:
+    """Deprecated single-script TPC writer.
+
+    Retained for backward compatibility.  New code should call
+    write_solid_eq_input / write_liquid_eq_input / splice_tpc_cell /
+    write_coex_input directly (or use run_melting() which does so).
+    """
+    # Delegate to the new coex writer using a pre-assembled data file if
+    # it already exists, otherwise just write the coex script stub.
+    tpc_data = work_dir / "tpc_start.lammps"
+    return write_coex_input(
+        tpc_data, model_path, work_dir,
+        temperature=temperature,
+        dt=dt,
+        n_equil=n_equil,
+        n_prod=n_prod,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
+    )
+
+
+# ------------------------------------------------------------------ #
+# Other input writers (unchanged)                                      #
+# ------------------------------------------------------------------ #
 
 def write_eos_input(
     lammps_data: Path, model_path: Path, out_file: Path,
@@ -222,163 +552,6 @@ def write_elastic_input(
             f"change_box      all {undo_s}",
             "",
         ]
-    script_path.write_text("\n".join(lines) + "\n")
-    return script_path
-
-
-def write_melting_input(
-    lammps_data: Path,
-    model_path: Path,
-    work_dir: Path,
-    *,
-    temperature: float,
-    n_solid: int,
-    n_liquid: int,
-    supercell_repeat: int = 5,
-    dt: float = 0.002,
-    n_equil: int = 5000,
-    n_prod: int = 20000,
-    seed: int = 12345,
-    pair_style: Optional[str] = None,
-    pair_coeff: Optional[str] = None,
-) -> Path:
-    """Write a two-phase coexistence LAMMPS input script.
-
-    Protocol
-    --------
-    Stage 1 — Heat whole cell to T_dis (NVT, no groups).
-        The entire supercell is heated gradually from T_target to T_dis.
-        No groups, no freezing.  Both halves heat together so the MTP
-        never encounters extreme out-of-domain configurations.
-        Reduced timestep dt/5 used for stability during rapid heating.
-
-    Stage 2 — Freeze solid half, quench liquid to T_target (NVT).
-        fix setforce 0 0 0 is applied to the solid (lo-z) group, which
-        zeroes forces on those atoms so they cannot move.  A single NVT
-        on ALL atoms quenches the liquid half from T_dis back to T_target
-        while it stays disordered.  Only ONE fix integrates equations of
-        motion at any time — no double-integration, no ghost-atom issues.
-
-    Stage 3 — Full-cell equilibration at T_target (NVT, no groups).
-        setforce is removed; all atoms are free.  NVT at T_target lets
-        the solid/liquid interface form and settle.
-
-    Stage 4 — Production NPH (iso, P=0).
-        NPH is the physically correct ensemble for TPC: constant pressure
-        allows the cell volume to relax as one phase grows into the other.
-        Velocities are inherited from Stage 3 (no velocity reset).
-
-    Why not dual-NVT?
-    -----------------
-    With 4 MPI ranks decomposed along z, the split plane at z=zmid lands
-    on an MPI domain boundary.  Ghost atoms straddling that boundary are
-    assigned to BOTH solid_atoms and liquid_atoms regardless of the
-    ``open 5/6`` region flags.  Two competing fix nvt commands then
-    integrate every atom twice.  MEAM survives; MTP diverges.
-
-    Why not setforce-from-cold?
-    ---------------------------
-    Freezing the solid from the very start (previous attempt) dumps all
-    kinetic energy into the liquid 500 atoms only.  The effective liquid
-    temperature is ~2x the thermostat target (thermostat counts all 1000
-    atoms but only 500 move).  MTP diverges within 500 steps because the
-    liquid atoms enter out-of-domain configurations immediately.
-    """
-    abs_data  = Path(lammps_data).resolve()
-    abs_model = Path(model_path).resolve()
-    thermo_out  = (work_dir / "coex_thermo.txt").resolve()
-    natom_out   = (work_dir / "atom_count.txt").resolve()
-    script_path = work_dir / "melting.in"
-
-    dt_heat = round(dt / 5.0, 6)
-    T_dis   = min(1.3 * temperature, temperature + 300.0)
-    n_dis   = max(2000, n_equil)
-    n_eq    = max(1000, n_equil // 2)
-    tdamp   = round(100 * dt, 6)
-    pdamp   = round(1000 * dt, 6)
-
-    pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
-
-    lines = [
-        "units           metal",
-        "atom_style      atomic",
-        "boundary        p p p",
-        "",
-        f"read_data       {abs_data}",
-        f"replicate       {supercell_repeat} {supercell_repeat} {supercell_repeat * 2}",
-        "",
-    ] + pair_lines + [
-        "",
-        "neigh_modify    one 4000 page 100000",
-        "",
-        "minimize        1e-8 1e-10 5000 50000",
-        "",
-        f"timestep        {dt_heat}",
-        "thermo_modify   flush yes lost warn",
-        "thermo          500",
-        "",
-        "# ----------------------------------------------------------------",
-        f"# Stage 1: Heat entire cell to {T_dis:.1f} K (= min(1.3*T, T+300)).",
-        f"#          No groups — both halves heat together so MTP never",
-        f"#          encounters extreme out-of-domain configurations.",
-        f"#          Reduced timestep {dt_heat} ps for stability.",
-        "# ----------------------------------------------------------------",
-        f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxHeat all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
-        f"run             {n_dis}",
-        "unfix           fxHeat",
-        "",
-        "# ----------------------------------------------------------------",
-        "# Stage 2: Freeze solid (lo-z) half; quench liquid to T_target.",
-        "#   setforce 0 0 0 zeroes forces on solid atoms every step so",
-        "#   they cannot move.  A single NVT on all atoms quenches the",
-        "#   liquid (which is already disordered) back to T_target.",
-        "#   Only ONE integrator runs — no double-integration.",
-        "# ----------------------------------------------------------------",
-        "variable        zmid equal (zlo+zhi)/2.0",
-        "region          solid_region block INF INF INF INF INF ${zmid} units box open 6",
-        "group           solid_atoms  region solid_region",
-        "",
-        "fix             fxFreeze solid_atoms setforce 0.0 0.0 0.0",
-        f"fix             fxQuench all nvt temp {T_dis:.1f} {temperature:.1f} {tdamp}",
-        f"run             {n_eq}",
-        "unfix           fxFreeze",
-        "unfix           fxQuench",
-        "",
-        "# ----------------------------------------------------------------",
-        f"# Stage 3: Full-cell equilibration at T = {temperature:.1f} K.",
-        f"#          All atoms free; interface forms and settles.",
-        f"#          Switch to production timestep {dt} ps.",
-        "# ----------------------------------------------------------------",
-        f"timestep        {dt}",
-        f"fix             fxEQ all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
-        f"run             {n_eq}",
-        "unfix           fxEQ",
-        "",
-        "reset_atoms     id",
-        "",
-        "# ----------------------------------------------------------------",
-        "# Stage 4: Production NPH (iso, P=0).  Correct ensemble for TPC:",
-        "#          constant pressure allows the cell to adjust as one phase",
-        "#          grows into the other, avoiding artificial pressure buildup.",
-        "#          Velocities are inherited from Stage 3 (no velocity reset).",
-        "# ----------------------------------------------------------------",
-        f"timestep        {dt}",
-        "thermo_style    custom step temp vol pe atoms",
-        "thermo          50",
-        "thermo_modify   flush yes lost warn",
-        "",
-        f"fix             fxNPH all nph iso 0.0 0.0 {pdamp}",
-        f"print           \"# step temp vol pe\" file {thermo_out} screen no",
-        f"fix             fxPrint all print 50 "
-        f"\"$(step) $(temp) $(vol) $(pe)\" append {thermo_out} screen no",
-        "",
-        f"run             {n_prod}",
-        "unfix           fxNPH",
-        "unfix           fxPrint",
-        "",
-        f"print           \"$(atoms)\" file {natom_out} screen no",
-    ]
     script_path.write_text("\n".join(lines) + "\n")
     return script_path
 
