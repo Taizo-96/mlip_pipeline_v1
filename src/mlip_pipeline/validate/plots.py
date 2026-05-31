@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from mlip_pipeline.validate.classical_reference import ClassicalReferenceResult
 
 
-# ── Colour palette ────────────────────────────────────────────────────────────
+# ── Colour palette ─────────────────────────────────────────────────────
 _MTP_COLOR = "#2c7bb6"
 _REF_COLOR = "#d7191c"
 
@@ -42,7 +42,30 @@ def _require_numpy():
         raise ImportError("numpy is required for validation plots") from exc
 
 
-# ── MTP vs classical reference comparison plots ───────────────────────────────
+def _thexp_fit_line(
+    r: ThermalExpansionResult,
+) -> tuple[list[float], list[float]] | None:
+    """Return (Ts, Vs) for a linear fit line spanning the MD temperature range.
+
+    Reproduces the same polyfit that thermal_expansion.py uses, so V_ref is
+    derived on-the-fly rather than stored on the dataclass.
+    Returns None if the data or fit is unusable.
+    """
+    if not r.temperatures or not r.volumes or not math.isfinite(r.alpha):
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    Ts_arr = np.array(r.temperatures)
+    Vs_arr = np.array(r.volumes)
+    coeffs = np.polyfit(Ts_arr, Vs_arr, 1)
+    T_span = [float(Ts_arr.min()), float(Ts_arr.max())]
+    Vs_fit = [float(np.polyval(coeffs, T)) for T in T_span]
+    return T_span, Vs_fit
+
+
+# ── MTP vs classical reference comparison plots ─────────────────────────────
 
 def _cmp_eos(
     mtp_result: ValidationResult,
@@ -245,22 +268,18 @@ def _cmp_thermal_expansion(
 
         ax.scatter(mtp_r.temperatures, mtp_r.volumes,
                    s=25, color=_MTP_COLOR, zorder=3)
-        if math.isfinite(mtp_r.alpha) and math.isfinite(mtp_r.V_ref):
-            Ts = [min(mtp_r.temperatures), max(mtp_r.temperatures)]
-            Vs = [mtp_r.V_ref + 3 * mtp_r.alpha * mtp_r.V_ref * (T - mtp_r.T_ref)
-                  for T in Ts]
-            ax.plot(Ts, Vs, color=_MTP_COLOR, lw=1.8,
+        mtp_fit = _thexp_fit_line(mtp_r)
+        if mtp_fit is not None:
+            ax.plot(*mtp_fit, color=_MTP_COLOR, lw=1.8,
                     label=f"MTP  \u03b1={mtp_r.alpha*1e6:.1f}\u00d710\u207b\u2076 K\u207b\u00b9")
         else:
             ax.plot([], [], color=_MTP_COLOR, label="MTP")
 
         ax.scatter(ref_r.temperatures, ref_r.volumes,
                    s=25, color=_REF_COLOR, zorder=3, marker="^")
-        if math.isfinite(ref_r.alpha) and math.isfinite(ref_r.V_ref):
-            Ts = [min(ref_r.temperatures), max(ref_r.temperatures)]
-            Vs = [ref_r.V_ref + 3 * ref_r.alpha * ref_r.V_ref * (T - ref_r.T_ref)
-                  for T in Ts]
-            ax.plot(Ts, Vs, color=_REF_COLOR, lw=1.8, ls="--",
+        ref_fit = _thexp_fit_line(ref_r)
+        if ref_fit is not None:
+            ax.plot(*ref_fit, color=_REF_COLOR, lw=1.8, ls="--",
                     label=f"{ref_lbl}  \u03b1={ref_r.alpha*1e6:.1f}\u00d710\u207b\u2076 K\u207b\u00b9")
         else:
             ax.plot([], [], color=_REF_COLOR, ls="--", label=ref_lbl)
