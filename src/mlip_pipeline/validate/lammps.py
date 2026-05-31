@@ -116,28 +116,32 @@ def write_solid_eq_input(
     The reference data file has 0 K DFT lattice parameters.  After
     replicate the MTP pressure is ~20 kbar.
 
-    Safe two-stage protocol
-    -----------------------
+    Three-stage protocol
+    --------------------
     Stage 0  Cold NPT at 1 K (500 steps, dt/5):
-             Barostat decompresses ~20 kbar -> ~0 with negligible
-             kinetic energy.  The box is now at the correct P=0
-             volume AND aspect ratio for this potential.
-             No change_box is needed — iso NPT preserves the 5x5x10
-             shape because it scales all three axes equally.
+             Barostat decompresses ~20 kbar -> ~0 with negligible KE.
+             Box is now at the correct P=0 volume and aspect ratio.
 
-    Stage 1  NVT at T_target (n_equil steps, full dt):
-             Velocities assigned at T_target after the box is at the
-             correct volume.  NVT is appropriate because volume is
-             already relaxed.  No pressure kick, no overshoot.
+    Stage 1  NPT ramp from 1 K -> T_target (~20 ps):
+             Slow linear heating under NPT so the barostat tracks the
+             expanding lattice.  tdamp_ramp = 5*tdamp keeps the
+             thermostat loose so it does not fight the ramp.
+             Velocities start at 1 K — no instantaneous thermal shock.
+
+    Stage 2  NPT hold at T_target (n_equil steps):
+             Full thermodynamic equilibration before the dump.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     dump_out  = (work_dir / "solid_final.dump").resolve()
     script_path = work_dir / "solid_eq.in"
 
-    dt_slow = round(dt / 5.0, 6)
-    tdamp   = round(100 * dt, 6)
-    pdamp   = round(1000 * dt, 6)
+    dt_slow      = round(dt / 5.0, 6)
+    tdamp        = round(100 * dt, 6)
+    tdamp_ramp   = round(500 * dt, 6)   # loose thermostat during ramp
+    pdamp        = round(1000 * dt, 6)
+    # ramp long enough that heating rate <= ~15 K/ps
+    n_ramp = max(5000, int(20_000 / dt))
 
     lines = [
         "units           metal",
@@ -157,10 +161,7 @@ def write_solid_eq_input(
         "thermo_modify   flush yes",
         "",
         "# ---------------------------------------------------------------",
-        "# Stage 0: cold NPT at 1 K.",
-        "# iso barostat decompresses ~20 kbar -> ~0 with negligible KE.",
-        "# The box reaches the correct P=0 volume in the right 5x5x10",
-        "# aspect ratio.  No change_box needed after this.",
+        "# Stage 0: cold NPT at 1 K — decompress ~20 kbar -> ~0.",
         "# ---------------------------------------------------------------",
         f"timestep        {dt_slow}",
         f"velocity        all create 1.0 {seed} dist gaussian",
@@ -169,14 +170,23 @@ def write_solid_eq_input(
         "unfix           fxS0",
         "",
         "# ---------------------------------------------------------------",
-        f"# Stage 1: NVT equilibration at T_target = {temperature:.1f} K.",
-        "# Velocities assigned NOW at the correct volume -> no pressure kick.",
+        f"# Stage 1: NPT ramp 1 K -> {temperature:.1f} K over {n_ramp} steps",
+        f"# (~{n_ramp * dt / 1000:.1f} ns).  Loose tdamp={tdamp_ramp} ps.",
         "# ---------------------------------------------------------------",
         f"timestep        {dt}",
-        f"velocity        all create {temperature:.1f} {seed + 1} dist gaussian",
-        f"fix             fxS1 all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
-        f"run             {n_equil}",
+        f"velocity        all create 1.0 {seed + 1} dist gaussian",
+        f"fix             fxS1 all npt temp 1.0 {temperature:.1f} {tdamp_ramp}"
+        f" iso 0.0 0.0 {pdamp}",
+        f"run             {n_ramp}",
         "unfix           fxS1",
+        "",
+        "# ---------------------------------------------------------------",
+        f"# Stage 2: NPT hold at {temperature:.1f} K for {n_equil} steps.",
+        "# ---------------------------------------------------------------",
+        f"fix             fxS2 all npt temp {temperature:.1f} {temperature:.1f}"
+        f" {tdamp} iso 0.0 0.0 {pdamp}",
+        f"run             {n_equil}",
+        "unfix           fxS2",
         "",
         f"write_dump      all custom {dump_out} id type x y z modify sort id",
     ]
@@ -203,18 +213,21 @@ def write_liquid_eq_input(
     T_dis = min(1.3 * T_target, T_target + 300).
 
     Stage 0  Cold NPT at 1 K (500 steps, dt/5) — decompress cell.
-    Stage 1  NVT at T_dis (n_equil steps, dt) — velocities assigned
-             at T_dis after Stage 0 has set the correct volume.
+    Stage 1  NPT ramp 1 K -> T_dis (~20 ps, loose thermostat).
+             No instantaneous velocity kick — ramp drives the heating.
+    Stage 2  NPT hold at T_dis (n_equil steps) — ensure full melting.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
     dump_out  = (work_dir / "liquid_final.dump").resolve()
     script_path = work_dir / "liquid_eq.in"
 
-    T_dis    = min(1.3 * temperature, temperature + 300.0)
-    dt_slow  = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
-    tdamp    = round(100 * dt, 6)
-    pdamp    = round(1000 * dt, 6)
+    T_dis        = min(1.3 * temperature, temperature + 300.0)
+    dt_slow      = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
+    tdamp        = round(100 * dt, 6)
+    tdamp_ramp   = round(500 * dt, 6)
+    pdamp        = round(1000 * dt, 6)
+    n_ramp       = max(5000, int(20_000 / dt))
 
     lines = [
         "units           metal",
@@ -234,8 +247,7 @@ def write_liquid_eq_input(
         "thermo_modify   flush yes",
         "",
         "# ---------------------------------------------------------------",
-        "# Stage 0: cold NPT at 1 K — decompress cell before adding heat.",
-        "# iso barostat preserves the 5x5x10 aspect ratio.",
+        "# Stage 0: cold NPT at 1 K — decompress cell.",
         "# ---------------------------------------------------------------",
         f"timestep        {dt_slow}",
         f"velocity        all create 1.0 {seed} dist gaussian",
@@ -244,14 +256,23 @@ def write_liquid_eq_input(
         "unfix           fxL0",
         "",
         "# ---------------------------------------------------------------",
-        f"# Stage 1: NVT at T_dis = {T_dis:.1f} K.",
-        "# Velocities assigned at T_dis after box is at correct volume.",
+        f"# Stage 1: NPT ramp 1 K -> {T_dis:.1f} K over {n_ramp} steps",
+        f"# (~{n_ramp * dt / 1000:.1f} ns).  Loose tdamp={tdamp_ramp} ps.",
         "# ---------------------------------------------------------------",
         f"timestep        {dt}",
-        f"velocity        all create {T_dis:.1f} {seed + 1} dist gaussian",
-        f"fix             fxL1 all nvt temp {T_dis:.1f} {T_dis:.1f} {tdamp}",
-        f"run             {n_equil}",
+        f"velocity        all create 1.0 {seed + 1} dist gaussian",
+        f"fix             fxL1 all npt temp 1.0 {T_dis:.1f} {tdamp_ramp}"
+        f" iso 0.0 0.0 {pdamp}",
+        f"run             {n_ramp}",
         "unfix           fxL1",
+        "",
+        "# ---------------------------------------------------------------",
+        f"# Stage 2: NPT hold at T_dis = {T_dis:.1f} K for {n_equil} steps.",
+        "# ---------------------------------------------------------------",
+        f"fix             fxL2 all npt temp {T_dis:.1f} {T_dis:.1f}"
+        f" {tdamp} iso 0.0 0.0 {pdamp}",
+        f"run             {n_equil}",
+        "unfix           fxL2",
         "",
         f"write_dump      all custom {dump_out} id type x y z modify sort id",
     ]
