@@ -1,24 +1,30 @@
 """Classical potential reference runner.
 
 Runs the same physics validation steps (EOS, elastic, melting, vacancy,
-thermal expansion) using a classical interatomic potential (e.g. EAM, MEAM)
-and computes property deviations against MTP results.
+thermal expansion, RDF) using a classical interatomic potential (e.g. EAM,
+MEAM) and collects result dataclasses for later comparison against MTP.
 
-This module is intentionally potential-agnostic: the caller supplies the
-``pair_style`` and ``pair_coeff`` strings, so it works for any LAMMPS-
-supported potential (EAM, MEAM, MEAM/SW, etc.).
+Design principle
+----------------
+This module is *computation only*: it calls ``run_*`` functions to produce
+result dataclasses but does **not** call any plotting function itself.
+Plotting is done by the caller (``runner.py``) after both MTP and reference
+results are available, via ``plots.plot_comparison()``.
 
-Typical usage (Lee 2003 2NN-MEAM for Pb)
------------------------------------------
+The module is potential-agnostic: the caller supplies ``pair_style`` and
+``pair_coeff``, so it works for any LAMMPS-supported potential.
+
+Typical usage
+-------------
     from mlip_pipeline.validate.classical_reference import run_classical_reference
 
     ref_result = run_classical_reference(
         config=config,
         pair_style="meam",
-        pair_coeff="* * /path/to/library.meam Pb /path/to/Pb.meam Pb",
+        pair_coeff="* * /path/library.meam Pb /path/Pb.meam Pb",
         out_dir=val_dir / "classical_ref",
         label="Lee2003-MEAM",
-        mtp_result=validation_result,   # ValidationResult from MTP run
+        mtp_result=validation_result,
     )
 """
 from __future__ import annotations
@@ -30,36 +36,15 @@ from typing import Optional
 from mlip_pipeline.utils.fs import ensure_dir
 from mlip_pipeline.models import (
     EosResult, ElasticResult, MeltingResult,
-    ThermalExpansionResult, VacancyResult, ValidationResult,
+    ThermalExpansionResult, VacancyResult, RdfResult, ValidationResult,
 )
 from mlip_pipeline.validate.eos import run_eos
 from mlip_pipeline.validate.elastic import run_elastic
 from mlip_pipeline.validate.melting import run_melting
 from mlip_pipeline.validate.thermal_expansion import run_thermal_expansion
 from mlip_pipeline.validate.vacancy import run_vacancy
-from mlip_pipeline.validate import plots
-
-
-# ── CLI helpers ──────────────────────────────────────────────────────────────
-
-_W = 60
-
-
-def _banner(title: str) -> None:
-    pad = (_W - len(title) - 2) // 2
-    print(f"\n{'─' * pad} {title} {'─' * (_W - pad - len(title) - 2)}")
-
-
-def _step(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  {msg}")
-
-
-def _ok(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  ✓  {msg}")
-
-
-def _warn(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  ⚠  {msg}")
+from mlip_pipeline.validate.rdf import run_rdf
+from mlip_pipeline.validate._cli import banner, step, ok, warn
 
 
 # ------------------------------------------------------------------ #
@@ -72,13 +57,13 @@ class ClassicalReferenceResult:
     label: str
     pair_style: str
     pair_coeff: str
-    eos_results: list[EosResult] = field(default_factory=list)
-    elastic_results: list[ElasticResult] = field(default_factory=list)
-    melting_results: list[MeltingResult] = field(default_factory=list)
+    eos_results:               list[EosResult]              = field(default_factory=list)
+    elastic_results:           list[ElasticResult]          = field(default_factory=list)
+    melting_results:           list[MeltingResult]          = field(default_factory=list)
     thermal_expansion_results: list[ThermalExpansionResult] = field(default_factory=list)
-    vacancy_results: list[VacancyResult] = field(default_factory=list)
+    vacancy_results:           list[VacancyResult]          = field(default_factory=list)
+    rdf_results:               list[RdfResult]              = field(default_factory=list)
     deviations: dict = field(default_factory=dict)
-    plot_paths: dict = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ #
@@ -95,10 +80,10 @@ def _pct(mtp_val: Optional[float], ref_val: Optional[float]) -> Optional[float]:
 
 def _collect_deviations(
     mtp_result: ValidationResult,
-    ref_eos: list[EosResult],
+    ref_eos:     list[EosResult],
     ref_elastic: list[ElasticResult],
     ref_melting: list[MeltingResult],
-    ref_thexp: list[ThermalExpansionResult],
+    ref_thexp:   list[ThermalExpansionResult],
     ref_vacancy: list[VacancyResult],
 ) -> dict:
     devs: dict = {}
@@ -114,8 +99,8 @@ def _collect_deviations(
             if d is not None:
                 devs[f"{prop}_{sid}"] = round(d, 2)
 
-    ref_el_map = {r.structure_id: r for r in ref_elastic}
-    mtp_el_map = {r.structure_id: r for r in mtp_result.elastic_results}
+    ref_el_map  = {r.structure_id: r for r in ref_elastic}
+    mtp_el_map  = {r.structure_id: r for r in mtp_result.elastic_results}
     for sid, ref in ref_el_map.items():
         mtp = mtp_el_map.get(sid)
         if mtp is None or not ref.compute_ok or not mtp.compute_ok:
@@ -126,9 +111,7 @@ def _collect_deviations(
                 devs[f"{prop}_{sid}"] = round(d, 2)
         if ref.C and mtp.C:
             for cij in ("C11", "C12", "C44", "C22", "C33"):
-                ref_v = ref.C.get(cij)
-                mtp_v = mtp.C.get(cij)
-                d = _pct(mtp_v, ref_v)
+                d = _pct(mtp.C.get(cij), ref.C.get(cij))
                 if d is not None:
                     devs[f"{cij}_{sid}"] = round(d, 2)
 
@@ -156,7 +139,7 @@ def _collect_deviations(
     mtp_vac_map = {r.structure_id: r for r in mtp_result.vacancy_results}
     for sid, ref in ref_vac_map.items():
         mtp = mtp_vac_map.get(sid)
-        if mtp is None or not ref.compute_ok or not ref.compute_ok:
+        if mtp is None or not ref.compute_ok or not mtp.compute_ok:
             continue
         d = _pct(mtp.E_vac, ref.E_vac)
         if d is not None:
@@ -174,21 +157,21 @@ def print_classical_deviation_table(
     mtp_result: ValidationResult,
 ) -> None:
     """Print a clean MTP vs classical reference comparison table."""
-    _banner(f"MTP vs {result.label}")
+    banner(f"MTP vs {result.label}")
 
     ref_lbl = result.label
-    col_w   = max(len(ref_lbl), 12)  # min width for reference column
+    col_w   = max(len(ref_lbl), 12)
 
     def _row(prop: str, mtp_v: float, ref_v: float, unit: str, dev_key: str) -> None:
-        d    = result.deviations.get(dev_key)
-        flag = "" if d is None else ("✓" if abs(d) < 10 else ("!" if abs(d) < 25 else "✗"))
+        d     = result.deviations.get(dev_key)
+        flag  = "" if d is None else ("\u2713" if abs(d) < 10 else ("!" if abs(d) < 25 else "\u2717"))
         d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
         print(f"  {prop:<8}  {mtp_v:>10.3f}  {ref_v:{col_w}.3f}  {d_str}  {unit}  {flag}")
 
     def _header(section: str) -> None:
-        print(f"\n  ── {section} ")
-        print(f"  {'Property':<8}  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}  Unit")
-        print("  " + "─" * (10 + col_w + 32))
+        print(f"\n  \u2500\u2500 {section} ")
+        print(f"  {'Property':<8}  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}  Unit")
+        print("  " + "\u2500" * (10 + col_w + 32))
 
     # EOS
     for mtp_r in mtp_result.eos_results:
@@ -197,7 +180,7 @@ def print_classical_deviation_table(
         if ref_r is None or not mtp_r.fit_ok or not ref_r.fit_ok:
             continue
         _header(f"EOS [{sid}]")
-        for prop, unit in [("V0", "Å³/atom"), ("E0", "eV/atom"), ("B0", "GPa")]:
+        for prop, unit in [("V0", "\u00c5\u00b3/atom"), ("E0", "eV/atom"), ("B0", "GPa")]:
             mtp_v = getattr(mtp_r, prop, None)
             ref_v = getattr(ref_r, prop, None)
             if mtp_v is not None and ref_v is not None:
@@ -214,8 +197,10 @@ def print_classical_deviation_table(
             ("C11", "GPa"), ("C12", "GPa"), ("C44", "GPa"),
             ("B_voigt", "GPa"), ("G_voigt", "GPa"),
         ]:
-            mtp_v = (mtp_r.C or {}).get(prop) if prop.startswith("C") else getattr(mtp_r, prop, None)
-            ref_v = (ref_r.C or {}).get(prop) if prop.startswith("C") else getattr(ref_r, prop, None)
+            mtp_v = (mtp_r.C or {}).get(prop) if prop.startswith("C") \
+                    else getattr(mtp_r, prop, None)
+            ref_v = (ref_r.C or {}).get(prop) if prop.startswith("C") \
+                    else getattr(ref_r, prop, None)
             if mtp_v is not None and ref_v is not None:
                 _row(prop, mtp_v, ref_v, unit, f"{prop}_{sid}")
 
@@ -226,10 +211,10 @@ def print_classical_deviation_table(
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
         d     = result.deviations.get(f"T_melt_{sid}")
-        flag  = "" if d is None else ("✓" if abs(d) < 5 else ("!" if abs(d) < 15 else "✗"))
+        flag  = "" if d is None else ("\u2713" if abs(d) < 5 else ("!" if abs(d) < 15 else "\u2717"))
         d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
-        print(f"\n  ── Melting [{sid}]")
-        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
+        print(f"\n  \u2500\u2500 Melting [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}")
         print(f"  {mtp_r.T_melt:>10.0f}  {ref_r.T_melt:{col_w}.0f}  {d_str}  K  {flag}")
 
     # Vacancy
@@ -239,24 +224,25 @@ def print_classical_deviation_table(
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
         d     = result.deviations.get(f"E_vac_{sid}")
-        flag  = "" if d is None else ("✓" if abs(d) < 15 else ("!" if abs(d) < 30 else "✗"))
+        flag  = "" if d is None else ("\u2713" if abs(d) < 15 else ("!" if abs(d) < 30 else "\u2717"))
         d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
-        print(f"\n  ── Vacancy [{sid}]")
-        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
+        print(f"\n  \u2500\u2500 Vacancy [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}")
         print(f"  {mtp_r.E_vac:>10.4f}  {ref_r.E_vac:{col_w}.4f}  {d_str}  eV  {flag}")
 
     # Thermal expansion
     for mtp_r in mtp_result.thermal_expansion_results:
         sid   = mtp_r.structure_id
-        ref_r = next((r for r in result.thermal_expansion_results if r.structure_id == sid), None)
+        ref_r = next((r for r in result.thermal_expansion_results
+                      if r.structure_id == sid), None)
         if ref_r is None or not mtp_r.compute_ok or not ref_r.compute_ok:
             continue
         d     = result.deviations.get(f"alpha_{sid}")
-        flag  = "" if d is None else ("✓" if abs(d) < 15 else ("!" if abs(d) < 30 else "✗"))
+        flag  = "" if d is None else ("\u2713" if abs(d) < 15 else ("!" if abs(d) < 30 else "\u2717"))
         d_str = f"{d:>+7.1f}%" if d is not None else "    N/A"
-        print(f"\n  ── Thermal expansion [{sid}]")
-        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'Δ%':>8}")
-        print(f"  {mtp_r.alpha*1e6:>10.2f}  {ref_r.alpha*1e6:{col_w}.2f}  {d_str}  ×10⁻⁶ K⁻¹  {flag}")
+        print(f"\n  \u2500\u2500 Thermal expansion [{sid}]")
+        print(f"  {'MTP':>10}  {ref_lbl:>{col_w}}  {'\u0394%':>8}")
+        print(f"  {mtp_r.alpha*1e6:>10.2f}  {ref_r.alpha*1e6:{col_w}.2f}  {d_str}  \u00d710\u207b\u2076 K\u207b\u00b9  {flag}")
 
     print()
 
@@ -313,10 +299,10 @@ def run_classical_reference(
     if cutoff is None:
         cutoff = val_cfg.get("cutoff") or val_cfg.get("lammps_cutoff")
 
-    _banner(f"Classical Reference: {label}")
-    _step("setup", f"pair_style : {pair_style}")
-    _step("setup", f"pair_coeff : {pair_coeff}")
-    _step("setup", f"out_dir    : {ref_dir}")
+    banner(f"Classical Reference: {label}")
+    step("setup", f"pair_style : {pair_style}")
+    step("setup", f"pair_coeff : {pair_coeff}")
+    step("setup", f"out_dir    : {ref_dir}")
 
     _dummy_model = Path(".")
 
@@ -333,7 +319,7 @@ def run_classical_reference(
     melting_results: list[MeltingResult]          = []
     thexp_results:   list[ThermalExpansionResult] = []
     vacancy_results: list[VacancyResult]          = []
-    plot_paths: dict = {}
+    rdf_results:     list[RdfResult]              = []
 
     # ── EOS ──────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
@@ -342,7 +328,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                _warn("ref-eos", f"{sid}: data not found")
+                warn("ref-eos", f"{sid}: data not found")
                 eos_results.append(EosResult(
                     structure_id=sid, volumes=[], energies=[],
                     fit_error=f"data file not found: {data_path}",
@@ -360,11 +346,10 @@ def run_classical_reference(
                 pair_coeff=pair_coeff,
             )
             eos_results.append(res)
-            p = plots.plot_eos(res, ref_dir)
-            if p:
-                plot_paths[f"eos_{sid}"] = p
             if res.fit_ok:
-                _ok("ref-eos", f"{sid}: B₀={res.B0:.1f} GPa  V₀={res.V0:.3f} Å³")
+                ok("ref-eos", f"{sid}: B\u2080={res.B0:.1f} GPa  V\u2080={res.V0:.3f} \u00c5\u00b3")
+            else:
+                warn("ref-eos", f"{sid}: fit failed — {res.fit_error}")
 
     # ── Elastic ───────────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
@@ -373,7 +358,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                _warn("ref-el", f"{sid}: data not found")
+                warn("ref-el", f"{sid}: data not found")
                 elastic_results.append(ElasticResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -390,7 +375,9 @@ def run_classical_reference(
             )
             elastic_results.append(res)
             if res.compute_ok:
-                _ok("ref-el", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
+                ok("ref-el", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
+            else:
+                warn("ref-el", f"{sid}: failed — {res.error}")
 
     # ── Melting ───────────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
@@ -399,7 +386,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                _warn("ref-melt", f"{sid}: data not found")
+                warn("ref-melt", f"{sid}: data not found")
                 melting_results.append(MeltingResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -422,7 +409,9 @@ def run_classical_reference(
             )
             melting_results.append(res)
             if res.compute_ok:
-                _ok("ref-melt", f"{sid}: T_melt = {res.T_melt:.0f} K")
+                ok("ref-melt", f"{sid}: T_melt = {res.T_melt:.0f} K")
+            else:
+                warn("ref-melt", f"{sid}: failed — {res.error}")
 
     # ── Thermal expansion ─────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
@@ -431,7 +420,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                _warn("ref-thexp", f"{sid}: data not found")
+                warn("ref-thexp", f"{sid}: data not found")
                 thexp_results.append(ThermalExpansionResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -452,7 +441,9 @@ def run_classical_reference(
             )
             thexp_results.append(res)
             if res.compute_ok:
-                _ok("ref-thexp", f"{sid}: α = {res.alpha*1e6:.2f}×10⁻⁶ K⁻¹")
+                ok("ref-thexp", f"{sid}: \u03b1 = {res.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9")
+            else:
+                warn("ref-thexp", f"{sid}: failed — {res.error}")
 
     # ── Vacancy ───────────────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
@@ -461,7 +452,7 @@ def run_classical_reference(
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
-                _warn("ref-vac", f"{sid}: data not found")
+                warn("ref-vac", f"{sid}: data not found")
                 vacancy_results.append(VacancyResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -478,9 +469,45 @@ def run_classical_reference(
             )
             vacancy_results.append(res)
             if res.compute_ok:
-                _ok("ref-vac", f"{sid}: E_vac = {res.E_vac:.4f} eV")
+                ok("ref-vac", f"{sid}: E_vac = {res.E_vac:.4f} eV")
+            else:
+                warn("ref-vac", f"{sid}: failed — {res.error}")
 
-    # Compute deviations
+    # ── RDF ──────────────────────────────────────────────────────────
+    rdf_cfg = val_cfg.get("rdf", {})
+    if rdf_cfg.get("enabled", True):
+        for s in _resolve_structures_cl(rdf_cfg, val_cfg):
+            sid = s.get("id", "unknown")
+            data_path = _resolve(s)
+            if not data_path.exists():
+                warn("ref-rdf", f"{sid}: data not found")
+                rdf_results.append(RdfResult(
+                    structure_id=sid,
+                    error=f"data file not found: {data_path}",
+                ))
+                continue
+            res = run_rdf(
+                sid, data_path, _dummy_model, ref_dir,
+                element=element, lammps_cmd=lammps_cmd,
+                mpi_command=mpi_command, mpi_np=mpi_np,
+                cutoff=cutoff,
+                temperature=rdf_cfg.get("temperature", 300.0),
+                r_max=rdf_cfg.get("r_max", 8.0),
+                n_bins=rdf_cfg.get("n_bins", 200),
+                n_equil=rdf_cfg.get("n_equil", 5000),
+                n_prod=rdf_cfg.get("n_prod", 20000),
+                dt=rdf_cfg.get("dt", 0.002),
+                supercell_repeat=rdf_cfg.get("supercell_repeat", 3),
+                pair_style=pair_style,
+                pair_coeff=pair_coeff,
+            )
+            rdf_results.append(res)
+            if res.compute_ok:
+                ok("ref-rdf", f"{sid}: first peak at {res.first_peak_r:.3f} \u00c5")
+            else:
+                warn("ref-rdf", f"{sid}: failed — {res.error}")
+
+    # Compute scalar deviations (used by the CLI table)
     devs = _collect_deviations(
         mtp_result,
         eos_results, elastic_results,
@@ -496,8 +523,8 @@ def run_classical_reference(
         melting_results=melting_results,
         thermal_expansion_results=thexp_results,
         vacancy_results=vacancy_results,
+        rdf_results=rdf_results,
         deviations=devs,
-        plot_paths=plot_paths,
     )
 
     print_classical_deviation_table(result, mtp_result)

@@ -1,6 +1,13 @@
 """Orchestrator for physics validation.
 
 Entry point:  run_validation(config, model_path, out_dir)
+
+Design principle
+----------------
+Computation and plotting are kept strictly separate:
+  1. All ``run_*`` calls collect result dataclasses.
+  2. A single ``_plot_all()`` call at the end turns those results into PNG
+     files.  No matplotlib code runs during the LAMMPS loop.
 """
 from __future__ import annotations
 
@@ -19,28 +26,8 @@ from mlip_pipeline.validate.thermal_expansion import run_thermal_expansion
 from mlip_pipeline.validate.vacancy import run_vacancy
 from mlip_pipeline.validate.rdf import run_rdf
 from mlip_pipeline.validate import plots
+from mlip_pipeline.validate._cli import banner, step, ok, warn
 from mlip_pipeline.validate.classical_reference import run_classical_reference
-
-# ── CLI helpers ──────────────────────────────────────────────────────────────
-
-_W = 60  # total banner width
-
-
-def _banner(title: str) -> None:
-    pad = (_W - len(title) - 2) // 2
-    print(f"\n{'─' * pad} {title} {'─' * (_W - pad - len(title) - 2)}")
-
-
-def _step(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  {msg}")
-
-
-def _ok(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  ✓  {msg}")
-
-
-def _warn(tag: str, msg: str) -> None:
-    print(f"  [{tag:<8}]  ⚠  {msg}")
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -99,6 +86,59 @@ def _step_enabled(
     return cfg_enabled
 
 
+# ── Plot helper (pure, no LAMMPS) ────────────────────────────────────────────
+
+def _plot_all(
+    eos_results:     list[EosResult],
+    elastic_results: list[ElasticResult],
+    melting_results: list[MeltingResult],
+    thexp_results:   list[ThermalExpansionResult],
+    vacancy_results: list[VacancyResult],
+    rdf_results:     list[RdfResult],
+    val_dir: Path,
+) -> dict[str, Path]:
+    """Generate all standalone MTP plots and return a {key: Path} dict."""
+    plot_paths: dict[str, Path] = {}
+
+    for res in eos_results:
+        p = plots.plot_eos(res, val_dir)
+        if p:
+            plot_paths[f"eos_{res.structure_id}"] = p
+            ok("eos", f"{res.structure_id} → {p.name}")
+
+    if elastic_results:
+        p = plots.plot_elastic_bar(elastic_results, val_dir)
+        if p:
+            plot_paths["elastic_constants"] = p
+            ok("elastic", f"bar chart → {p.name}")
+
+    if melting_results:
+        p = plots.plot_melting(melting_results, val_dir)
+        if p:
+            plot_paths["melting_temperature"] = p
+            ok("melting", f"bracket plot → {p.name}")
+
+    if thexp_results:
+        p = plots.plot_thermal_expansion(thexp_results, val_dir)
+        if p:
+            plot_paths["thermal_expansion"] = p
+            ok("thexp", f"plot → {p.name}")
+
+    if vacancy_results:
+        p = plots.plot_vacancy(vacancy_results, val_dir)
+        if p:
+            plot_paths["vacancy_formation"] = p
+            ok("vacancy", f"bar chart → {p.name}")
+
+    if rdf_results:
+        p = plots.plot_rdf(rdf_results, val_dir)
+        if p:
+            plot_paths["rdf"] = p
+            ok("rdf", f"plot → {p.name}")
+
+    return plot_paths
+
+
 # ── Public runner ─────────────────────────────────────────────────────────────
 
 def run_validation(
@@ -126,15 +166,15 @@ def run_validation(
     element     = val_cfg.get("element", "Fe")
     cutoff: Optional[float] = val_cfg.get("cutoff") or val_cfg.get("lammps_cutoff")
 
-    _banner("Validation")
-    _step("setup", f"model    : {model_path}")
-    _step("setup", f"out_dir  : {val_dir}")
-    _step("setup", f"lammps   : {lammps_cmd}")
-    _step("setup", f"element  : {element}")
+    banner("Validation")
+    step("setup", f"model    : {model_path}")
+    step("setup", f"out_dir  : {val_dir}")
+    step("setup", f"lammps   : {lammps_cmd}")
+    step("setup", f"element  : {element}")
     if only_steps is not None:
-        _step("setup", f"only     : {only_steps}")
+        step("setup", f"only     : {only_steps}")
     if skip_steps:
-        _step("setup", f"skip     : {skip_steps}")
+        step("setup", f"skip     : {skip_steps}")
 
     eos_results:     list[EosResult]              = []
     elastic_results: list[ElasticResult]          = []
@@ -142,16 +182,18 @@ def run_validation(
     thexp_results:   list[ThermalExpansionResult] = []
     vacancy_results: list[VacancyResult]          = []
     rdf_results:     list[RdfResult]              = []
-    plot_paths: dict = {}
 
-    # ── EOS ──────────────────────────────────────────────────────────────────
+    # ── Phase 1: computation ─────────────────────────────────────────────────
+    banner("Computation")
+
+    # EOS
     eos_cfg = val_cfg.get("eos", {})
     if _step_enabled("eos", eos_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(eos_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("eos", f"{sid}: data not found — {data_path}")
+                warn("eos", f"{sid}: data not found — {data_path}")
                 eos_results.append(EosResult(
                     structure_id=sid, volumes=[], energies=[],
                     fit_error=f"data file not found: {data_path}",
@@ -167,19 +209,19 @@ def run_validation(
                 cutoff=cutoff,
             )
             eos_results.append(res)
-            p = plots.plot_eos(res, val_dir)
-            if p:
-                plot_paths[f"eos_{sid}"] = p
-                _ok("eos", f"{sid}: B₀={res.B0:.1f} GPa  V₀={res.V0:.3f} Å³  → {p.name}")
+            if res.fit_ok:
+                ok("eos", f"{sid}: B\u2080={res.B0:.1f} GPa  V\u2080={res.V0:.3f} \u00c5\u00b3")
+            else:
+                warn("eos", f"{sid}: fit failed — {res.fit_error}")
 
-    # ── Elastic constants ─────────────────────────────────────────────────
+    # Elastic constants
     el_cfg = val_cfg.get("elastic", {})
     if _step_enabled("elastic", el_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(el_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("elastic", f"{sid}: data not found — {data_path}")
+                warn("elastic", f"{sid}: data not found — {data_path}")
                 elastic_results.append(ElasticResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -194,21 +236,18 @@ def run_validation(
             )
             elastic_results.append(res)
             if res.compute_ok:
-                _ok("elastic", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
-        if elastic_results:
-            p = plots.plot_elastic_bar(elastic_results, val_dir)
-            if p:
-                plot_paths["elastic_constants"] = p
-                _ok("elastic", f"bar chart → {p.name}")
+                ok("elastic", f"{sid}: B={res.B_voigt:.1f}  G={res.G_voigt:.1f} GPa")
+            else:
+                warn("elastic", f"{sid}: failed — {res.error}")
 
-    # ── Melting temperature ───────────────────────────────────────────────
+    # Melting temperature
     melt_cfg = val_cfg.get("melting", {})
     if _step_enabled("melting", melt_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(melt_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("melting", f"{sid}: data not found — {data_path}")
+                warn("melting", f"{sid}: data not found — {data_path}")
                 melting_results.append(MeltingResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -229,21 +268,18 @@ def run_validation(
             )
             melting_results.append(res)
             if res.compute_ok:
-                _ok("melting", f"{sid}: T_melt = {res.T_melt:.0f} K")
-        if melting_results:
-            p = plots.plot_melting(melting_results, val_dir)
-            if p:
-                plot_paths["melting_temperature"] = p
-                _ok("melting", f"bracket plot → {p.name}")
+                ok("melting", f"{sid}: T_melt = {res.T_melt:.0f} K")
+            else:
+                warn("melting", f"{sid}: failed — {res.error}")
 
-    # ── Thermal expansion ─────────────────────────────────────────────────
+    # Thermal expansion
     thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
     if _step_enabled("thexp", thexp_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(thexp_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("thexp", f"{sid}: data not found — {data_path}")
+                warn("thexp", f"{sid}: data not found — {data_path}")
                 thexp_results.append(ThermalExpansionResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -262,21 +298,18 @@ def run_validation(
             )
             thexp_results.append(res)
             if res.compute_ok:
-                _ok("thexp", f"{sid}: α = {res.alpha*1e6:.2f}×10⁻⁶ K⁻¹")
-        if thexp_results:
-            p = plots.plot_thermal_expansion(thexp_results, val_dir)
-            if p:
-                plot_paths["thermal_expansion"] = p
-                _ok("thexp", f"plot → {p.name}")
+                ok("thexp", f"{sid}: \u03b1 = {res.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9")
+            else:
+                warn("thexp", f"{sid}: failed — {res.error}")
 
-    # ── Vacancy formation energy ──────────────────────────────────────────
+    # Vacancy formation energy
     vac_cfg = val_cfg.get("vacancy", {})
     if _step_enabled("vacancy", vac_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(vac_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("vacancy", f"{sid}: data not found — {data_path}")
+                warn("vacancy", f"{sid}: data not found — {data_path}")
                 vacancy_results.append(VacancyResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -291,21 +324,18 @@ def run_validation(
             )
             vacancy_results.append(res)
             if res.compute_ok:
-                _ok("vacancy", f"{sid}: E_vac = {res.E_vac:.4f} eV")
-        if vacancy_results:
-            p = plots.plot_vacancy(vacancy_results, val_dir)
-            if p:
-                plot_paths["vacancy_formation"] = p
-                _ok("vacancy", f"bar chart → {p.name}")
+                ok("vacancy", f"{sid}: E_vac = {res.E_vac:.4f} eV")
+            else:
+                warn("vacancy", f"{sid}: failed — {res.error}")
 
-    # ── RDF ──────────────────────────────────────────────────────────────────
+    # RDF
     rdf_cfg = val_cfg.get("rdf", {})
     if _step_enabled("rdf", rdf_cfg.get("enabled", True), only_steps, skip_steps):
         for s in _resolve_structures(rdf_cfg, val_cfg):
             sid = s.get("id", s.get("structure_id", "unknown"))
             data_path = _resolve_data_path(s, config)
             if not data_path.exists():
-                _warn("rdf", f"{sid}: data not found — {data_path}")
+                warn("rdf", f"{sid}: data not found — {data_path}")
                 rdf_results.append(RdfResult(
                     structure_id=sid,
                     error=f"data file not found: {data_path}",
@@ -326,14 +356,19 @@ def run_validation(
             )
             rdf_results.append(res)
             if res.compute_ok:
-                _ok("rdf", f"{sid}: first peak at {res.first_peak_r:.3f} Å")
-        if rdf_results:
-            p = plots.plot_rdf(rdf_results, val_dir)
-            if p:
-                plot_paths["rdf"] = p
-                _ok("rdf", f"plot → {p.name}")
+                ok("rdf", f"{sid}: first peak at {res.first_peak_r:.3f} \u00c5")
+            else:
+                warn("rdf", f"{sid}: failed — {res.error}")
 
-    # ── Manifest ──────────────────────────────────────────────────────────
+    # ── Phase 2: plotting ────────────────────────────────────────────────────
+    banner("Plotting")
+    plot_paths = _plot_all(
+        eos_results, elastic_results, melting_results,
+        thexp_results, vacancy_results, rdf_results,
+        val_dir,
+    )
+
+    # ── Manifest ─────────────────────────────────────────────────────────────
     result = ValidationResult(
         model_path=model_path,
         validate_dir=val_dir,
@@ -347,12 +382,12 @@ def run_validation(
     )
     result.save_manifest()
 
-    # ── Classical reference comparison ────────────────────────────────────
+    # ── Classical reference comparison ────────────────────────────────────────
     cl_ref_cfg = val_cfg.get("classical_reference", {})
     if cl_ref_cfg.get("enabled", False):
         pair_style = cl_ref_cfg.get("pair_style")
         pair_coeff = cl_ref_cfg.get("pair_coeff")
-        label      = cl_ref_cfg.get("label", "classical")
+        ref_label  = cl_ref_cfg.get("label", "classical")
         ref_dir    = val_dir / "classical_ref"
         if pair_style and pair_coeff:
             ref_result = run_classical_reference(
@@ -361,22 +396,22 @@ def run_validation(
                 pair_coeff=pair_coeff,
                 out_dir=ref_dir,
                 mtp_result=result,
-                label=label,
+                label=ref_label,
                 lammps_cmd=lammps_cmd,
                 mpi_command=mpi_command,
                 mpi_np=mpi_np,
                 cutoff=cutoff,
             )
-            # side-by-side comparison plots (MTP vs classical)
+            banner("Comparison plots (MTP vs reference)")
             comp_plots = plots.plot_comparison(result, ref_result, val_dir)
             for k, p in comp_plots.items():
                 plot_paths[f"cmp_{k}"] = p
-                _ok("compare", f"{k} → {p.name}")
+                ok("compare", f"{k} \u2192 {p.name}")
         else:
-            _warn("compare", "classical_reference enabled but pair_style/pair_coeff missing")
+            warn("compare", "classical_reference enabled but pair_style/pair_coeff missing")
 
-    _banner("Validation complete")
-    _step("output", f"manifest → {val_dir / 'validate_manifest.json'}")
-    _step("output", f"plots    → {len(plot_paths)} file(s) in {val_dir}")
+    banner("Validation complete")
+    step("output", f"manifest \u2192 {val_dir / 'validate_manifest.json'}")
+    step("output", f"plots    \u2192 {len(plot_paths)} file(s) in {val_dir}")
 
     return result
