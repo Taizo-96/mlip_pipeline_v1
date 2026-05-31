@@ -61,7 +61,7 @@ class ThermalExpansionResult:
     temperatures: list[float] = field(default_factory=list)
     volumes: list[float] = field(default_factory=list)
     alpha: float = 0.0
-    V_fit: list[float] = field(default_factory=list)
+    T_ref: float = 300.0
     compute_ok: bool = False
     error: Optional[str] = None
 
@@ -70,8 +70,8 @@ class ThermalExpansionResult:
 class VacancyResult:
     structure_id: str
     E_vac: float = 0.0
-    N_perfect: int = 0
-    N_vacancy: int = 0
+    n_atoms_perfect: int = 0
+    n_atoms_vacancy: int = 0
     compute_ok: bool = False
     error: Optional[str] = None
 
@@ -138,7 +138,7 @@ class ValidationResult:
                 {
                     "structure_id": r.structure_id,
                     "temperatures": r.temperatures, "volumes": r.volumes,
-                    "alpha": r.alpha, "V_fit": r.V_fit,
+                    "alpha": r.alpha, "T_ref": r.T_ref,
                     "compute_ok": r.compute_ok, "error": r.error,
                 }
                 for r in self.thermal_expansion_results
@@ -147,7 +147,8 @@ class ValidationResult:
                 {
                     "structure_id": r.structure_id,
                     "E_vac": r.E_vac,
-                    "N_perfect": r.N_perfect, "N_vacancy": r.N_vacancy,
+                    "n_atoms_perfect": r.n_atoms_perfect,
+                    "n_atoms_vacancy": r.n_atoms_vacancy,
                     "compute_ok": r.compute_ok, "error": r.error,
                 }
                 for r in self.vacancy_results
