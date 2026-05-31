@@ -111,10 +111,16 @@ def write_solid_eq_input(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> Path:
-    """Equilibrate the whole supercell as solid at T_target.
+    """Equilibrate the whole supercell as solid at T_target, P=0.
+
+    Uses NPT (iso 0 0) so the cell expands to the correct equilibrium
+    volume for this MTP at T_target before the dump is written.
+    The reference data file typically has 0 K DFT lattice parameters;
+    without NPT the initial pressure is ~20 kbar and atoms are lost
+    within the first few hundred NVT steps.
 
     Dumps the final snapshot to solid_final.dump.
-    No groups, no regions — one NVT thermostat on all atoms.
+    No groups, no regions.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -122,6 +128,7 @@ def write_solid_eq_input(
     script_path = work_dir / "solid_eq.in"
 
     tdamp = round(100 * dt, 6)
+    pdamp = round(1000 * dt, 6)
 
     lines = [
         "units           metal",
@@ -141,10 +148,12 @@ def write_solid_eq_input(
         "thermo          500",
         "thermo_modify   flush yes",
         "",
+        f"# NPT: cell relaxes to correct volume at T_target before dump.",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxNVT all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
+        f"fix             fxNPT all npt temp {temperature:.1f} {temperature:.1f} {tdamp} "
+        f"iso 0.0 0.0 {pdamp}",
         f"run             {n_equil}",
-        "unfix           fxNVT",
+        "unfix           fxNPT",
         "",
         f"write_dump      all custom {dump_out} id type x y z modify sort id",
     ]
@@ -166,11 +175,21 @@ def write_liquid_eq_input(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> Path:
-    """Melt the whole supercell to T_dis and equilibrate as liquid.
+    """Melt the whole supercell and equilibrate as liquid at T_dis, P=0.
 
     T_dis = min(1.3 * T_target, T_target + 300).
-    Heats gradually from T_target to T_dis with a reduced timestep,
-    then equilibrates.  Dumps the final snapshot to liquid_final.dump.
+
+    Protocol:
+      1. Short NPT at T_target to relax cell volume (avoids the 20 kbar
+         pressure spike from the 0 K reference lattice parameter).
+      2. NPT heat from T_target to T_dis with reduced timestep.
+      3. NPT equilibration at T_dis.
+
+    Using NPT throughout ensures P ≈ 0 at every stage and the box
+    dimensions in liquid_final.dump are consistent with the solid_final.dump
+    box (both relaxed at their respective temperatures).
+
+    Dumps the final snapshot to liquid_final.dump.
     No groups, no regions.
     """
     abs_data  = Path(lammps_data).resolve()
@@ -178,10 +197,12 @@ def write_liquid_eq_input(
     dump_out  = (work_dir / "liquid_final.dump").resolve()
     script_path = work_dir / "liquid_eq.in"
 
-    T_dis   = min(1.3 * temperature, temperature + 300.0)
+    T_dis    = min(1.3 * temperature, temperature + 300.0)
     _dt_heat = dt_heat if dt_heat is not None else round(dt / 5.0, 6)
-    tdamp   = round(100 * dt, 6)
-    n_heat  = max(2000, n_equil // 2)
+    tdamp    = round(100 * dt, 6)
+    pdamp    = round(1000 * dt, 6)
+    n_pre    = max(1000, n_equil // 5)   # short NPT pre-relax at T_target
+    n_heat   = max(2000, n_equil // 2)   # heat ramp T_target -> T_dis
 
     lines = [
         "units           metal",
@@ -197,18 +218,27 @@ def write_liquid_eq_input(
         "",
         "minimize        1e-8 1e-10 5000 50000",
         "",
-        f"timestep        {_dt_heat}",
+        "# --- Pre-relax: NPT at T_target to remove 0K pressure spike ---",
+        f"timestep        {dt}",
         "thermo          500",
         "thermo_modify   flush yes",
-        "",
-        f"# Heat gradually from T_target={temperature:.1f} K to T_dis={T_dis:.1f} K",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        f"fix             fxHeat all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
+        f"fix             fxPre all npt temp {temperature:.1f} {temperature:.1f} {tdamp} "
+        f"iso 0.0 0.0 {pdamp}",
+        f"run             {n_pre}",
+        "unfix           fxPre",
+        "",
+        f"# --- Heat ramp: NPT T_target -> T_dis at reduced timestep ---",
+        f"timestep        {_dt_heat}",
+        f"fix             fxHeat all npt temp {temperature:.1f} {T_dis:.1f} {tdamp} "
+        f"iso 0.0 0.0 {pdamp}",
         f"run             {n_heat}",
         "unfix           fxHeat",
         "",
-        f"# Equilibrate at T_dis",
-        f"fix             fxLiq all nvt temp {T_dis:.1f} {T_dis:.1f} {tdamp}",
+        f"# --- Equilibrate liquid at T_dis ---",
+        f"timestep        {dt}",
+        f"fix             fxLiq all npt temp {T_dis:.1f} {T_dis:.1f} {tdamp} "
+        f"iso 0.0 0.0 {pdamp}",
         f"run             {n_equil}",
         "unfix           fxLiq",
         "",
@@ -229,15 +259,15 @@ def splice_tpc_cell(
     Takes the lo-z half of *solid_dump* and the hi-z half of *liquid_dump*
     and writes a combined LAMMPS data file to *out_data*.
 
-    Both dumps must have the same box dimensions and atom count (guaranteed
-    when generated by write_solid_eq_input / write_liquid_eq_input with
-    identical supercell_repeat and lammps_data arguments).
+    Both dumps must have the same box dimensions (guaranteed when both
+    use NPT at P=0 with the same supercell_repeat; the equilibrium
+    volumes will be very close).  The solid box is used as the reference.
 
-    The split plane is z = (zlo + zhi) / 2.  Atoms exactly on the plane go
-    to the solid half (consistent with the ``open 6`` convention).
+    The split plane is z = (zlo + zhi) / 2.  Atoms exactly on the plane
+    go to the solid half.
     """
-    def _read_dump(path: Path) -> tuple[dict, list[tuple[float, float, float]]]:
-        """Return (box_bounds, [(x, y, z), ...]) sorted by atom id."""
+    def _read_dump(path: Path) -> tuple[dict, list[tuple[int, float, float, float]]]:
+        """Return (box_bounds, [(id, x, y, z), ...]) sorted by atom id."""
         box: dict[str, tuple[float, float]] = {}
         atoms: list[tuple[int, float, float, float]] = []
         with path.open() as fh:
@@ -247,68 +277,81 @@ def splice_tpc_cell(
             line = lines[i].strip()
             if line == "ITEM: BOX BOUNDS pp pp pp":
                 for key in ("x", "y", "z"):
-                    lo, hi = map(float, lines[i + 1].split())
-                    box[key] = (lo, hi)
                     i += 1
+                    lo, hi = map(float, lines[i].split())
+                    box[key] = (lo, hi)
             elif line.startswith("ITEM: ATOMS"):
                 i += 1
                 while i < len(lines) and not lines[i].startswith("ITEM:"):
                     parts = lines[i].split()
-                    # columns: id type x y z
                     atoms.append((int(parts[0]), float(parts[2]),
                                   float(parts[3]), float(parts[4])))
                     i += 1
                 continue
             i += 1
         atoms.sort(key=lambda a: a[0])
-        coords = [(x, y, z) for _, x, y, z in atoms]
-        return box, coords
+        return box, atoms
 
-    box_s, solid_coords  = _read_dump(solid_dump)
-    box_l, liquid_coords = _read_dump(liquid_dump)
+    box_s, solid_atoms  = _read_dump(solid_dump)
+    box_l, liquid_atoms = _read_dump(liquid_dump)
 
-    if len(solid_coords) != len(liquid_coords):
+    if len(solid_atoms) != len(liquid_atoms):
         raise ValueError(
             f"splice_tpc_cell: atom count mismatch "
-            f"({len(solid_coords)} solid vs {len(liquid_coords)} liquid). "
+            f"({len(solid_atoms)} solid vs {len(liquid_atoms)} liquid). "
             f"Both equilibration runs must use identical supercell_repeat."
         )
 
-    # Use solid box (both should be identical; solid is the reference)
+    # Solid box is the reference (NPT-relaxed solid at T_target).
+    # Liquid box may differ slightly in volume; we rescale liquid hi-z
+    # atom z-coordinates into the solid box to avoid a seam discontinuity.
     xlo, xhi = box_s["x"]
     ylo, yhi = box_s["y"]
     zlo, zhi = box_s["z"]
     zmid = (zlo + zhi) / 2.0
 
+    # Rescale factors: map liquid box -> solid box
+    lx_scale = (xhi - xlo) / (box_l["x"][1] - box_l["x"][0])
+    ly_scale = (yhi - ylo) / (box_l["y"][1] - box_l["y"][0])
+    lz_scale = (zhi - zlo) / (box_l["z"][1] - box_l["z"][0])
+    lxlo, lxhi = box_l["x"]
+    lylo, lyhi = box_l["y"]
+    lzlo, lzhi = box_l["z"]
+
     combined: list[tuple[float, float, float]] = []
-    for (sx, sy, sz), (lx, ly, lz) in zip(solid_coords, liquid_coords):
+    for (sid, sx, sy, sz), (_, lx, ly, lz) in zip(solid_atoms, liquid_atoms):
         if sz <= zmid:
             combined.append((sx, sy, sz))
         else:
-            combined.append((lx, ly, lz))
+            # Rescale liquid coords into solid box
+            rx = xlo + (lx - lxlo) * lx_scale
+            ry = ylo + (ly - lylo) * ly_scale
+            rz = zlo + (lz - lzlo) * lz_scale
+            combined.append((rx, ry, rz))
 
     n_atoms = len(combined)
-    lines = [
-        "LAMMPS data file — TPC splice\n",
+    out_lines = [
+        "LAMMPS data file - TPC splice",
+        "",
         f"{n_atoms} atoms",
         "",
         "1 atom types",
         "",
-        f"{xlo:.6f} {xhi:.6f} xlo xhi",
-        f"{ylo:.6f} {yhi:.6f} ylo yhi",
-        f"{zlo:.6f} {zhi:.6f} zlo zhi",
+        f"{xlo:.8f} {xhi:.8f} xlo xhi",
+        f"{ylo:.8f} {yhi:.8f} ylo yhi",
+        f"{zlo:.8f} {zhi:.8f} zlo zhi",
         "",
         "Masses",
         "",
-        f"{atom_type} 1.0",  # mass placeholder; LAMMPS pair_coeff sets real masses
+        f"{atom_type} 1.0",
         "",
         "Atoms  # atomic",
         "",
     ]
     for i, (x, y, z) in enumerate(combined, start=1):
-        lines.append(f"{i} {atom_type} {x:.6f} {y:.6f} {z:.6f}")
+        out_lines.append(f"{i} {atom_type} {x:.8f} {y:.8f} {z:.8f}")
 
-    out_data.write_text("\n".join(lines) + "\n")
+    out_data.write_text("\n".join(out_lines) + "\n")
 
 
 def write_coex_input(
@@ -327,10 +370,12 @@ def write_coex_input(
 
     Reads the pre-assembled TPC data file *tpc_data*.
 
-    Stage A — NVT at T_target: relaxes the solid/liquid interface.
+    Stage A - NVT at T_target: relaxes the solid/liquid interface.
                No groups.  Single thermostat on all atoms.
-    Stage B — NPH iso 0 0 pdamp: production run.
-               Correct ensemble for TPC — constant pressure allows
+               The cell is already at ~P=0 from the NPT solid prep,
+               so NVT is appropriate here.
+    Stage B - NPH iso 0 0 pdamp: production run.
+               Correct ensemble for TPC - constant pressure allows
                the cell volume to relax as one phase grows/shrinks.
                Velocities inherited from Stage A.
     """
@@ -360,6 +405,7 @@ def write_coex_input(
         "",
         "# ----------------------------------------------------------------",
         f"# Stage A: NVT interface relaxation at T = {temperature:.1f} K.",
+        "#          Cell is already at P~0 from NPT solid prep.",
         "#          No groups. Single thermostat on all atoms.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} 99999 dist gaussian",
@@ -414,14 +460,7 @@ def write_melting_input(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> Path:
-    """Deprecated single-script TPC writer.
-
-    Retained for backward compatibility.  New code should call
-    write_solid_eq_input / write_liquid_eq_input / splice_tpc_cell /
-    write_coex_input directly (or use run_melting() which does so).
-    """
-    # Delegate to the new coex writer using a pre-assembled data file if
-    # it already exists, otherwise just write the coex script stub.
+    """Deprecated single-script TPC writer. Delegates to write_coex_input."""
     tpc_data = work_dir / "tpc_start.lammps"
     return write_coex_input(
         tpc_data, model_path, work_dir,
