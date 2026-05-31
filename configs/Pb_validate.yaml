@@ -2,8 +2,8 @@
 
 element: Pb
 
-lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
-classical_lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/interface-lammps-mlip-3/lmp_mpi
+lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/mylammps/src/lmp_mpi
+classical_lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/mylammps/src/lmp_mpi
 mpi_command: mpirun
 mpi_np: 4
 
@@ -49,4 +49,4 @@ matproj_reference:
 classical_reference:
   name: Lee2003-MEAM
   pair_style: "meam"
-  pair_coeff: "* * {project_root}/reference_potentials/library.meam Pb {project_root}/reference_potentials/Pb.meam Pb"
+  pair_coeff: "* * /home/saitto/mlip_pipeline_v1/reference_potentials/library.meam Pb /home/saitto/mlip_pipeline_v1/reference_potentials/Pb.meam Pb"
