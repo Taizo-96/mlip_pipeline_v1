@@ -11,6 +11,8 @@ Computation and reporting are kept strictly separate:
   3. For each configured classical reference, ``plot_comparison()`` produces
      side-by-side MTP vs reference PNG files and ``write_report()`` writes
      a Markdown report and CSV summary.
+  4. When two or more references are run, ``plot_combined()`` is called once
+     to overlay all potentials on a single figure per property type.
 """
 from __future__ import annotations
 
@@ -36,7 +38,7 @@ from mlip_pipeline.validate._cli import banner, step, ok, warn
 from mlip_pipeline.validate.classical_reference import run_classical_reference
 
 
-# ── Internal helpers ─────────────────────────────────────────────────────────
+# ── Internal helpers ───────────────────────────────────────────────────────
 
 def _resolve_val_config(config: dict) -> dict:
     return config.get("validate", config)
@@ -80,11 +82,11 @@ def run_validation(
     config: dict,
     model_path: Path,
     out_dir: Path,
-    # ── MTP step filters ────────────────────────────────────────────────────
+    # ── MTP step filters ───────────────────────────────────────────────
     only_steps: Optional[list[str]] = None,
     skip_steps: Optional[list[str]] = None,
     skip_mtp: bool = False,
-    # ── Reference filters ───────────────────────────────────────────────────
+    # ── Reference filters ──────────────────────────────────────────────
     skip_refs: bool = False,
     only_refs: Optional[list[str]] = None,
     skip_ref: Optional[list[str]] = None,
@@ -158,7 +160,7 @@ def run_validation(
     elif skip_ref:
         step("setup", f"skip-ref : {skip_ref}")
 
-    # ── MTP computation ───────────────────────────────────────────────────────
+    # ── MTP computation ──────────────────────────────────────────────────────────
     eos_results: list[EosResult] = []
     elastic_results: list[ElasticResult] = []
     melting_results: list[MeltingResult] = []
@@ -187,7 +189,7 @@ def run_validation(
                 cutoff=cutoff,
             )
             eos_results.append(res)
-            ok("eos", f"{sid}: B₀={res.B0:.1f} GPa  V₀={res.V0:.3f} Å³") if res.fit_ok else warn("eos", f"{sid}: fit failed — {res.fit_error}")
+            ok("eos", f"{sid}: B\u2080={res.B0:.1f} GPa  V\u2080={res.V0:.3f} \u00c5\u00b3") if res.fit_ok else warn("eos", f"{sid}: fit failed — {res.fit_error}")
 
     if plan.will_run_step("elastic"):
         el_cfg = val_cfg.get("elastic", {})
@@ -251,7 +253,7 @@ def run_validation(
                 dt=thexp_cfg.get("dt", 0.002),
             )
             thexp_results.append(res)
-            ok("thexp", f"{sid}: α = {res.alpha*1e6:.2f}×10⁻⁶ K⁻¹") if res.compute_ok else warn("thexp", f"{sid}: failed — {res.error}")
+            ok("thexp", f"{sid}: \u03b1 = {res.alpha*1e6:.2f}\u00d710\u207b\u2076 K\u207b\u00b9") if res.compute_ok else warn("thexp", f"{sid}: failed — {res.error}")
 
     if plan.will_run_step("vacancy"):
         vac_cfg = val_cfg.get("vacancy", {})
@@ -293,7 +295,7 @@ def run_validation(
                 supercell_repeat=rdf_cfg.get("supercell_repeat", 3),
             )
             rdf_results.append(res)
-            ok("rdf", f"{sid}: first peak at {res.first_peak_r:.3f} Å") if res.compute_ok else warn("rdf", f"{sid}: failed — {res.error}")
+            ok("rdf", f"{sid}: first peak at {res.first_peak_r:.3f} \u00c5") if res.compute_ok else warn("rdf", f"{sid}: failed — {res.error}")
 
     result = ValidationResult(
         model_path=model_path,
@@ -308,8 +310,10 @@ def run_validation(
     )
     result.save_manifest()
 
-    # ── Classical reference comparisons ───────────────────────────────────────
+    # ── Classical reference comparisons ───────────────────────────────────────────
     plot_paths: dict[str, Path] = {}
+    all_ref_results = []  # collected for combined plots
+
     for idx, ref_cfg in enumerate(plan.ref_configs, start=1):
         pair_style = ref_cfg.get("pair_style")
         pair_coeff = ref_cfg.get("pair_coeff")
@@ -334,22 +338,32 @@ def run_validation(
             mpi_np=mpi_np,
             cutoff=cutoff,
         )
+        all_ref_results.append(ref_result)
 
         banner(f"Comparison: MTP vs {ref_label}")
         ref_plot_paths = plots.plot_comparison(result, ref_result, cmp_dir)
         for k, p in ref_plot_paths.items():
-            ok("compare", f"{k} → {p.relative_to(val_dir)}")
+            ok("compare", f"{k} \u2192 {p.relative_to(val_dir)}")
         plot_paths.update({f"{ref_slug}:{k}": p for k, p in ref_plot_paths.items()})
 
         banner(f"Report: {ref_label}")
         md_path, csv_path = write_report(result, ref_result, val_dir)
-        ok("report", f"Markdown → {md_path.name}")
-        ok("report", f"CSV      → {csv_path.name}")
+        ok("report", f"Markdown \u2192 {md_path.name}")
+        ok("report", f"CSV      \u2192 {csv_path.name}")
+
+    # ── Combined plots (all refs on one figure) ────────────────────────────────
+    if len(all_ref_results) >= 1:
+        combined_dir = ensure_dir(val_dir / "comparison_combined")
+        banner("Combined: MTP vs all references")
+        combined_paths = plots.plot_combined(result, all_ref_results, combined_dir)
+        for k, p in combined_paths.items():
+            ok("combined", f"{k} \u2192 {p.relative_to(val_dir)}")
+        plot_paths.update({f"combined:{k}": p for k, p in combined_paths.items()})
 
     banner("Done")
-    step("output", f"manifest → {val_dir / 'validate_manifest.json'}")
+    step("output", f"manifest \u2192 {val_dir / 'validate_manifest.json'}")
     if plot_paths:
         n_refs = len({k.split(':', 1)[0] for k in plot_paths})
-        step("output", f"plots    → {len(plot_paths)} file(s) across {n_refs} reference(s)")
+        step("output", f"plots    \u2192 {len(plot_paths)} file(s) across {n_refs} output group(s)")
 
     return result
