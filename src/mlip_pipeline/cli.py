@@ -34,7 +34,7 @@ app = typer.Typer(
 )
 
 # All physics validation steps, in the order they run.
-VALIDATE_STEPS = ("eos", "elastic", "melting", "thermal_expansion", "vacancy", "rdf")
+VALIDATE_STEPS = ("eos", "elastic", "melting", "thexp", "thermal_expansion", "vacancy", "rdf")
 
 
 def build_fit_result(config: dict, resolved_paths: dict) -> FitResult:
@@ -267,21 +267,6 @@ def convert_cfg(config: Annotated[str, typer.Option(..., help="Path to config ya
 
 # ---------------------------------------------------------------------------
 # EVALUATION COMMANDS
-#
-# Two commands, clear separation of concerns:
-#
-#   evaluate      — run mlp calculate_efs (expensive MTP inference) + plot.
-#                   Skips inference if predicted_train.cfg already exists,
-#                   unless --force is given.
-#                   Accepts --gen N (single gen) or --gens 0,3,all (multi).
-#
-#   plot-eval     — regenerate plots only from an existing predicted_train.cfg.
-#                   Fast; never re-runs calculate_efs.
-#                   Accepts --gens 0,3,all.
-#
-#   compare-parity — side-by-side parity subplots across chosen gens.
-#                   Reads cached predicted_train.cfg; no MTP inference.
-#                   Accepts --gens 0,17 and --quantities energy,forces,stress.
 # ---------------------------------------------------------------------------
 
 @app.command("evaluate")
@@ -307,22 +292,13 @@ def evaluate(
     """
     Run evaluation (mlp calculate_efs + plots) for one or more generations.
 
-    By default, calculate_efs is skipped when predicted_train.cfg already
-    exists — pass --force to always re-run inference.
-
     Examples
     --------
-    # Single gen (current-loop style):
+    # Single gen:
         mlip-pipeline evaluate --config configs/Pb_loop.yaml --gen 5
 
-    # All gens (replaces old regenerate-eval):
+    # All gens:
         mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens all
-
-    # Force-rerun even if cache exists:
-        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens all --force
-
-    # Subset:
-        mlip-pipeline evaluate --config configs/Pb_loop.yaml --gens 0,3,7
     """
     if gen is not None and gens:
         raise typer.BadParameter("--gen and --gens are mutually exclusive.")
@@ -332,15 +308,12 @@ def evaluate(
 
     base_cfg = load_yaml(config)
 
-    # Build generation list
     if gen is not None:
         gen_list = [gen]
     elif gens:
         runs_root = _runs_root_from_config(config)
         gen_list = _resolve_gens(runs_root, gens)
     else:
-        # No --gen or --gens: behave like old single-gen `evaluate` using
-        # non-loop paths (backward compat for non-loop workflows).
         cfg, paths = get_paths(config)
         fit_result = build_fit_result(cfg, paths)
         if force:
@@ -423,20 +396,6 @@ def plot_eval(
 ):
     """
     Regenerate evaluation plots from cached data WITHOUT re-running mlp calculate_efs.
-
-    Use this after changing plot styles, adding new plot types, or fixing a
-    missing PNG — without paying the MTP inference cost.
-
-    Requires that 'evaluate' has been run at least once so that
-    predicted_train.cfg exists in gen_NN/fit/eval/.
-
-    Examples
-    --------
-    # Replot all gens that have cached data:
-        mlip-pipeline plot-eval --config configs/Pb_loop.yaml
-
-    # Replot a subset:
-        mlip-pipeline plot-eval --config configs/Pb_loop.yaml --gens 0,3,7
     """
     from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
     from mlip_pipeline.models import GenerationState
@@ -447,8 +406,7 @@ def plot_eval(
 
     if not gen_list:
         typer.echo(
-            "No gen_NN/fit/eval/predicted_train.cfg files found.\n"
-            "Run 'evaluate' first.",
+            "No gen_NN/fit/eval/predicted_train.cfg files found.\nRun 'evaluate' first.",
             err=True,
         )
         raise typer.Exit(1)
@@ -515,23 +473,6 @@ def compare_parity(
 ):
     """
     Produce side-by-side parity comparison plots across chosen generations.
-
-    Reads cached predicted_train.cfg files — no MTP inference is run.
-    Each requested quantity gets its own PNG with one subplot per generation.
-
-    Examples
-    --------
-    # Compare gen 0 and gen 17 for energy and forces (default):
-        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17
-
-    # Energy only:
-        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,5,10,17 --quantities energy
-
-    # All three quantities:
-        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17 --quantities energy,forces,stress
-
-    # Custom output directory:
-        mlip-pipeline compare-parity --config configs/Pb_loop.yaml --gens 0,17 --output runs/my_comparisons/
     """
     from mlip_pipeline.loop.runner import _config_for_gen, _resolve_fit_result
     from mlip_pipeline.evaluate.parity import parse_cfg_efs, build_parity_data
@@ -541,7 +482,6 @@ def compare_parity(
     base_cfg  = load_yaml(config)
     runs_root = _runs_root_from_config(config)
 
-    # Parse gen list (order preserved, no sorting — user controls display order)
     try:
         gen_list = [int(g.strip()) for g in gens.split(",") if g.strip()]
     except ValueError:
@@ -562,7 +502,6 @@ def compare_parity(
     dest_dir = Path(output) if output else runs_root / "loop_summary" / "compare_parity"
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load parity data for each gen from cache
     gen_parities: list[tuple[int, dict]] = []
     for gen_num in gen_list:
         gen_tag   = f"gen_{gen_num:02d}"
@@ -583,7 +522,6 @@ def compare_parity(
             paths = project_paths(cfg)
             paths = {**paths, **gen_paths(cfg, paths)}
 
-            # Resolve train_cfg the same way runner.py does
             from mlip_pipeline.evaluate.runner import _resolve_train_cfg
             train_cfg = _resolve_train_cfg(cfg, paths)
 
@@ -612,17 +550,24 @@ def compare_parity(
 # PHYSICS VALIDATION
 # ---------------------------------------------------------------------------
 
+_VALID_STEPS_DISPLAY = "eos, elastic, melting, thexp, vacancy, rdf"
+
+
 def _parse_validate_steps(value: str, flag: str) -> list[str]:
     """Parse a comma-separated step list and validate against VALIDATE_STEPS."""
     steps = [s.strip().lower() for s in value.split(",") if s.strip()]
     unknown = [s for s in steps if s not in VALIDATE_STEPS]
     if unknown:
         raise typer.BadParameter(
-            f"Unknown step(s): {unknown}. "
-            f"Valid steps: {', '.join(VALIDATE_STEPS)}",
+            f"Unknown step(s): {unknown}. Valid: {_VALID_STEPS_DISPLAY}",
             param_hint=flag,
         )
     return steps
+
+
+def _parse_ref_labels(value: str) -> list[str]:
+    """Parse a comma-separated list of reference labels (case-preserved)."""
+    return [s.strip() for s in value.split(",") if s.strip()]
 
 
 @app.command("validate")
@@ -631,76 +576,77 @@ def validate(
     model: Annotated[str, typer.Option(..., "--model", help="Path to trained .almtp potential")],
     outdir: Annotated[Optional[str], typer.Option(
         "--outdir",
-        help="Output directory for plots and manifest. Defaults to <model_dir>/validate/",
+        help="Output directory. Defaults to <model_dir>/validate/",
     )] = None,
+    # ── MTP step filters ────────────────────────────────────────────────────
     only: Annotated[str, typer.Option(
         "--only",
-        help=(
-            f"Comma-separated list of steps to run exclusively. "
-            f"Valid: {', '.join(VALIDATE_STEPS)}. "
-            "Mutually exclusive with --skip."
-        ),
+        help=f"Run only these MTP steps (comma-separated). Valid: {_VALID_STEPS_DISPLAY}. Mutually exclusive with --skip.",
     )] = "",
     skip: Annotated[str, typer.Option(
         "--skip",
-        help=(
-            f"Comma-separated list of steps to suppress. "
-            f"Valid: {', '.join(VALIDATE_STEPS)}. "
-            "Mutually exclusive with --only."
-        ),
+        help=f"Skip these MTP steps (comma-separated). Valid: {_VALID_STEPS_DISPLAY}. Mutually exclusive with --only.",
+    )] = "",
+    skip_mtp: Annotated[bool, typer.Option(
+        "--skip-mtp",
+        help="Skip all MTP computation entirely. Useful to only re-run reference comparisons.",
+    )] = False,
+    # ── Reference filters ───────────────────────────────────────────────────
+    skip_refs: Annotated[bool, typer.Option(
+        "--skip-refs",
+        help="Skip all classical-reference computations.",
+    )] = False,
+    only_ref: Annotated[str, typer.Option(
+        "--only-ref",
+        help="Run only this reference label (comma-separated for multiple). Mutually exclusive with --skip-ref.",
+    )] = "",
+    skip_ref: Annotated[str, typer.Option(
+        "--skip-ref",
+        help="Skip this reference label (comma-separated for multiple). Mutually exclusive with --only-ref.",
     )] = "",
 ):
     """
-    Run physics validation (EOS, elastic constants, melting temperature, …)
-    for a trained MTP potential.
-
-    Use --only to run a single step without touching the config file:
+    Run physics validation (EOS, elastic, melting, …) for a trained MTP potential.
 
     Examples
     --------
-    # Full validation:
-        mlip-pipeline validate \\
-            --config configs/Pb_validate.yaml \\
-            --model  runs/gen_16/fit/Pb16.almtp
+    # Full validation (MTP + all references):
+        mlip-pipeline validate --config configs/Pb_validate.yaml --model runs/gen_16/fit/Pb16.almtp
 
-    # Melting temperature only:
-        mlip-pipeline validate \\
-            --config configs/Pb_validate.yaml \\
-            --model  runs/gen_16/fit/Pb16.almtp \\
-            --only melting
+    # MTP only (skip all reference potentials):
+        mlip-pipeline validate ... --skip-refs
 
-    # Everything except the slow melting step:
-        mlip-pipeline validate \\
-            --config configs/Pb_validate.yaml \\
-            --model  runs/gen_16/fit/Pb16.almtp \\
-            --skip melting
+    # Skip MTP; only run reference comparisons against cached manifest:
+        mlip-pipeline validate ... --skip-mtp
 
-    # EOS and elastic only:
-        mlip-pipeline validate \\
-            --config configs/Pb_validate.yaml \\
-            --model  runs/gen_16/fit/Pb16.almtp \\
-            --only eos,elastic
+    # Only run EOS and elastic for MTP, but still compare all references:
+        mlip-pipeline validate ... --only eos,elastic
 
-    # Custom output directory:
-        mlip-pipeline validate \\
-            --config configs/Pb_validate.yaml \\
-            --model  runs/gen_16/fit/Pb16.almtp \\
-            --outdir runs/gen_16/validate
+    # Skip the slow melting step:
+        mlip-pipeline validate ... --skip melting
+
+    # Run only one specific reference:
+        mlip-pipeline validate ... --only-ref Lee2003-MEAM
+
+    # Skip one specific reference:
+        mlip-pipeline validate ... --skip-ref Zhou2004-EAM
     """
     from mlip_pipeline.validate.runner import run_validation
 
+    # Mutual-exclusion guards
     if only and skip:
         raise typer.BadParameter("--only and --skip are mutually exclusive.")
+    if only_ref and skip_ref:
+        raise typer.BadParameter("--only-ref and --skip-ref are mutually exclusive.")
+    if skip_mtp and (only or skip):
+        raise typer.BadParameter("--skip-mtp cannot be combined with --only or --skip.")
+    if skip_refs and (only_ref or skip_ref):
+        raise typer.BadParameter("--skip-refs cannot be combined with --only-ref or --skip-ref.")
 
-    only_steps: Optional[list[str]] = None
-    skip_steps: list[str] = []
-
-    if only:
-        only_steps = _parse_validate_steps(only, "--only")
-        typer.echo(f"  [validate] running only: {only_steps}")
-    if skip:
-        skip_steps = _parse_validate_steps(skip, "--skip")
-        typer.echo(f"  [validate] skipping: {skip_steps}")
+    only_steps: Optional[list[str]] = _parse_validate_steps(only, "--only") if only else None
+    skip_steps: list[str] = _parse_validate_steps(skip, "--skip") if skip else []
+    only_refs: Optional[list[str]] = _parse_ref_labels(only_ref) if only_ref else None
+    skip_ref_list: list[str] = _parse_ref_labels(skip_ref) if skip_ref else []
 
     model_path = Path(model)
     if not model_path.exists():
@@ -714,6 +660,10 @@ def validate(
         cfg, model_path, out_path,
         only_steps=only_steps,
         skip_steps=skip_steps,
+        skip_mtp=skip_mtp,
+        skip_refs=skip_refs,
+        only_refs=only_refs,
+        skip_ref=skip_ref_list,
     )
 
     manifest = result.validate_dir / "validate_manifest.json"
@@ -734,7 +684,7 @@ def validate(
             if el.compute_ok:
                 typer.echo(
                     f"  Elastic [{el.structure_id}]  B={el.B_voigt:.1f} GPa  "
-                    f"G={el.G_voigt:.1f} GPa  Cij={el.C}"
+                    f"G={el.G_voigt:.1f} GPa"
                 )
             else:
                 typer.echo(f"  Elastic [{el.structure_id}]  failed: {el.error}")
