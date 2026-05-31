@@ -80,8 +80,6 @@ def _resolve_pair_coeff(pair_coeff: str) -> str:
     resolved = []
     for tok in tokens:
         p = Path(tok)
-        # Only resolve tokens that are neither a wildcard nor a bare word/number
-        # and that point to an existing file on disk.
         if not p.is_absolute() and p.suffix and p.exists():
             resolved.append(str(p.resolve()))
         else:
@@ -98,14 +96,7 @@ def _pair_block(
     pair_style: Optional[str] = None,
     pair_coeff: Optional[str] = None,
 ) -> list[str]:
-    """Return pair_style + pair_coeff lines.
-
-    When pair_style/pair_coeff are provided (classical reference mode),
-    they are used verbatim — except that any relative file paths inside
-    pair_coeff are resolved to absolute so LAMMPS can find them regardless
-    of the working directory it is launched from.
-    Otherwise the default MTP mlip block is used.
-    """
+    """Return pair_style + pair_coeff lines."""
     if pair_style is not None and pair_coeff is not None:
         return [
             f"pair_style      {pair_style}",
@@ -253,36 +244,45 @@ def write_melting_input(
 ) -> Path:
     """Write a two-phase coexistence LAMMPS input script.
 
-    Ensemble choices
-    ----------------
-    - Stage 1 (liquid disordering): a single NVT thermostat on ALL atoms,
-      combined with ``fix setforce 0 0 0`` on the solid half.
-      setforce zeroes the forces on solid atoms every step so they cannot
-      move, while the single NVT drives the liquid half to T_dis.
-      This is the correct approach: only ONE fix integrates equations of
-      motion at any time, so the "time integrated more than once" error
-      (and the associated unphysical pressure spike) is completely avoided.
+    Protocol
+    --------
+    Stage 1 — Heat whole cell to T_dis (NVT, no groups).
+        The entire supercell is heated gradually from T_target to T_dis.
+        No groups, no freezing.  Both halves heat together so the MTP
+        never encounters extreme out-of-domain configurations.
+        Reduced timestep dt/5 used for stability during rapid heating.
 
-      The previous dual-NVT approach (separate fix nvt on solid_atoms and
-      liquid_atoms) fails when running with multiple MPI ranks because the
-      split plane at z=zmid falls on an MPI domain boundary.  Ghost atoms
-      straddling that boundary are assigned to BOTH groups regardless of
-      the ``open 5/6`` region flags, causing every atom to be integrated
-      twice.  MEAM is robust enough to survive; MTP diverges.
+    Stage 2 — Freeze solid half, quench liquid to T_target (NVT).
+        fix setforce 0 0 0 is applied to the solid (lo-z) group, which
+        zeroes forces on those atoms so they cannot move.  A single NVT
+        on ALL atoms quenches the liquid half from T_dis back to T_target
+        while it stays disordered.  Only ONE fix integrates equations of
+        motion at any time — no double-integration, no ghost-atom issues.
 
-    - Stage 2 (quench + equilibration): single NVT ramp T_dis → T_target
-      on all atoms.
-    - Stage 3 (production / phase classification): NPH at P=0 (iso).
-      NPH is the physically correct ensemble for two-phase coexistence:
-      it allows the cell volume to relax, removing the artificial pressure
-      build-up that NVT would introduce as one phase grows into the other.
-      Velocities are carried forward from Stage 2 (no velocity reset).
+    Stage 3 — Full-cell equilibration at T_target (NVT, no groups).
+        setforce is removed; all atoms are free.  NVT at T_target lets
+        the solid/liquid interface form and settle.
 
-    Group partitioning
-    ------------------
-    The solid (lo-z) group is still defined for the setforce fix.
-    open-face regions are kept for consistency but are not critical for
-    setforce correctness (double-zeroing a force is a no-op).
+    Stage 4 — Production NPH (iso, P=0).
+        NPH is the physically correct ensemble for TPC: constant pressure
+        allows the cell volume to relax as one phase grows into the other.
+        Velocities are inherited from Stage 3 (no velocity reset).
+
+    Why not dual-NVT?
+    -----------------
+    With 4 MPI ranks decomposed along z, the split plane at z=zmid lands
+    on an MPI domain boundary.  Ghost atoms straddling that boundary are
+    assigned to BOTH solid_atoms and liquid_atoms regardless of the
+    ``open 5/6`` region flags.  Two competing fix nvt commands then
+    integrate every atom twice.  MEAM survives; MTP diverges.
+
+    Why not setforce-from-cold?
+    ---------------------------
+    Freezing the solid from the very start (previous attempt) dumps all
+    kinetic energy into the liquid 500 atoms only.  The effective liquid
+    temperature is ~2x the thermostat target (thermostat counts all 1000
+    atoms but only 500 move).  MTP diverges within 500 steps because the
+    liquid atoms enter out-of-domain configurations immediately.
     """
     abs_data  = Path(lammps_data).resolve()
     abs_model = Path(model_path).resolve()
@@ -290,16 +290,12 @@ def write_melting_input(
     natom_out   = (work_dir / "atom_count.txt").resolve()
     script_path = work_dir / "melting.in"
 
-    # Reduced timestep for the disordering stage (avoids instabilities).
-    dt_heat  = round(dt / 5.0, 6)
-    # Cap disordering temperature: aggressive heating can cause instabilities
-    # for low-Tm systems (Pb ~600 K, K ~336 K).  Use min(1.3*T, T+300) K.
-    T_dis    = min(1.3 * temperature, temperature + 300.0)
-    n_dis    = max(2000, n_equil)
-    n_eq     = max(1000, n_equil // 2)
-    # Explicit Nose-Hoover damping: tdamp=100*dt, pdamp=1000*dt (ps)
-    tdamp    = round(100 * dt, 6)
-    pdamp    = round(1000 * dt, 6)
+    dt_heat = round(dt / 5.0, 6)
+    T_dis   = min(1.3 * temperature, temperature + 300.0)
+    n_dis   = max(2000, n_equil)
+    n_eq    = max(1000, n_equil // 2)
+    tdamp   = round(100 * dt, 6)
+    pdamp   = round(1000 * dt, 6)
 
     pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
 
@@ -317,50 +313,55 @@ def write_melting_input(
         "",
         "minimize        1e-8 1e-10 5000 50000",
         "",
-        "# ----------------------------------------------------------------",
-        "# Define solid (lo-z) group for the setforce freeze in Stage 1.",
-        "# open 6 = z-hi face exclusive so atoms at z=zmid go to liquid.",
-        "# ----------------------------------------------------------------",
-        "variable        zmid   equal (zlo+zhi)/2.0",
-        "region          solid_region  block INF INF INF INF INF ${zmid} units box open 6",
-        "group           solid_atoms   region solid_region",
-        "",
         f"timestep        {dt_heat}",
         "thermo_modify   flush yes lost warn",
         "thermo          500",
         "",
         "# ----------------------------------------------------------------",
-        f"# Stage 1: Disorder liquid half at {T_dis:.1f} K (= min(1.3*T, T+300)).",
-        f"#          Reduced timestep {dt_heat} ps used for stability.",
-        "#",
-        "#  fix fxFreeze zeroes forces on solid atoms every step → they",
-        "#  cannot move.  A single NVT on ALL atoms drives the liquid half",
-        "#  to T_dis.  Only one fix integrates equations of motion, so",
-        "#  there is no double-integration and no competing thermostats.",
+        f"# Stage 1: Heat entire cell to {T_dis:.1f} K (= min(1.3*T, T+300)).",
+        f"#          No groups — both halves heat together so MTP never",
+        f"#          encounters extreme out-of-domain configurations.",
+        f"#          Reduced timestep {dt_heat} ps for stability.",
         "# ----------------------------------------------------------------",
         f"velocity        all create {temperature:.1f} {seed} dist gaussian",
-        "fix             fxFreeze solid_atoms setforce 0.0 0.0 0.0",
-        f"fix             fxDis    all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
+        f"fix             fxHeat all nvt temp {temperature:.1f} {T_dis:.1f} {tdamp}",
         f"run             {n_dis}",
-        "unfix           fxFreeze",
-        "unfix           fxDis",
+        "unfix           fxHeat",
         "",
         "# ----------------------------------------------------------------",
-        f"# Stage 2: Quench + equilibrate whole cell at T = {temperature:.1f} K.",
-        f"#          Switch back to production timestep {dt} ps.",
+        "# Stage 2: Freeze solid (lo-z) half; quench liquid to T_target.",
+        "#   setforce 0 0 0 zeroes forces on solid atoms every step so",
+        "#   they cannot move.  A single NVT on all atoms quenches the",
+        "#   liquid (which is already disordered) back to T_target.",
+        "#   Only ONE integrator runs — no double-integration.",
+        "# ----------------------------------------------------------------",
+        "variable        zmid equal (zlo+zhi)/2.0",
+        "region          solid_region block INF INF INF INF INF ${zmid} units box open 6",
+        "group           solid_atoms  region solid_region",
+        "",
+        "fix             fxFreeze solid_atoms setforce 0.0 0.0 0.0",
+        f"fix             fxQuench all nvt temp {T_dis:.1f} {temperature:.1f} {tdamp}",
+        f"run             {n_eq}",
+        "unfix           fxFreeze",
+        "unfix           fxQuench",
+        "",
+        "# ----------------------------------------------------------------",
+        f"# Stage 3: Full-cell equilibration at T = {temperature:.1f} K.",
+        f"#          All atoms free; interface forms and settles.",
+        f"#          Switch to production timestep {dt} ps.",
         "# ----------------------------------------------------------------",
         f"timestep        {dt}",
-        f"fix             fxEQ all nvt temp {T_dis:.1f} {temperature:.1f} {tdamp}",
+        f"fix             fxEQ all nvt temp {temperature:.1f} {temperature:.1f} {tdamp}",
         f"run             {n_eq}",
         "unfix           fxEQ",
         "",
         "reset_atoms     id",
         "",
         "# ----------------------------------------------------------------",
-        "# Stage 3: Production NPH (iso, P=0).  Correct ensemble for TPC:",
+        "# Stage 4: Production NPH (iso, P=0).  Correct ensemble for TPC:",
         "#          constant pressure allows the cell to adjust as one phase",
         "#          grows into the other, avoiding artificial pressure buildup.",
-        "#          Velocities are inherited from Stage 2 (no velocity reset).",
+        "#          Velocities are inherited from Stage 3 (no velocity reset).",
         "# ----------------------------------------------------------------",
         f"timestep        {dt}",
         "thermo_style    custom step temp vol pe atoms",
@@ -400,7 +401,6 @@ def write_thermal_expansion_input(
     out_file  = (work_dir / "thexp_output.txt").resolve()
     script_path = work_dir / "thexp.in"
 
-    # Explicit damping constants: tdamp=100*dt, pdamp=1000*dt (ps)
     tdamp = round(100 * dt, 6)
     pdamp = round(1000 * dt, 6)
 
@@ -510,7 +510,6 @@ def write_rdf_input(
     n_freq   = max(n_every * 2, n_prod // 10)
     n_repeat = n_freq // n_every
 
-    # Explicit damping
     tdamp = round(100 * dt, 6)
 
     pair_lines = _pair_block(abs_model, pair_style, pair_coeff)
