@@ -33,7 +33,6 @@ def _parse_rdf_output(out_file: Path) -> tuple[list[float], list[float]]:
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        # Look for timestep header lines: two numbers
         if line and not line.startswith("#"):
             parts = line.split()
             if len(parts) == 2:
@@ -83,7 +82,6 @@ def _first_peak(r_list: list[float], g_list: list[float]) -> tuple[float, float]
         if g > best_g:
             best_g = g
             best_r = r
-        # Stop after the first peak has been passed (g starts decreasing)
         elif best_g > 1.0 and g < best_g * 0.5:
             break
     return best_r, best_g
@@ -107,6 +105,8 @@ def run_rdf(
     n_prod: int = 20000,
     dt: float = 0.002,
     supercell_repeat: int = 3,
+    pair_style: Optional[str] = None,
+    pair_coeff: Optional[str] = None,
 ) -> RdfResult:
     work_dir = ensure_dir(validate_dir / "rdf" / structure_id)
     out_file = work_dir / "rdf_output.txt"
@@ -125,6 +125,8 @@ def run_rdf(
         r_max=r_max,
         n_bins=n_bins,
         supercell_repeat=supercell_repeat,
+        pair_style=pair_style,
+        pair_coeff=pair_coeff,
     )
     try:
         run_lammps(
@@ -147,7 +149,7 @@ def run_rdf(
         return RdfResult(structure_id=structure_id, error=msg)
 
     r_peak, g_peak = _first_peak(r_list, g_list)
-    print(f"  [rdf] {structure_id}: first peak r={r_peak:.3f} Å  g(r)={g_peak:.3f}  "
+    print(f"  [rdf] {structure_id}: first peak r={r_peak:.3f} \u00c5  g(r)={g_peak:.3f}  "
           f"(T={temperature:.0f} K)")
     return RdfResult(
         structure_id=structure_id,
