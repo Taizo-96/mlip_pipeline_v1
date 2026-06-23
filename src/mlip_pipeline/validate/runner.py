@@ -38,7 +38,7 @@ from mlip_pipeline.validate.rdf import run_rdf
 from mlip_pipeline.validate import plots
 from mlip_pipeline.validate.report import write_report
 from mlip_pipeline.validate._cli import banner, step, ok, warn
-from mlip_pipeline.validate.classical_reference import run_classical_reference
+from mlip_pipeline.validate.classical_reference import run_classical_reference, _collect_deviations
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────
@@ -434,10 +434,24 @@ def run_validation(
 
         ref_label = ref_cfg.get("label", f"classical_{idx}")
         ref_slug = _slugify(ref_label)
+        ref_dir = ensure_dir(val_dir / f"classical_ref_{ref_slug}")
         cmp_dir = ensure_dir(val_dir / f"comparison_{ref_slug}")
 
-        # Inject the now-complete MTP result into the reference result
+        # Inject the now-complete MTP result and recompute deviations
         ref_result.mtp_result = result
+        ref_result.deviations = _collect_deviations(
+            result,
+            ref_result.eos_results,
+            ref_result.elastic_results,
+            ref_result.melting_results,
+            ref_result.thermal_expansion_results,
+            ref_result.vacancy_results,
+        )
+
+        # Re-save manifest now that deviations are correct and MTP data is available
+        manifest_path = ref_result.save_manifest(ref_dir)
+        ok("ref-data", f"manifest \u2192 {manifest_path.relative_to(val_dir)}")
+
         all_ref_results.append(ref_result)
 
         banner(f"Comparison: MTP vs {ref_label}")
