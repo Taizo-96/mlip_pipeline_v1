@@ -5,40 +5,46 @@ element: Pb
 lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/mylammps/src/lmp_mpi
 classical_lammps_cmd: /home/saitto/active-learning-ML-potential-KTH/codes/mylammps/src/lmp_mpi
 mpi_command: mpirun
-mpi_np: 4
+mpi_np: 8
 
 structures:
   fcc:
     data_file: reference_structures/fcc_Pb.lammps
 
 eos:
+  enabled: false
   n_points: 25
   scale_min: 0.85
   scale_max: 1.15
 
 elastic:
+  enabled: false
   delta: 0.005
 
 melting:
-  T_start: 585
-  T_end: 615
+  enabled: false
+  T_start: 595
+  T_end: 605
   T_step: 5
   supercell_repeat: 5
   n_equil: 5000
   n_prod: 20000
-  dt: 0.002
+  dt: 0.004
 
 thexp:
+  enabled: false
   temperatures: [100, 200, 300, 400, 500]
   n_equil: 5000
   n_prod: 10000
   dt: 0.002
 
 vacancy:
+  enabled: false
   supercell_repeat: 3
 
 rdf:
-  temperature: 300
+  enabled: true
+  temperature: 700
   supercell_repeat: 3
   n_equil: 5000
   n_prod: 20000

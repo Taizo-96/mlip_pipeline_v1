@@ -14,3 +14,4 @@ __pycache__/
 runs/
 datasets/
 structures/
+/reference_potentials/validate/
