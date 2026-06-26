@@ -48,6 +48,7 @@ def _resolve_val_config(config: dict) -> dict:
 
 
 def _resolve_structures(step_cfg: dict, val_cfg: dict) -> list[dict]:
+    """Return structure list for a step, falling back to the top-level structures block."""
     if "structures" in step_cfg:
         return step_cfg["structures"]
     top = val_cfg.get("structures", {})
@@ -289,11 +290,6 @@ def run_validation(
         step("setup", f"skip-ref : {skip_ref}")
 
     # ── Collect all tasks ────────────────────────────────────────────────────
-    # Each task is a (step_name, structure_dict) pair for MTP steps, or a
-    # ("_ref", ref_cfg, idx) tuple for classical references.
-    # All tasks are submitted concurrently; results are collected afterwards.
-
-    # MTP task list: [(step_name, structure_dict), ...]
     mtp_tasks: list[tuple[str, dict]] = []
     if plan.mtp_steps:
         for step_name in plan.mtp_steps:
@@ -302,7 +298,6 @@ def run_validation(
             for s in _resolve_structures(step_cfg, val_cfg):
                 mtp_tasks.append((step_name, s))
 
-    # Reference task list: [(idx, ref_cfg), ...]
     ref_tasks: list[tuple[int, dict]] = list(enumerate(plan.ref_configs, start=1))
 
     n_total = len(mtp_tasks) + len(ref_tasks)
@@ -315,12 +310,9 @@ def run_validation(
         banner("Reference Computation  [parallel]")
 
     # ── Submit and collect ───────────────────────────────────────────────────
-    # future -> (kind, key) where kind in ('mtp', 'ref')
     future_meta: dict[Future, tuple[str, object]] = {}
-
-    # Accumulate results keyed by (step_name, structure_id) / ref_idx
     mtp_raw: dict[tuple[str, str], object] = {}
-    ref_raw: dict[int, object] = {}  # idx -> ref_result
+    ref_raw: dict[int, object] = {}
 
     common_kw = dict(
         config=config,
@@ -341,7 +333,7 @@ def run_validation(
             f = pool.submit(_run_mtp_step, step_name, s, **common_kw)
             future_meta[f] = ("mtp", (step_name, sid))
 
-        # Submit reference tasks
+        # Submit reference tasks — no mtp_result yet; runner injects it below
         for idx, ref_cfg in ref_tasks:
             pair_style = ref_cfg.get("pair_style")
             pair_coeff = ref_cfg.get("pair_coeff")
@@ -359,16 +351,15 @@ def run_validation(
                 pair_style=pair_style,
                 pair_coeff=pair_coeff,
                 out_dir=ref_dir,
-                mtp_result=None,   # will be injected after MTP completes
                 label=ref_label,
                 lammps_cmd=lammps_cmd,
                 mpi_command=mpi_command,
                 mpi_np=mpi_np,
                 cutoff=cutoff,
+                # mtp_result intentionally omitted — injected after MTP finishes
             )
             future_meta[f] = ("ref", idx)
 
-        # Collect as they finish
         for f in as_completed(future_meta):
             kind, key = future_meta[f]
             try:
@@ -438,7 +429,6 @@ def run_validation(
         cmp_dir = ensure_dir(val_dir / f"comparison_{ref_slug}")
 
         # Inject the now-complete MTP result and recompute deviations
-        ref_result.mtp_result = result
         ref_result.deviations = _collect_deviations(
             result,
             ref_result.eos_results,
@@ -448,9 +438,13 @@ def run_validation(
             ref_result.vacancy_results,
         )
 
-        # Re-save manifest now that deviations are correct and MTP data is available
+        # Re-save manifest with correct deviations
         manifest_path = ref_result.save_manifest(ref_dir)
         ok("ref-data", f"manifest \u2192 {manifest_path.relative_to(val_dir)}")
+
+        # Print the comparison table now that deviations are populated
+        from mlip_pipeline.validate.classical_reference import print_classical_deviation_table
+        print_classical_deviation_table(ref_result, result)
 
         all_ref_results.append(ref_result)
 

@@ -14,6 +14,14 @@ results are available, via ``plots.plot_comparison()``.
 The module is potential-agnostic: the caller supplies ``pair_style`` and
 ``pair_coeff``, so it works for any LAMMPS-supported potential.
 
+``mtp_result`` is **optional**.  When omitted (the default), the function
+runs purely as a data-collection step — deviations are not computed and
+the deviation table is not printed.  The caller (``runner.py``) injects
+the completed ``ValidationResult`` afterwards and re-saves the manifest
+with correct deviations.  This allows the reference runner to execute
+concurrently with MTP tasks in the thread pool without a None-dereference
+error.
+
 Typical usage
 -------------
     from mlip_pipeline.validate.classical_reference import run_classical_reference
@@ -24,7 +32,6 @@ Typical usage
         pair_coeff="* * /path/library.meam Pb /path/Pb.meam Pb",
         out_dir=val_dir / "classical_ref",
         label="Lee2003-MEAM",
-        mtp_result=validation_result,
     )
 """
 from __future__ import annotations
@@ -409,29 +416,6 @@ def print_classical_deviation_table(
 
 
 # ------------------------------------------------------------------ #
-# Structure resolver (mirrors runner.py logic)                         #
-# ------------------------------------------------------------------ #
-
-def _resolve_structures_cl(step_cfg: dict, val_cfg: dict) -> list[dict]:
-    """Return structure list, falling back to top-level structures block."""
-    if "structures" in step_cfg:
-        return step_cfg["structures"]
-    top = val_cfg.get("structures", {})
-    if isinstance(top, dict):
-        result = []
-        for sid, sdata in top.items():
-            entry = dict(sdata)
-            entry.setdefault("id", sid)
-            if "data_file" in entry and "lammps_data" not in entry:
-                entry["lammps_data"] = entry["data_file"]
-            result.append(entry)
-        return result
-    if isinstance(top, list):
-        return top
-    return []
-
-
-# ------------------------------------------------------------------ #
 # Public runner                                                         #
 # ------------------------------------------------------------------ #
 
@@ -440,13 +424,21 @@ def run_classical_reference(
     pair_style: str,
     pair_coeff: str,
     out_dir: Path,
-    mtp_result: ValidationResult,
     label: str = "classical",
+    mtp_result: Optional[ValidationResult] = None,
     lammps_cmd: Optional[str] = None,
     mpi_command: Optional[str] = None,
     mpi_np: Optional[int] = None,
     cutoff: Optional[float] = None,
 ) -> ClassicalReferenceResult:
+    """Run classical reference validation and return a ClassicalReferenceResult.
+
+    ``mtp_result`` is optional.  When not supplied the function skips
+    deviation computation and table printing; the caller is responsible
+    for injecting the MTP result and calling
+    ``ClassicalReferenceResult.save_manifest()`` again once MTP has
+    finished (as ``runner.py`` already does).
+    """
     val_cfg = config.get("validate", config)
     ref_dir = ensure_dir(out_dir)
     element = val_cfg.get("element", "Pb")
@@ -475,6 +467,24 @@ def run_classical_reference(
             data_path = (root / data_path).resolve()
         return data_path
 
+    def _resolve_structures(step_cfg: dict) -> list[dict]:
+        """Return structure list, falling back to the top-level structures block."""
+        if "structures" in step_cfg:
+            return step_cfg["structures"]
+        top = val_cfg.get("structures", {})
+        if isinstance(top, dict):
+            result = []
+            for sid, sdata in top.items():
+                entry = dict(sdata)
+                entry.setdefault("id", sid)
+                if "data_file" in entry and "lammps_data" not in entry:
+                    entry["lammps_data"] = entry["data_file"]
+                result.append(entry)
+            return result
+        if isinstance(top, list):
+            return top
+        return []
+
     eos_results:     list[EosResult]              = []
     elastic_results: list[ElasticResult]          = []
     melting_results: list[MeltingResult]          = []
@@ -485,7 +495,7 @@ def run_classical_reference(
     # ── EOS ──────────────────────────────────────────────────────────
     eos_cfg = val_cfg.get("eos", {})
     if eos_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(eos_cfg, val_cfg):
+        for s in _resolve_structures(eos_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -515,7 +525,7 @@ def run_classical_reference(
     # ── Elastic ───────────────────────────────────────────────────────
     el_cfg = val_cfg.get("elastic", {})
     if el_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(el_cfg, val_cfg):
+        for s in _resolve_structures(el_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -543,7 +553,7 @@ def run_classical_reference(
     # ── Melting ───────────────────────────────────────────────────────
     melt_cfg = val_cfg.get("melting", {})
     if melt_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(melt_cfg, val_cfg):
+        for s in _resolve_structures(melt_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -577,7 +587,7 @@ def run_classical_reference(
     # ── Thermal expansion ─────────────────────────────────────────────
     thexp_cfg = val_cfg.get("thexp", val_cfg.get("thermal_expansion", {}))
     if thexp_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(thexp_cfg, val_cfg):
+        for s in _resolve_structures(thexp_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -609,7 +619,7 @@ def run_classical_reference(
     # ── Vacancy ───────────────────────────────────────────────────────
     vac_cfg = val_cfg.get("vacancy", {})
     if vac_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(vac_cfg, val_cfg):
+        for s in _resolve_structures(vac_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -637,7 +647,7 @@ def run_classical_reference(
     # ── RDF ──────────────────────────────────────────────────────────
     rdf_cfg = val_cfg.get("rdf", {})
     if rdf_cfg.get("enabled", True):
-        for s in _resolve_structures_cl(rdf_cfg, val_cfg):
+        for s in _resolve_structures(rdf_cfg):
             sid = s.get("id", "unknown")
             data_path = _resolve(s)
             if not data_path.exists():
@@ -668,11 +678,16 @@ def run_classical_reference(
             else:
                 warn("ref-rdf", f"{sid}: failed \u2014 {res.error}")
 
-    devs = _collect_deviations(
-        mtp_result,
-        eos_results, elastic_results,
-        melting_results, thexp_results, vacancy_results,
-    )
+    # Only compute deviations + print table when mtp_result is available.
+    # When called from the thread pool (mtp_result=None), runner.py injects
+    # the real result and re-saves the manifest in the sequential block.
+    devs: dict = {}
+    if mtp_result is not None:
+        devs = _collect_deviations(
+            mtp_result,
+            eos_results, elastic_results,
+            melting_results, thexp_results, vacancy_results,
+        )
 
     result = ClassicalReferenceResult(
         label=label,
@@ -687,6 +702,10 @@ def run_classical_reference(
         deviations=devs,
     )
 
-    print_classical_deviation_table(result, mtp_result)
+    if mtp_result is not None:
+        print_classical_deviation_table(result, mtp_result)
+
+    # Always save — runner.py will re-save with correct deviations once
+    # the MTP result is available.
     result.save_manifest(ref_dir)
     return result
